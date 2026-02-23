@@ -4,12 +4,17 @@ use crate::workspace::layer::MemoryLayer;
 
 /// Workspace memory configuration.
 ///
-/// Controls memory layer definitions for privacy-aware writes.
-/// Layers are parsed from the `MEMORY_LAYERS` env var (JSON array)
-/// or default to a single private layer scoped to the gateway user.
+/// Controls memory layer definitions for privacy-aware writes and
+/// cross-scope read access for multi-user deployments.
 #[derive(Debug, Clone)]
 pub struct WorkspaceConfig {
     pub memory_layers: Vec<MemoryLayer>,
+    /// Additional user scopes the workspace can read from.
+    ///
+    /// When set, search/read/list operations span these scopes in addition
+    /// to the primary user scope. Writes remain isolated to the primary scope.
+    /// Parsed from `WORKSPACE_READ_SCOPES` (comma-separated).
+    pub read_scopes: Vec<String>,
 }
 
 impl WorkspaceConfig {
@@ -53,6 +58,18 @@ impl WorkspaceConfig {
             }
         }
 
-        Ok(Self { memory_layers })
+        let read_scopes = optional_env("WORKSPACE_READ_SCOPES")?
+            .map(|s| {
+                s.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(Self {
+            memory_layers,
+            read_scopes,
+        })
     }
 }

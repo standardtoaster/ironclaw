@@ -362,6 +362,17 @@ impl AppBuilder {
             .unwrap_or("default");
         let workspace = if let Some(ref db) = self.db {
             let mut ws = Workspace::new_with_db(workspace_user_id, db.clone());
+
+            // Wire additional read scopes from workspace config
+            if !self.config.workspace.read_scopes.is_empty() {
+                ws = ws.with_additional_read_scopes(self.config.workspace.read_scopes.clone());
+                tracing::info!(
+                    user_id = workspace_user_id,
+                    read_scopes = ?ws.read_user_ids(),
+                    "Workspace configured with multi-scope reads"
+                );
+            }
+
             if let Some(ref emb) = embeddings {
                 ws = ws.with_embeddings(emb.clone());
             }
