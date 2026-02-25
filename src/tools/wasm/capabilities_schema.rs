@@ -167,6 +167,15 @@ pub struct HttpCapabilitySchema {
     /// Request timeout in seconds.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+
+    /// Allow HTTP (non-HTTPS) requests. Required for localhost/local service tools.
+    #[serde(default)]
+    pub allow_http: bool,
+
+    /// Allow requests to private/loopback IPs (127.0.0.1, 10.x, etc.).
+    /// Required for tools that communicate with local services.
+    #[serde(default)]
+    pub allow_private_ips: bool,
 }
 
 impl HttpCapabilitySchema {
@@ -199,6 +208,9 @@ impl HttpCapabilitySchema {
         if let Some(secs) = self.timeout_secs {
             cap.timeout = Duration::from_secs(secs);
         }
+
+        cap.allow_http = self.allow_http;
+        cap.allow_private_ips = self.allow_private_ips;
 
         cap
     }

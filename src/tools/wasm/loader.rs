@@ -44,7 +44,9 @@ use crate::tools::registry::{ToolRegistry, WasmRegistrationError, WasmToolRegist
 use crate::tools::wasm::capabilities_schema::CapabilitiesFile;
 use crate::tools::wasm::{
     Capabilities, OAuthRefreshConfig, WasmError, WasmStorageError, WasmToolRuntime, WasmToolStore,
+    WorkspaceReader,
 };
+use crate::workspace::Workspace;
 
 /// Error during WASM tool loading.
 #[derive(Debug, thiserror::Error)]
@@ -74,11 +76,36 @@ pub enum WasmLoadError {
     InvalidName(String),
 }
 
+/// Bridge from async Workspace to sync WorkspaceReader trait.
+///
+/// Uses `Handle::block_on` to run the async workspace read from a sync context.
+/// This is safe because WASM tool execution runs inside `spawn_blocking`.
+struct AsyncWorkspaceReader {
+    workspace: Arc<Workspace>,
+}
+
+impl WorkspaceReader for AsyncWorkspaceReader {
+    fn read(&self, path: &str) -> Option<String> {
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        let ws = Arc::clone(&self.workspace);
+        let path = path.to_string();
+        // Use block_on from a blocking thread to bridge async->sync.
+        // This is called from spawn_blocking so it won't deadlock.
+        std::thread::scope(|s| {
+            s.spawn(|| handle.block_on(async { ws.read(&path).await.ok().map(|d| d.content) }))
+                .join()
+                .ok()
+                .flatten()
+        })
+    }
+}
+
 /// Loads WASM tools from files or storage into the registry.
 pub struct WasmToolLoader {
     runtime: Arc<WasmToolRuntime>,
     registry: Arc<ToolRegistry>,
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
+    workspace: Option<Arc<Workspace>>,
 }
 
 impl WasmToolLoader {
@@ -88,12 +115,19 @@ impl WasmToolLoader {
             runtime,
             registry,
             secrets_store: None,
+            workspace: None,
         }
     }
 
     /// Set the secrets store for credential injection in WASM tools.
     pub fn with_secrets_store(mut self, store: Arc<dyn SecretsStore + Send + Sync>) -> Self {
         self.secrets_store = Some(store);
+        self
+    }
+
+    /// Set workspace for WASM tools that need workspace_read capability.
+    pub fn with_workspace(mut self, workspace: Arc<Workspace>) -> Self {
+        self.workspace = Some(workspace);
         self
     }
 
@@ -121,7 +155,7 @@ impl WasmToolLoader {
         let wasm_bytes = fs::read(wasm_path).await?;
 
         // Read capabilities (optional) and extract OAuth refresh config
-        let (capabilities, oauth_refresh) = if let Some(cap_path) = capabilities_path {
+        let (mut capabilities, oauth_refresh) = if let Some(cap_path) = capabilities_path {
             if cap_path.exists() {
                 let cap_bytes = fs::read(cap_path).await?;
                 let cap_file = CapabilitiesFile::from_bytes(&cap_bytes)
@@ -139,6 +173,17 @@ impl WasmToolLoader {
         } else {
             (Capabilities::default(), None)
         };
+
+        // Inject workspace reader if capability is declared and workspace is available
+        if capabilities.workspace_read.is_some() {
+            if let Some(ref ws) = self.workspace {
+                if let Some(ref mut ws_cap) = capabilities.workspace_read {
+                    ws_cap.reader =
+                        Some(Arc::new(AsyncWorkspaceReader { workspace: Arc::clone(ws) })
+                            as Arc<dyn WorkspaceReader>);
+                }
+            }
+        }
 
         // Register the tool
         self.registry
