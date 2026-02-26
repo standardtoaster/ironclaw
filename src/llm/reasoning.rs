@@ -478,7 +478,7 @@ Respond in JSON format:
         if !effective_tools.is_empty() {
             let mut request = ToolCompletionRequest::new(messages, effective_tools)
                 .with_max_tokens(4096)
-                .with_temperature(0.7)
+                .with_temperature(0.2)
                 .with_tool_choice("auto");
             request.metadata = context.metadata.clone();
 
@@ -545,7 +545,7 @@ Respond in JSON format:
             // No tools, use simple completion
             let mut request = CompletionRequest::new(messages)
                 .with_max_tokens(4096)
-                .with_temperature(0.7);
+                .with_temperature(0.2);
             request.metadata = context.metadata.clone();
 
             let response = self.llm.complete(request).await?;
