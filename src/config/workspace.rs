@@ -81,7 +81,7 @@ impl WorkspaceConfig {
             }
         }
 
-        let read_scopes = optional_env("WORKSPACE_READ_SCOPES")?
+        let read_scopes: Vec<String> = optional_env("WORKSPACE_READ_SCOPES")?
             .map(|s| {
                 s.split(',')
                     .map(|s| s.trim().to_string())
@@ -89,6 +89,18 @@ impl WorkspaceConfig {
                     .collect()
             })
             .unwrap_or_default();
+
+        for scope in &read_scopes {
+            if scope.len() > 128 {
+                return Err(ConfigError::InvalidValue {
+                    key: "WORKSPACE_READ_SCOPES".to_string(),
+                    message: format!(
+                        "scope '{}...' exceeds 128 characters",
+                        &scope[..32]
+                    ),
+                });
+            }
+        }
 
         Ok(Self {
             memory_layers,
