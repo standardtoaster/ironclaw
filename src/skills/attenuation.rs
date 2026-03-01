@@ -11,8 +11,11 @@
 //! | Trusted only       | All tools (user placed these, full trust)         |
 //! | Installed present  | Read-only tools ONLY                              |
 
+use std::collections::HashSet;
+
 use crate::llm::ToolDefinition;
 use crate::skills::{LoadedSkill, SkillTrust};
+use crate::tools::ToolGroup;
 
 /// Tools that are always safe -- read-only, no side effects.
 ///
@@ -111,6 +114,166 @@ pub fn attenuate_tools(
             }
         }
     }
+}
+
+// ==================== Tool Visibility Tiers ====================
+
+/// Map a tool name to its visibility group.
+///
+/// Built-in tools are assigned centrally here. Unknown tools (WASM, MCP,
+/// dynamic) default to `Core` (always visible) since they were explicitly
+/// installed or generated.
+pub fn tool_group_for_name(name: &str) -> ToolGroup {
+    match name {
+        // Core (always visible)
+        "time" | "message" => ToolGroup::Core,
+
+        // Memory (always visible)
+        "memory_search" | "memory_write" | "memory_read" | "memory_tree" => ToolGroup::Memory,
+
+        // Collections management (always visible)
+        "collections_list" | "collections_register" | "collections_drop" | "collections_alter" => {
+            ToolGroup::Collections
+        }
+
+        // Dev (on-demand)
+        "shell" | "read_file" | "write_file" | "list_dir" | "apply_patch" => ToolGroup::Dev,
+
+        // Jobs (on-demand)
+        "create_job" | "list_jobs" | "job_status" | "cancel_job" | "job_events" | "job_prompt" => {
+            ToolGroup::Jobs
+        }
+
+        // Extensions (on-demand)
+        "tool_search" | "tool_install" | "tool_auth" | "tool_activate" | "tool_list"
+        | "tool_remove" => ToolGroup::Extensions,
+
+        // Skills (on-demand)
+        "skill_list" | "skill_search" | "skill_install" | "skill_remove" => ToolGroup::Skills,
+
+        // Routines (on-demand)
+        "routine_create" | "routine_list" | "routine_update" | "routine_delete"
+        | "routine_history" => ToolGroup::Routines,
+
+        // Utility (on-demand)
+        "echo" | "json" | "http" | "build_software" => ToolGroup::Utility,
+
+        // Unknown/dynamic tools: always visible
+        _ => ToolGroup::Core,
+    }
+}
+
+/// Keywords in skill prompt content that activate each on-demand tool group.
+///
+/// Uses tool names rather than generic words to avoid false-positive activation.
+/// Case-insensitive substring match against the skill's prompt content.
+const GROUP_KEYWORDS: &[(ToolGroup, &[&str])] = &[
+    (
+        ToolGroup::Dev,
+        &[
+            "shell",
+            "read_file",
+            "write_file",
+            "list_dir",
+            "apply_patch",
+        ],
+    ),
+    (
+        ToolGroup::Jobs,
+        &["create_job", "list_jobs", "job_status", "cancel_job"],
+    ),
+    (
+        ToolGroup::Extensions,
+        &[
+            "tool_install",
+            "tool_search",
+            "tool_auth",
+            "tool_activate",
+            "mcp server",
+        ],
+    ),
+    (
+        ToolGroup::Skills,
+        &[
+            "skill_list",
+            "skill_search",
+            "skill_install",
+            "skill_remove",
+        ],
+    ),
+    (
+        ToolGroup::Routines,
+        &[
+            "routine_create",
+            "routine_list",
+            "routine_update",
+            "cron",
+        ],
+    ),
+    (
+        ToolGroup::Utility,
+        &["echo", "build_software"],
+    ),
+];
+
+/// Scan active skill prompts and return the set of on-demand tool groups
+/// that should be made visible.
+fn activated_groups(active_skills: &[LoadedSkill]) -> HashSet<ToolGroup> {
+    let mut groups = HashSet::new();
+
+    for skill in active_skills {
+        let content_lower = skill.prompt_content.to_lowercase();
+        for &(group, keywords) in GROUP_KEYWORDS {
+            if keywords
+                .iter()
+                .any(|kw: &&str| content_lower.contains(*kw))
+            {
+                groups.insert(group);
+            }
+        }
+    }
+
+    groups
+}
+
+/// Filter tool definitions based on visibility tiers.
+///
+/// When skills are active, only tools in always-visible groups or in groups
+/// activated by skill content are shown. When no skills are active, all tools
+/// are returned (backward compatibility).
+pub fn filter_tools_by_visibility(
+    tools: &[ToolDefinition],
+    active_skills: &[LoadedSkill],
+) -> Vec<ToolDefinition> {
+    if active_skills.is_empty() {
+        return tools.to_vec();
+    }
+
+    let active_groups = activated_groups(active_skills);
+
+    let mut kept = Vec::new();
+    let mut removed = Vec::new();
+
+    for tool in tools {
+        let group = tool_group_for_name(&tool.name);
+        if group.is_always_visible() || active_groups.contains(&group) {
+            kept.push(tool.clone());
+        } else {
+            removed.push(tool.name.clone());
+        }
+    }
+
+    if !removed.is_empty() {
+        tracing::info!(
+            removed_count = removed.len(),
+            active_groups = ?active_groups,
+            removed = ?removed,
+            "Tool visibility filtering: hidden {} on-demand tool(s)",
+            removed.len()
+        );
+    }
+
+    kept
 }
 
 #[cfg(test)]
@@ -221,5 +384,198 @@ mod tests {
         assert!(!result.explanation.is_empty());
         assert!(result.removed_tools.contains(&"shell".to_string()));
         assert!(!result.removed_tools.contains(&"time".to_string()));
+    }
+
+    // ==================== Visibility Tier Tests ====================
+
+    fn make_skill_with_content(name: &str, content: &str) -> LoadedSkill {
+        LoadedSkill {
+            manifest: SkillManifest {
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                activation: ActivationCriteria::default(),
+                metadata: None,
+            },
+            prompt_content: content.to_string(),
+            trust: SkillTrust::Trusted,
+            source: SkillSource::User(PathBuf::from("/tmp")),
+            content_hash: "sha256:000".to_string(),
+            compiled_patterns: vec![],
+            lowercased_keywords: vec![],
+            lowercased_tags: vec![],
+        }
+    }
+
+    fn mixed_tools() -> Vec<ToolDefinition> {
+        vec![
+            // Core (always visible)
+            make_tool("time"),
+            make_tool("message"),
+            // Memory (always visible)
+            make_tool("memory_search"),
+            make_tool("memory_write"),
+            // Collections (always visible)
+            make_tool("collections_register"),
+            // Dev (on-demand)
+            make_tool("shell"),
+            make_tool("read_file"),
+            // Jobs (on-demand)
+            make_tool("create_job"),
+            make_tool("list_jobs"),
+            // Extensions (on-demand)
+            make_tool("tool_install"),
+            // Skills (on-demand)
+            make_tool("skill_list"),
+            // Routines (on-demand)
+            make_tool("routine_create"),
+            // Utility (on-demand)
+            make_tool("echo"),
+            make_tool("json"),
+        ]
+    }
+
+    #[test]
+    fn test_visibility_no_skills_returns_all() {
+        let tools = mixed_tools();
+        let result = filter_tools_by_visibility(&tools, &[]);
+        assert_eq!(result.len(), tools.len());
+    }
+
+    #[test]
+    fn test_visibility_skill_hides_on_demand() {
+        let tools = mixed_tools();
+        // Skill that mentions nothing about on-demand tool groups
+        let skills = vec![make_skill_with_content(
+            "grocery",
+            "Track your grocery items. Use collections_register to create a list.",
+        )];
+        let result = filter_tools_by_visibility(&tools, &skills);
+        let names: Vec<&str> = result.iter().map(|t| t.name.as_str()).collect();
+
+        // Always visible
+        assert!(names.contains(&"time"));
+        assert!(names.contains(&"message"));
+        assert!(names.contains(&"memory_search"));
+        assert!(names.contains(&"memory_write"));
+        assert!(names.contains(&"collections_register"));
+
+        // On-demand: hidden since skill doesn't reference their tool names
+        assert!(!names.contains(&"shell"));
+        assert!(!names.contains(&"read_file"));
+        assert!(!names.contains(&"create_job"));
+        assert!(!names.contains(&"list_jobs"));
+        assert!(!names.contains(&"tool_install"));
+        assert!(!names.contains(&"skill_list"));
+        assert!(!names.contains(&"routine_create"));
+        assert!(!names.contains(&"echo"));
+        assert!(!names.contains(&"json"));
+    }
+
+    #[test]
+    fn test_visibility_skill_activates_group_by_keyword() {
+        let tools = mixed_tools();
+        // Skill that references shell and create_job tool names
+        let skills = vec![make_skill_with_content(
+            "dev-helper",
+            "Use the shell to run commands. Use create_job for background work.",
+        )];
+        let result = filter_tools_by_visibility(&tools, &skills);
+        let names: Vec<&str> = result.iter().map(|t| t.name.as_str()).collect();
+
+        // Dev group activated by "shell"
+        assert!(names.contains(&"shell"));
+        assert!(names.contains(&"read_file"));
+        // Jobs group activated by "create_job"
+        assert!(names.contains(&"create_job"));
+        assert!(names.contains(&"list_jobs"));
+        // Still hidden
+        assert!(!names.contains(&"tool_install"));
+        assert!(!names.contains(&"routine_create"));
+    }
+
+    #[test]
+    fn test_visibility_case_insensitive() {
+        let tools = mixed_tools();
+        let skills = vec![make_skill_with_content(
+            "scheduler",
+            "Use ROUTINE_CREATE for recurring tasks. Set up CRON schedules.",
+        )];
+        let result = filter_tools_by_visibility(&tools, &skills);
+        let names: Vec<&str> = result.iter().map(|t| t.name.as_str()).collect();
+
+        assert!(names.contains(&"routine_create"));
+    }
+
+    #[test]
+    fn test_visibility_generic_words_dont_trigger() {
+        let tools = mixed_tools();
+        // Skill that uses generic words like "json", "skill", "schedule"
+        // but doesn't reference actual tool names
+        let skills = vec![make_skill_with_content(
+            "grocery",
+            "Track your grocery items. Uses JSON schema for validation. \
+             This skill helps you manage shopping lists.",
+        )];
+        let result = filter_tools_by_visibility(&tools, &skills);
+        let names: Vec<&str> = result.iter().map(|t| t.name.as_str()).collect();
+
+        // Generic words shouldn't trigger on-demand groups
+        assert!(!names.contains(&"routine_create"));
+        assert!(!names.contains(&"skill_list"));
+        // "echo" is a keyword for Utility, but "echo" doesn't appear in prompt
+        assert!(!names.contains(&"echo"));
+    }
+
+    #[test]
+    fn test_visibility_multiple_skills_combine() {
+        let tools = mixed_tools();
+        let skills = vec![
+            make_skill_with_content("dev", "Use the shell to run builds."),
+            make_skill_with_content("ext", "Use tool_install to add an MCP server."),
+        ];
+        let result = filter_tools_by_visibility(&tools, &skills);
+        let names: Vec<&str> = result.iter().map(|t| t.name.as_str()).collect();
+
+        // Dev from first skill
+        assert!(names.contains(&"shell"));
+        // Extensions from second skill
+        assert!(names.contains(&"tool_install"));
+        // Routines still hidden
+        assert!(!names.contains(&"routine_create"));
+    }
+
+    #[test]
+    fn test_tool_group_mapping() {
+        assert!(tool_group_for_name("time").is_always_visible());
+        assert!(tool_group_for_name("memory_search").is_always_visible());
+        assert!(tool_group_for_name("collections_list").is_always_visible());
+        assert!(!tool_group_for_name("shell").is_always_visible());
+        assert!(!tool_group_for_name("create_job").is_always_visible());
+        assert!(!tool_group_for_name("routine_create").is_always_visible());
+        // Unknown tools default to Core (always visible)
+        assert!(tool_group_for_name("my_custom_wasm_tool").is_always_visible());
+    }
+
+    #[test]
+    fn test_visibility_unknown_tools_always_visible() {
+        let tools = vec![
+            make_tool("time"),
+            make_tool("my_wasm_tool"),
+            make_tool("custom_mcp_tool"),
+            make_tool("shell"),
+        ];
+        let skills = vec![make_skill_with_content(
+            "basic",
+            "A simple skill with no tool references.",
+        )];
+        let result = filter_tools_by_visibility(&tools, &skills);
+        let names: Vec<&str> = result.iter().map(|t| t.name.as_str()).collect();
+
+        // Unknown tools are always visible (Core group)
+        assert!(names.contains(&"my_wasm_tool"));
+        assert!(names.contains(&"custom_mcp_tool"));
+        // Known on-demand tool is hidden
+        assert!(!names.contains(&"shell"));
     }
 }
