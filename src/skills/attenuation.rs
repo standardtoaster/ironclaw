@@ -156,7 +156,7 @@ pub fn tool_group_for_name(name: &str) -> ToolGroup {
         | "routine_history" => ToolGroup::Routines,
 
         // Utility (on-demand)
-        "echo" | "json" | "http" | "build_software" => ToolGroup::Utility,
+        "echo" | "json" | "http" | "web_fetch" | "build_software" => ToolGroup::Utility,
 
         // Unknown/dynamic tools: always visible
         _ => ToolGroup::Core,
@@ -577,5 +577,189 @@ mod tests {
         assert!(names.contains(&"custom_mcp_tool"));
         // Known on-demand tool is hidden
         assert!(!names.contains(&"shell"));
+    }
+
+    /// Every built-in tool name should map to its expected group. This catches
+    /// misclassification and serves as a reference for which tools are in which tier.
+    #[test]
+    fn test_all_builtin_tools_have_correct_group() {
+        let expected: &[(&str, ToolGroup)] = &[
+            // Core (always visible)
+            ("time", ToolGroup::Core),
+            ("message", ToolGroup::Core),
+            // Memory (always visible)
+            ("memory_search", ToolGroup::Memory),
+            ("memory_write", ToolGroup::Memory),
+            ("memory_read", ToolGroup::Memory),
+            ("memory_tree", ToolGroup::Memory),
+            // Collections (always visible)
+            ("collections_list", ToolGroup::Collections),
+            ("collections_register", ToolGroup::Collections),
+            ("collections_drop", ToolGroup::Collections),
+            ("collections_alter", ToolGroup::Collections),
+            // Dev (on-demand)
+            ("shell", ToolGroup::Dev),
+            ("read_file", ToolGroup::Dev),
+            ("write_file", ToolGroup::Dev),
+            ("list_dir", ToolGroup::Dev),
+            ("apply_patch", ToolGroup::Dev),
+            // Jobs (on-demand)
+            ("create_job", ToolGroup::Jobs),
+            ("list_jobs", ToolGroup::Jobs),
+            ("job_status", ToolGroup::Jobs),
+            ("cancel_job", ToolGroup::Jobs),
+            ("job_events", ToolGroup::Jobs),
+            ("job_prompt", ToolGroup::Jobs),
+            // Extensions (on-demand)
+            ("tool_search", ToolGroup::Extensions),
+            ("tool_install", ToolGroup::Extensions),
+            ("tool_auth", ToolGroup::Extensions),
+            ("tool_activate", ToolGroup::Extensions),
+            ("tool_list", ToolGroup::Extensions),
+            ("tool_remove", ToolGroup::Extensions),
+            // Skills (on-demand)
+            ("skill_list", ToolGroup::Skills),
+            ("skill_search", ToolGroup::Skills),
+            ("skill_install", ToolGroup::Skills),
+            ("skill_remove", ToolGroup::Skills),
+            // Routines (on-demand)
+            ("routine_create", ToolGroup::Routines),
+            ("routine_list", ToolGroup::Routines),
+            ("routine_update", ToolGroup::Routines),
+            ("routine_delete", ToolGroup::Routines),
+            ("routine_history", ToolGroup::Routines),
+            // Utility (on-demand)
+            ("echo", ToolGroup::Utility),
+            ("json", ToolGroup::Utility),
+            ("http", ToolGroup::Utility),
+            ("web_fetch", ToolGroup::Utility),
+            ("build_software", ToolGroup::Utility),
+        ];
+
+        for &(tool_name, expected_group) in expected {
+            let actual = tool_group_for_name(tool_name);
+            assert_eq!(
+                actual, expected_group,
+                "Tool '{}' expected {:?} but got {:?}",
+                tool_name, expected_group, actual
+            );
+        }
+    }
+
+    /// Dynamic/external tools should fall through to Core (always visible).
+    #[test]
+    fn test_dynamic_tools_default_to_core() {
+        assert_eq!(tool_group_for_name("my_wasm_tool"), ToolGroup::Core);
+        assert_eq!(tool_group_for_name("custom_mcp_server"), ToolGroup::Core);
+        assert_eq!(tool_group_for_name("grocery_items_add"), ToolGroup::Core);
+    }
+
+    /// Empty skill prompt should activate no on-demand groups.
+    #[test]
+    fn test_visibility_empty_prompt_activates_nothing() {
+        let tools = mixed_tools();
+        let skills = vec![make_skill_with_content("empty", "")];
+        let result = filter_tools_by_visibility(&tools, &skills);
+        let names: Vec<&str> = result.iter().map(|t| t.name.as_str()).collect();
+
+        // Only always-visible tools should be present
+        assert!(names.contains(&"time"));
+        assert!(names.contains(&"memory_search"));
+        assert!(names.contains(&"collections_register"));
+        assert!(!names.contains(&"shell"));
+        assert!(!names.contains(&"create_job"));
+        assert!(!names.contains(&"routine_create"));
+    }
+
+    /// Skill that references every group keyword should activate all groups.
+    #[test]
+    fn test_visibility_all_groups_activated() {
+        let tools = mixed_tools();
+        let skills = vec![make_skill_with_content(
+            "kitchen-sink",
+            "Use shell to run commands. Use create_job for background work. \
+             Use tool_install for extensions. Use skill_list to browse. \
+             Use routine_create for scheduling. Use echo for testing.",
+        )];
+        let result = filter_tools_by_visibility(&tools, &skills);
+        // Every tool should be visible when all groups are active
+        assert_eq!(result.len(), tools.len());
+    }
+
+    /// Visibility filtering and trust attenuation work correctly together.
+    /// Visibility runs first (hiding irrelevant tools), then trust attenuation
+    /// further restricts based on skill trust level.
+    #[test]
+    fn test_visibility_and_attenuation_compose() {
+        let tools = mixed_tools();
+
+        // Installed skill that mentions shell — activates Dev group
+        let skills = vec![LoadedSkill {
+            manifest: SkillManifest {
+                name: "dev-helper".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                activation: ActivationCriteria::default(),
+                metadata: None,
+            },
+            prompt_content: "Use the shell to run commands.".to_string(),
+            trust: SkillTrust::Installed,
+            source: SkillSource::User(PathBuf::from("/tmp")),
+            content_hash: "sha256:000".to_string(),
+            compiled_patterns: vec![],
+            lowercased_keywords: vec![],
+            lowercased_tags: vec![],
+        }];
+
+        // Step 1: Visibility filtering
+        let after_visibility = filter_tools_by_visibility(&tools, &skills);
+        let vis_names: Vec<&str> = after_visibility.iter().map(|t| t.name.as_str()).collect();
+        // Shell should be visible (Dev group activated)
+        assert!(vis_names.contains(&"shell"));
+        // Jobs should be hidden (not activated)
+        assert!(!vis_names.contains(&"create_job"));
+
+        // Step 2: Trust attenuation on the visibility-filtered set
+        let after_attenuation = attenuate_tools(&after_visibility, &skills);
+        let att_names: Vec<&str> = after_attenuation
+            .tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        // Shell should now be removed by trust attenuation (not in READ_ONLY_TOOLS)
+        assert!(!att_names.contains(&"shell"));
+        // Read-only tools survive both filters
+        assert!(att_names.contains(&"memory_search"));
+        assert!(att_names.contains(&"time"));
+        // Installed trust level
+        assert_eq!(after_attenuation.min_trust, SkillTrust::Installed);
+    }
+
+    /// Verify each on-demand group has at least one keyword that activates it.
+    #[test]
+    fn test_every_on_demand_group_is_activatable() {
+        let on_demand_groups = [
+            (ToolGroup::Dev, "shell"),
+            (ToolGroup::Jobs, "create_job"),
+            (ToolGroup::Extensions, "tool_install"),
+            (ToolGroup::Skills, "skill_list"),
+            (ToolGroup::Routines, "routine_create"),
+            (ToolGroup::Utility, "echo"),
+        ];
+
+        for (expected_group, keyword) in on_demand_groups {
+            let skills = vec![make_skill_with_content(
+                "test",
+                &format!("Use {} to do things.", keyword),
+            )];
+            let groups = activated_groups(&skills);
+            assert!(
+                groups.contains(&expected_group),
+                "Keyword '{}' should activate {:?} but got {:?}",
+                keyword,
+                expected_group,
+                groups
+            );
+        }
     }
 }
