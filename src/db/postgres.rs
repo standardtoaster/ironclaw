@@ -708,7 +708,7 @@ fn resolve_filter_field(field: &str) -> Result<(String, bool), DatabaseError> {
         validate_filter_field_segment(parent)?;
         validate_filter_field_segment(child)?;
         return Ok((
-            format!("data->'{parent}'->>'{{child}}'").replace("{child}", child),
+            format!("data->'{}'->>'{}'", parent, child),
             false,
         ));
     }
@@ -751,18 +751,11 @@ fn build_filters(
     let mut idx = start_idx;
 
     for filter in filters {
-        let (sql_field, is_ts) = resolve_filter_field(&filter.field)?;
+        let (sql_field, _is_ts) = resolve_filter_field(&filter.field)?;
 
-        // For timestamp columns, compare using the column directly with cast.
-        // For JSONB fields, compare as text.
         let make_compare = |op: &str, idx: &mut i32| -> (String, Vec<PgParam>) {
             let val = json_value_to_text_string(&filter.value);
-            let clause = if is_ts {
-                // Cast both sides for proper timestamp comparison.
-                format!("{sql_field} {op} ${}", *idx)
-            } else {
-                format!("{sql_field} {op} ${}", *idx)
-            };
+            let clause = format!("{sql_field} {op} ${}", *idx);
             *idx += 1;
             (clause, vec![Box::new(val) as PgParam])
         };

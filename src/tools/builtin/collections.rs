@@ -1389,31 +1389,27 @@ impl Tool for CollectionQueryTool {
     fn description(&self) -> &str {
         "Query records with optional filters, ordering, and limit. \
          Returns matching records sorted by the specified field or by creation date. \
-         You can filter on 'created_at' (record creation timestamp) and \
+         You can filter on 'created_at' or 'updated_at' (record timestamps) and \
          nested system fields like '_lineage.source' using dot notation."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         let mut field_names: Vec<&str> = self.schema.fields.keys().map(|s| s.as_str()).collect();
-        // Include created_at as a filterable field for time-based queries.
-        let mut filter_field_names = field_names.clone();
-        filter_field_names.push("created_at");
         // Sort for deterministic schema output.
         field_names.sort();
-        filter_field_names.sort();
 
         json!({
             "type": "object",
             "properties": {
                 "filters": {
                     "type": "array",
-                    "description": "Optional filters to apply. Use 'created_at' for time-based filters (e.g. records created today). Use dot notation for nested system fields (e.g. '_lineage.source').",
+                    "description": "Optional filters to apply. Use 'created_at' or 'updated_at' for time-based filters (e.g. records created today). Use dot notation for nested system fields (e.g. '_lineage.source').",
                     "items": {
                         "type": "object",
                         "properties": {
                             "field": {
                                 "type": "string",
-                                "description": "Field to filter on. Schema fields, 'created_at', or dot-notation system fields like '_lineage.source'."
+                                "description": "Field to filter on. Schema fields, 'created_at', 'updated_at', or dot-notation system fields like '_lineage.source'."
                             },
                             "op": {
                                 "type": "string",
@@ -1475,7 +1471,7 @@ impl Tool for CollectionQueryTool {
             let is_system_dot = f.field.starts_with('_') && f.field.contains('.');
             if !is_schema_field && !is_db_column && !is_system_dot {
                 return Err(ToolError::InvalidParameters(format!(
-                    "Unknown filter field '{}'. Available fields: {}, created_at, or _lineage.* system fields",
+                    "Unknown filter field '{}'. Available fields: {}, created_at, updated_at, or _lineage.* system fields",
                     f.field,
                     self.schema
                         .fields
@@ -1578,7 +1574,7 @@ impl Tool for CollectionSummaryTool {
     fn description(&self) -> &str {
         "Summarize records with aggregation operations like sum, count, average, \
          min, or max. Optionally group results by a field and filter before aggregating. \
-         Filters support 'created_at' and dot-notation system fields like '_lineage.source'."
+         Filters support 'created_at', 'updated_at', and dot-notation system fields like '_lineage.source'."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1611,13 +1607,13 @@ impl Tool for CollectionSummaryTool {
                 },
                 "filters": {
                     "type": "array",
-                    "description": "Optional filters to apply before aggregating. Use 'created_at' for time-based filters. Use dot notation for nested system fields (e.g. '_lineage.source').",
+                    "description": "Optional filters to apply before aggregating. Use 'created_at' or 'updated_at' for time-based filters. Use dot notation for nested system fields (e.g. '_lineage.source').",
                     "items": {
                         "type": "object",
                         "properties": {
                             "field": {
                                 "type": "string",
-                                "description": "Field to filter on. Schema fields, 'created_at', or dot-notation system fields like '_lineage.source'."
+                                "description": "Field to filter on. Schema fields, 'created_at', 'updated_at', or dot-notation system fields like '_lineage.source'."
                             },
                             "op": {
                                 "type": "string",

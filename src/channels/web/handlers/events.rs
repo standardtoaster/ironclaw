@@ -36,8 +36,8 @@ pub struct EventIngestResponse {
 
 /// POST /api/events/ingest
 ///
-/// Ingest an external event into a structured collection. Injects system fields
-/// (`_source`, `_timestamp`, `_lineage`) for provenance tracking.
+/// Ingest an external event into a structured collection. Injects `_lineage`
+/// system field for provenance tracking.
 pub async fn events_ingest_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<EventIngestRequest>,
@@ -59,21 +59,28 @@ pub async fn events_ingest_handler(
         .clone()
         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
 
-    // Inject system fields into the data.
+    // Inject _lineage system field into the data.
     let mut data = req.data.clone();
-    if let Some(obj) = data.as_object_mut() {
-        obj.insert("_source".to_string(), serde_json::json!(req.source));
-        obj.insert("_timestamp".to_string(), serde_json::json!(timestamp));
-        obj.insert(
-            "_lineage".to_string(),
-            serde_json::json!({
-                "source": req.source,
-                "source_id": event_id.to_string(),
-                "created_by": req.source,
-                "context": req.context,
-                "timestamp": timestamp
-            }),
-        );
+    match data.as_object_mut() {
+        Some(obj) => {
+            obj.insert(
+                "_lineage".to_string(),
+                serde_json::json!({
+                    "source": req.source,
+                    "source_id": event_id.to_string(),
+                    "created_by": req.source,
+                    "context": req.context,
+                    "timestamp": timestamp
+                }),
+            );
+        }
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "event data must be a JSON object"})),
+            )
+                .into_response();
+        }
     }
 
     match db
