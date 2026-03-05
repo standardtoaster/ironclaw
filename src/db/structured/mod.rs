@@ -217,15 +217,10 @@ fn validate_identifier(name: &str, kind: &str) -> Result<(), ValidationError> {
             reason: format!("{kind} must not start with an underscore"),
         });
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(ValidationError::InvalidName {
             name: name.to_string(),
-            reason: format!(
-                "{kind} must contain only alphanumeric characters and underscores"
-            ),
+            reason: format!("{kind} must contain only alphanumeric characters and underscores"),
         });
     }
     Ok(())
@@ -276,12 +271,13 @@ impl CollectionSchema {
                     });
                 }
                 validate_field_name(&alt.field)?;
-                let field_type = alt.field_type.clone().ok_or_else(|| {
-                    ValidationError::InvalidName {
-                        name: alt.field.clone(),
-                        reason: "field_type is required for add_field".to_string(),
-                    }
-                })?;
+                let field_type =
+                    alt.field_type
+                        .clone()
+                        .ok_or_else(|| ValidationError::InvalidName {
+                            name: alt.field.clone(),
+                            reason: "field_type is required for add_field".to_string(),
+                        })?;
                 if matches!(field_type, FieldType::Enum { ref values } if values.is_empty()) {
                     return Err(ValidationError::InvalidName {
                         name: alt.field.clone(),
@@ -321,12 +317,13 @@ impl CollectionSchema {
                         });
                     }
                 };
-                let new_value = alt.value.as_ref().ok_or_else(|| {
-                    ValidationError::InvalidName {
+                let new_value = alt
+                    .value
+                    .as_ref()
+                    .ok_or_else(|| ValidationError::InvalidName {
                         name: alt.field.clone(),
                         reason: "value is required for add_enum_value".to_string(),
-                    }
-                })?;
+                    })?;
                 if values.contains(new_value) {
                     return Err(ValidationError::InvalidEnumValue {
                         field: alt.field.clone(),
@@ -352,12 +349,13 @@ impl CollectionSchema {
                         });
                     }
                 };
-                let rm_value = alt.value.as_ref().ok_or_else(|| {
-                    ValidationError::InvalidName {
+                let rm_value = alt
+                    .value
+                    .as_ref()
+                    .ok_or_else(|| ValidationError::InvalidName {
                         name: alt.field.clone(),
                         reason: "value is required for remove_enum_value".to_string(),
-                    }
-                })?;
+                    })?;
                 let pos = values.iter().position(|v| v == rm_value).ok_or_else(|| {
                     ValidationError::InvalidEnumValue {
                         field: alt.field.clone(),
@@ -389,9 +387,7 @@ impl CollectionSchema {
         // Reject unknown fields (system fields pass through).
         for key in obj.keys() {
             if !self.fields.contains_key(key) && !is_system_field(key) {
-                return Err(ValidationError::UnknownField {
-                    field: key.clone(),
-                });
+                return Err(ValidationError::UnknownField { field: key.clone() });
             }
         }
 
@@ -448,9 +444,7 @@ impl CollectionSchema {
         // Reject unknown fields.
         for key in obj.keys() {
             if !self.fields.contains_key(key) {
-                return Err(ValidationError::UnknownField {
-                    field: key.clone(),
-                });
+                return Err(ValidationError::UnknownField { field: key.clone() });
             }
         }
 
@@ -498,11 +492,14 @@ fn try_parse_natural_date(s: &str) -> Option<NaiveDate> {
         "this week" | "this week." => return Some(today),
         "next week" => {
             // Next Monday.
-            let days_until_monday = (Weekday::Mon.num_days_from_monday() as i64
-                + 7
+            let days_until_monday = (Weekday::Mon.num_days_from_monday() as i64 + 7
                 - today.weekday().num_days_from_monday() as i64)
                 % 7;
-            let days = if days_until_monday == 0 { 7 } else { days_until_monday };
+            let days = if days_until_monday == 0 {
+                7
+            } else {
+                days_until_monday
+            };
             return Some(today + chrono::Duration::days(days));
         }
         _ => {}
@@ -510,8 +507,7 @@ fn try_parse_natural_date(s: &str) -> Option<NaiveDate> {
 
     // "monday", "tuesday", ... → next occurrence of that weekday.
     if let Some(target) = parse_weekday(&lower) {
-        let days = (target.num_days_from_monday() as i64
-            + 7
+        let days = (target.num_days_from_monday() as i64 + 7
             - today.weekday().num_days_from_monday() as i64)
             % 7;
         let days = if days == 0 { 7 } else { days };
@@ -522,8 +518,7 @@ fn try_parse_natural_date(s: &str) -> Option<NaiveDate> {
     if let Some(rest) = lower.strip_prefix("next ")
         && let Some(target) = parse_weekday(rest.trim())
     {
-        let days = (target.num_days_from_monday() as i64
-            + 7
+        let days = (target.num_days_from_monday() as i64 + 7
             - today.weekday().num_days_from_monday() as i64)
             % 7;
         let days = if days == 0 { 7 } else { days };
@@ -581,11 +576,13 @@ pub fn validate_field_value(
             }
         }
         FieldType::Date => {
-            let s = value.as_str().ok_or_else(|| ValidationError::TypeMismatch {
-                field: field.to_string(),
-                expected: "date (string)".to_string(),
-                got: json_type_name(value).to_string(),
-            })?;
+            let s = value
+                .as_str()
+                .ok_or_else(|| ValidationError::TypeMismatch {
+                    field: field.to_string(),
+                    expected: "date (string)".to_string(),
+                    got: json_type_name(value).to_string(),
+                })?;
             // Accept YYYY-MM-DD or common NL expressions ("today", "tomorrow", etc.)
             if NaiveDate::parse_from_str(s, "%Y-%m-%d").is_err()
                 && try_parse_natural_date(s).is_none()
@@ -599,11 +596,13 @@ pub fn validate_field_value(
             }
         }
         FieldType::Time => {
-            let s = value.as_str().ok_or_else(|| ValidationError::TypeMismatch {
-                field: field.to_string(),
-                expected: "time (string)".to_string(),
-                got: json_type_name(value).to_string(),
-            })?;
+            let s = value
+                .as_str()
+                .ok_or_else(|| ValidationError::TypeMismatch {
+                    field: field.to_string(),
+                    expected: "time (string)".to_string(),
+                    got: json_type_name(value).to_string(),
+                })?;
             NaiveTime::parse_from_str(s, "%H:%M:%S")
                 .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M"))
                 .map_err(|e| ValidationError::InvalidTimeFormat {
@@ -612,11 +611,13 @@ pub fn validate_field_value(
                 })?;
         }
         FieldType::DateTime => {
-            let s = value.as_str().ok_or_else(|| ValidationError::TypeMismatch {
-                field: field.to_string(),
-                expected: "datetime (string)".to_string(),
-                got: json_type_name(value).to_string(),
-            })?;
+            let s = value
+                .as_str()
+                .ok_or_else(|| ValidationError::TypeMismatch {
+                    field: field.to_string(),
+                    expected: "datetime (string)".to_string(),
+                    got: json_type_name(value).to_string(),
+                })?;
             DateTime::<FixedOffset>::parse_from_rfc3339(s).map_err(|e| {
                 ValidationError::InvalidDateTimeFormat {
                     field: field.to_string(),
@@ -640,11 +641,13 @@ pub fn validate_field_value(
             }
         }
         FieldType::Enum { values } => {
-            let s = value.as_str().ok_or_else(|| ValidationError::TypeMismatch {
-                field: field.to_string(),
-                expected: "enum (string)".to_string(),
-                got: json_type_name(value).to_string(),
-            })?;
+            let s = value
+                .as_str()
+                .ok_or_else(|| ValidationError::TypeMismatch {
+                    field: field.to_string(),
+                    expected: "enum (string)".to_string(),
+                    got: json_type_name(value).to_string(),
+                })?;
             if !values.iter().any(|v| v == s) {
                 return Err(ValidationError::InvalidEnumValue {
                     field: field.to_string(),
@@ -760,14 +763,10 @@ pub trait StructuredStore: Send + Sync {
 
     /// List all collection schemas for the given user.
     async fn list_collections(&self, user_id: &str)
-        -> Result<Vec<CollectionSchema>, DatabaseError>;
+    -> Result<Vec<CollectionSchema>, DatabaseError>;
 
     /// Drop a collection and all its records.
-    async fn drop_collection(
-        &self,
-        user_id: &str,
-        collection: &str,
-    ) -> Result<(), DatabaseError>;
+    async fn drop_collection(&self, user_id: &str, collection: &str) -> Result<(), DatabaseError>;
 
     /// Insert a new record into a collection. Returns the generated record ID.
     async fn insert_record(
@@ -778,8 +777,7 @@ pub trait StructuredStore: Send + Sync {
     ) -> Result<Uuid, DatabaseError>;
 
     /// Retrieve a single record by ID.
-    async fn get_record(&self, user_id: &str, record_id: Uuid)
-        -> Result<Record, DatabaseError>;
+    async fn get_record(&self, user_id: &str, record_id: Uuid) -> Result<Record, DatabaseError>;
 
     /// Update fields on an existing record (partial update / merge).
     async fn update_record(
@@ -790,8 +788,7 @@ pub trait StructuredStore: Send + Sync {
     ) -> Result<(), DatabaseError>;
 
     /// Delete a single record by ID.
-    async fn delete_record(&self, user_id: &str, record_id: Uuid)
-        -> Result<(), DatabaseError>;
+    async fn delete_record(&self, user_id: &str, record_id: Uuid) -> Result<(), DatabaseError>;
 
     /// Query records in a collection with optional filters, ordering, and limit.
     async fn query_records(

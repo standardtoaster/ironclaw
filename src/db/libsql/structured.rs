@@ -37,11 +37,31 @@ fn row_to_record(row: &libsql::Row) -> Result<Record, DatabaseError> {
     })
 }
 
+/// Resolve a filter field value from a record, supporting dot-notation for nested fields.
+///
+/// Special cases:
+/// - `created_at` / `updated_at` → handled by caller (uses Record fields, not data)
+/// - `_lineage.source` → `data["_lineage"]["source"]`
+/// - `name` → `data["name"]`
+fn resolve_field_value<'a>(
+    data: &'a serde_json::Value,
+    field: &str,
+) -> Option<&'a serde_json::Value> {
+    if let Some((parent, child)) = field.split_once('.') {
+        data.get(parent).and_then(|v| v.get(child))
+    } else {
+        data.get(field)
+    }
+}
+
 /// Check whether a single record's field value matches a filter.
 ///
 /// Returns true if the record passes the filter.
+///
+/// For `created_at` / `updated_at` filters, callers should use
+/// `matches_filter_with_record` instead.
 fn matches_filter(data: &serde_json::Value, filter: &Filter) -> Result<bool, DatabaseError> {
-    let field_val = data.get(&filter.field);
+    let field_val = resolve_field_value(data, &filter.field);
 
     match filter.op {
         FilterOp::IsNull => Ok(field_val.is_none() || field_val == Some(&serde_json::Value::Null)),
@@ -62,12 +82,16 @@ fn matches_filter(data: &serde_json::Value, filter: &Filter) -> Result<bool, Dat
             };
             Ok(json_to_text(fv) != json_to_text(&filter.value))
         }
-        FilterOp::Gt => Ok(compare_fields(field_val, &filter.value) == Some(std::cmp::Ordering::Greater)),
+        FilterOp::Gt => {
+            Ok(compare_fields(field_val, &filter.value) == Some(std::cmp::Ordering::Greater))
+        }
         FilterOp::Gte => {
             let ord = compare_fields(field_val, &filter.value);
             Ok(ord == Some(std::cmp::Ordering::Greater) || ord == Some(std::cmp::Ordering::Equal))
         }
-        FilterOp::Lt => Ok(compare_fields(field_val, &filter.value) == Some(std::cmp::Ordering::Less)),
+        FilterOp::Lt => {
+            Ok(compare_fields(field_val, &filter.value) == Some(std::cmp::Ordering::Less))
+        }
         FilterOp::Lte => {
             let ord = compare_fields(field_val, &filter.value);
             Ok(ord == Some(std::cmp::Ordering::Less) || ord == Some(std::cmp::Ordering::Equal))
@@ -105,6 +129,32 @@ fn matches_filter(data: &serde_json::Value, filter: &Filter) -> Result<bool, Dat
     }
 }
 
+/// Check whether a record matches a filter, with access to the full Record
+/// (needed for `created_at` / `updated_at` column filters).
+fn matches_filter_with_record(record: &Record, filter: &Filter) -> Result<bool, DatabaseError> {
+    // Handle DB column fields by converting to a JSON string value.
+    if filter.field == "created_at" || filter.field == "updated_at" {
+        let ts = if filter.field == "created_at" {
+            &record.created_at
+        } else {
+            &record.updated_at
+        };
+        let ts_str = ts.to_rfc3339();
+        let ts_val = serde_json::Value::String(ts_str);
+        // Create a temporary object with the timestamp as the field value
+        // and delegate to matches_filter.
+        let tmp = serde_json::json!({ &filter.field: ts_val });
+        // Use a non-dot-notation filter against the temp object.
+        let tmp_filter = Filter {
+            field: filter.field.clone(),
+            op: filter.op.clone(),
+            value: filter.value.clone(),
+        };
+        return matches_filter(&tmp, &tmp_filter);
+    }
+    matches_filter(&record.data, filter)
+}
+
 /// Compare a record field value against a filter value, returning ordering.
 ///
 /// Both values are compared as text strings (matching PostgreSQL `data->>'field'`
@@ -127,7 +177,6 @@ fn compare_fields(
 
     Some(a.cmp(&b))
 }
-
 
 #[async_trait]
 impl StructuredStore for LibSqlBackend {
@@ -188,8 +237,7 @@ impl StructuredStore for LibSqlBackend {
             })?;
 
         let schema_str = get_text(&row, 0);
-        serde_json::from_str(&schema_str)
-            .map_err(|e| DatabaseError::Serialization(e.to_string()))
+        serde_json::from_str(&schema_str).map_err(|e| DatabaseError::Serialization(e.to_string()))
     }
 
     async fn list_collections(
@@ -219,11 +267,7 @@ impl StructuredStore for LibSqlBackend {
         Ok(schemas)
     }
 
-    async fn drop_collection(
-        &self,
-        user_id: &str,
-        collection: &str,
-    ) -> Result<(), DatabaseError> {
+    async fn drop_collection(&self, user_id: &str, collection: &str) -> Result<(), DatabaseError> {
         let conn = self.connect().await?;
 
         // Defensive: delete records explicitly rather than relying on FK cascade,
@@ -274,7 +318,14 @@ impl StructuredStore for LibSqlBackend {
             INSERT INTO structured_records (id, user_id, collection, data, created_at, updated_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             "#,
-            params![id.to_string(), user_id, collection, data_str, now.clone(), now],
+            params![
+                id.to_string(),
+                user_id,
+                collection,
+                data_str,
+                now.clone(),
+                now
+            ],
         )
         .await
         .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -282,11 +333,7 @@ impl StructuredStore for LibSqlBackend {
         Ok(id)
     }
 
-    async fn get_record(
-        &self,
-        user_id: &str,
-        record_id: Uuid,
-    ) -> Result<Record, DatabaseError> {
+    async fn get_record(&self, user_id: &str, record_id: Uuid) -> Result<Record, DatabaseError> {
         let conn = self.connect().await?;
         let mut rows = conn
             .query(
@@ -331,8 +378,7 @@ impl StructuredStore for LibSqlBackend {
 
         // Merge updates into existing data.
         let mut merged = existing.data.clone();
-        if let (Some(base), Some(patch)) = (merged.as_object_mut(), validated_updates.as_object())
-        {
+        if let (Some(base), Some(patch)) = (merged.as_object_mut(), validated_updates.as_object()) {
             for (k, v) in patch {
                 base.insert(k.clone(), v.clone());
             }
@@ -364,11 +410,7 @@ impl StructuredStore for LibSqlBackend {
         Ok(())
     }
 
-    async fn delete_record(
-        &self,
-        user_id: &str,
-        record_id: Uuid,
-    ) -> Result<(), DatabaseError> {
+    async fn delete_record(&self, user_id: &str, record_id: Uuid) -> Result<(), DatabaseError> {
         let conn = self.connect().await?;
         let n = conn
             .execute(
@@ -421,12 +463,12 @@ impl StructuredStore for LibSqlBackend {
             all_records.push(row_to_record(&row)?);
         }
 
-        // Apply filters.
+        // Apply filters (using record-aware filter for created_at/updated_at support).
         let mut filtered: Vec<Record> = Vec::new();
         for record in all_records {
             let mut passes = true;
             for filter in filters {
-                if !matches_filter(&record.data, filter)? {
+                if !matches_filter_with_record(&record, filter)? {
                     passes = false;
                     break;
                 }
@@ -441,8 +483,16 @@ impl StructuredStore for LibSqlBackend {
             Some(field) => {
                 let field_owned = field.to_string();
                 filtered.sort_by(|a, b| {
-                    let va = a.data.get(&field_owned).map(json_to_text).unwrap_or_default();
-                    let vb = b.data.get(&field_owned).map(json_to_text).unwrap_or_default();
+                    let va = a
+                        .data
+                        .get(&field_owned)
+                        .map(json_to_text)
+                        .unwrap_or_default();
+                    let vb = b
+                        .data
+                        .get(&field_owned)
+                        .map(json_to_text)
+                        .unwrap_or_default();
                     // Try numeric sort first.
                     if let (Ok(na), Ok(nb)) = (va.parse::<f64>(), vb.parse::<f64>()) {
                         return na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal);
@@ -489,12 +539,12 @@ impl StructuredStore for LibSqlBackend {
             all_records.push(row_to_record(&row)?);
         }
 
-        // Apply filters.
+        // Apply filters (using record-aware filter for created_at/updated_at support).
         let mut filtered = Vec::new();
         for record in &all_records {
             let mut passes = true;
             for filter in &aggregation.filters {
-                if !matches_filter(&record.data, filter)? {
+                if !matches_filter_with_record(record, filter)? {
                     passes = false;
                     break;
                 }
@@ -519,13 +569,21 @@ impl StructuredStore for LibSqlBackend {
 
             let mut result_map = serde_json::Map::new();
             for (key, records) in &groups {
-                let value = compute_agg(&aggregation.operation, aggregation.field.as_deref(), records)?;
+                let value = compute_agg(
+                    &aggregation.operation,
+                    aggregation.field.as_deref(),
+                    records,
+                )?;
                 result_map.insert(key.clone(), value);
             }
             Ok(serde_json::Value::Object(result_map))
         } else {
             // Single (ungrouped) aggregation.
-            compute_agg(&aggregation.operation, aggregation.field.as_deref(), &filtered)
+            compute_agg(
+                &aggregation.operation,
+                aggregation.field.as_deref(),
+                &filtered,
+            )
         }
     }
 }
@@ -539,9 +597,8 @@ fn compute_agg(
     match op {
         AggOp::Count => Ok(serde_json::json!(records.len() as i64)),
         AggOp::Sum => {
-            let field = field.ok_or_else(|| {
-                DatabaseError::Query("Sum requires a field".to_string())
-            })?;
+            let field =
+                field.ok_or_else(|| DatabaseError::Query("Sum requires a field".to_string()))?;
             let mut sum: f64 = 0.0;
             let mut has_value = false;
             for record in records {
@@ -565,9 +622,8 @@ fn compute_agg(
             }
         }
         AggOp::Avg => {
-            let field = field.ok_or_else(|| {
-                DatabaseError::Query("Avg requires a field".to_string())
-            })?;
+            let field =
+                field.ok_or_else(|| DatabaseError::Query("Avg requires a field".to_string()))?;
             let mut sum: f64 = 0.0;
             let mut count: usize = 0;
             for record in records {
@@ -591,9 +647,8 @@ fn compute_agg(
             }
         }
         AggOp::Min => {
-            let field = field.ok_or_else(|| {
-                DatabaseError::Query("Min requires a field".to_string())
-            })?;
+            let field =
+                field.ok_or_else(|| DatabaseError::Query("Min requires a field".to_string()))?;
             let mut min_val: Option<String> = None;
             for record in records {
                 if let Some(val) = record.data.get(field)
@@ -604,8 +659,7 @@ fn compute_agg(
                         None => min_val = Some(text),
                         Some(current) => {
                             // Try numeric comparison.
-                            if let (Ok(nc), Ok(nt)) =
-                                (current.parse::<f64>(), text.parse::<f64>())
+                            if let (Ok(nc), Ok(nt)) = (current.parse::<f64>(), text.parse::<f64>())
                             {
                                 if nt < nc {
                                     min_val = Some(text);
@@ -629,9 +683,8 @@ fn compute_agg(
             }
         }
         AggOp::Max => {
-            let field = field.ok_or_else(|| {
-                DatabaseError::Query("Max requires a field".to_string())
-            })?;
+            let field =
+                field.ok_or_else(|| DatabaseError::Query("Max requires a field".to_string()))?;
             let mut max_val: Option<String> = None;
             for record in records {
                 if let Some(val) = record.data.get(field)
@@ -642,8 +695,7 @@ fn compute_agg(
                         None => max_val = Some(text),
                         Some(current) => {
                             // Try numeric comparison.
-                            if let (Ok(nc), Ok(nt)) =
-                                (current.parse::<f64>(), text.parse::<f64>())
+                            if let (Ok(nc), Ok(nt)) = (current.parse::<f64>(), text.parse::<f64>())
                             {
                                 if nt > nc {
                                     max_val = Some(text);
@@ -666,5 +718,96 @@ fn compute_agg(
                 None => Ok(serde_json::Value::Null),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_field_value_simple() {
+        let data = serde_json::json!({"name": "Milk", "quantity": 2});
+        assert_eq!(
+            resolve_field_value(&data, "name"),
+            Some(&serde_json::json!("Milk"))
+        );
+        assert_eq!(
+            resolve_field_value(&data, "quantity"),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(resolve_field_value(&data, "missing"), None);
+    }
+
+    #[test]
+    fn resolve_field_value_dot_notation() {
+        let data = serde_json::json!({
+            "_lineage": {
+                "source": "webhook",
+                "created_by": "home_assistant"
+            }
+        });
+        assert_eq!(
+            resolve_field_value(&data, "_lineage.source"),
+            Some(&serde_json::json!("webhook"))
+        );
+        assert_eq!(
+            resolve_field_value(&data, "_lineage.created_by"),
+            Some(&serde_json::json!("home_assistant"))
+        );
+        assert_eq!(resolve_field_value(&data, "_lineage.missing"), None);
+        assert_eq!(resolve_field_value(&data, "other.field"), None);
+    }
+
+    #[test]
+    fn matches_filter_dot_notation() {
+        let data = serde_json::json!({
+            "name": "Milk",
+            "_lineage": {
+                "source": "webhook",
+                "created_by": "user"
+            }
+        });
+        let filter = Filter {
+            field: "_lineage.source".to_string(),
+            op: FilterOp::Eq,
+            value: serde_json::json!("webhook"),
+        };
+        assert!(matches_filter(&data, &filter).unwrap());
+
+        let filter_neq = Filter {
+            field: "_lineage.source".to_string(),
+            op: FilterOp::Eq,
+            value: serde_json::json!("conversation"),
+        };
+        assert!(!matches_filter(&data, &filter_neq).unwrap());
+    }
+
+    #[test]
+    fn matches_filter_with_record_created_at() {
+        let record = Record {
+            id: uuid::Uuid::new_v4(),
+            user_id: "test".to_string(),
+            collection: "test".to_string(),
+            data: serde_json::json!({"name": "Test"}),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        // Filter for records created after 2020 should match.
+        let filter_past = Filter {
+            field: "created_at".to_string(),
+            op: FilterOp::Gt,
+            value: serde_json::json!("2020-01-01T00:00:00+00:00"),
+        };
+        assert!(matches_filter_with_record(&record, &filter_past).unwrap());
+
+        // Filter for records created after 2099 should not match.
+        let filter_future = Filter {
+            field: "created_at".to_string(),
+            op: FilterOp::Gt,
+            value: serde_json::json!("2099-01-01T00:00:00+00:00"),
+        };
+        assert!(!matches_filter_with_record(&record, &filter_future).unwrap());
     }
 }

@@ -465,10 +465,7 @@ impl ToolRegistry {
 
         // Register management tools
         self.register_sync(Arc::new(CollectionListTool::new(Arc::clone(&db))));
-        let mut register_tool = CollectionRegisterTool::new(
-            Arc::clone(&db),
-            Arc::clone(self),
-        );
+        let mut register_tool = CollectionRegisterTool::new(Arc::clone(&db), Arc::clone(self));
         if let Some(ref dir) = skills_dir {
             register_tool = register_tool.with_skills_dir(dir.clone());
         }
@@ -476,10 +473,7 @@ impl ToolRegistry {
             register_tool = register_tool.with_skill_registry(Arc::clone(sr));
         }
         self.register_sync(Arc::new(register_tool));
-        let mut drop_tool = CollectionDropTool::new(
-            Arc::clone(&db),
-            Arc::clone(self),
-        );
+        let mut drop_tool = CollectionDropTool::new(Arc::clone(&db), Arc::clone(self));
         if let Some(ref dir) = skills_dir {
             drop_tool = drop_tool.with_skills_dir(dir.clone());
         }
@@ -487,10 +481,7 @@ impl ToolRegistry {
             drop_tool = drop_tool.with_skill_registry(Arc::clone(sr));
         }
         self.register_sync(Arc::new(drop_tool));
-        let mut alter_tool = CollectionsAlterTool::new(
-            Arc::clone(&db),
-            Arc::clone(self),
-        );
+        let mut alter_tool = CollectionsAlterTool::new(Arc::clone(&db), Arc::clone(self));
         if let Some(ref dir) = skills_dir {
             alter_tool = alter_tool.with_skills_dir(dir.clone());
         }
@@ -518,7 +509,9 @@ impl ToolRegistry {
             }
             Err(e) => {
                 tracing::warn!("Failed to load collection schemas: {e}");
-                tracing::info!("Registered 4 collection management tools (no existing schemas loaded)");
+                tracing::info!(
+                    "Registered 4 collection management tools (no existing schemas loaded)"
+                );
             }
         }
     }

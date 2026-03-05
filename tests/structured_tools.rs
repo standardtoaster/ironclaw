@@ -12,11 +12,11 @@ use ironclaw::context::JobContext;
 use ironclaw::db::Database;
 use ironclaw::db::libsql::LibSqlBackend;
 use ironclaw::db::structured::CollectionSchema;
+use ironclaw::tools::Tool;
 use ironclaw::tools::builtin::collections::{
     CollectionAddTool, CollectionDeleteTool, CollectionQueryTool, CollectionSummaryTool,
     CollectionUpdateTool, generate_collection_tools,
 };
-use ironclaw::tools::Tool;
 
 // ==================== Setup ====================
 
@@ -174,9 +174,7 @@ async fn add_rejects_invalid_data_via_tool() {
     let add_tool = CollectionAddTool::new(schema, Arc::clone(&db));
 
     // Missing required field
-    let err = add_tool
-        .execute(json!({ "notes": "no date" }), &ctx)
-        .await;
+    let err = add_tool.execute(json!({ "notes": "no date" }), &ctx).await;
     assert!(err.is_err());
 }
 
@@ -266,10 +264,11 @@ async fn delete_via_tool() {
     assert_eq!(result.result["status"], "deleted");
 
     // Verify deleted
-    assert!(db
-        .get_record("andrew", uuid::Uuid::parse_str(&record_id).unwrap())
-        .await
-        .is_err());
+    assert!(
+        db.get_record("andrew", uuid::Uuid::parse_str(&record_id).unwrap())
+            .await
+            .is_err()
+    );
 }
 
 // ==================== Query with filters ====================
@@ -371,12 +370,9 @@ async fn summary_sum_via_tool() {
 
     // The aggregation result is the raw value (e.g., 24.5 for sum)
     let agg = &result.result["aggregation"];
-    let total: f64 = agg.as_f64().unwrap_or_else(|| {
-        agg.as_str()
-            .unwrap_or("0")
-            .parse()
-            .unwrap_or(0.0)
-    });
+    let total: f64 = agg
+        .as_f64()
+        .unwrap_or_else(|| agg.as_str().unwrap_or("0").parse().unwrap_or(0.0));
     assert!((total - 24.5).abs() < 0.01);
 }
 
@@ -414,12 +410,9 @@ async fn summary_count_via_tool() {
         .expect("count should succeed");
 
     let agg = &result.result["aggregation"];
-    let count: f64 = agg.as_f64().unwrap_or_else(|| {
-        agg.as_str()
-            .unwrap_or("0")
-            .parse()
-            .unwrap_or(0.0)
-    });
+    let count: f64 = agg
+        .as_f64()
+        .unwrap_or_else(|| agg.as_str().unwrap_or("0").parse().unwrap_or(0.0));
     assert!((count - 4.0).abs() < 0.01);
 }
 
@@ -460,16 +453,10 @@ async fn tools_respect_user_isolation() {
         .unwrap();
 
     // Andrew sees 2 items
-    let result = query_tool
-        .execute(json!({}), &andrew_ctx)
-        .await
-        .unwrap();
+    let result = query_tool.execute(json!({}), &andrew_ctx).await.unwrap();
     assert_eq!(result.result["count"], 2);
 
     // Grace sees 1 item
-    let result = query_tool
-        .execute(json!({}), &grace_ctx)
-        .await
-        .unwrap();
+    let result = query_tool.execute(json!({}), &grace_ctx).await.unwrap();
     assert_eq!(result.result["count"], 1);
 }

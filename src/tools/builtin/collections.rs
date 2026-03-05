@@ -26,10 +26,10 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::context::JobContext;
+use crate::db::Database;
 use crate::db::structured::{
     AggOp, Aggregation, AlterOperation, Alteration, CollectionSchema, FieldType, Filter,
 };
-use crate::db::Database;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, ToolRateLimitConfig, require_str};
 
@@ -40,9 +40,15 @@ fn field_type_to_json_schema(field_type: &FieldType) -> serde_json::Value {
     match field_type {
         FieldType::Text => json!({ "type": "string" }),
         FieldType::Number => json!({ "type": "number" }),
-        FieldType::Date => json!({ "type": "string", "format": "date", "description": "Date in YYYY-MM-DD format" }),
-        FieldType::Time => json!({ "type": "string", "description": "Time in HH:MM or HH:MM:SS format" }),
-        FieldType::DateTime => json!({ "type": "string", "format": "date-time", "description": "ISO 8601 datetime (e.g. 2026-02-22T08:00:00Z)" }),
+        FieldType::Date => {
+            json!({ "type": "string", "format": "date", "description": "Date in YYYY-MM-DD format" })
+        }
+        FieldType::Time => {
+            json!({ "type": "string", "description": "Time in HH:MM or HH:MM:SS format" })
+        }
+        FieldType::DateTime => {
+            json!({ "type": "string", "format": "date-time", "description": "ISO 8601 datetime (e.g. 2026-02-22T08:00:00Z)" })
+        }
         FieldType::Bool => json!({ "type": "boolean" }),
         FieldType::Enum { values } => json!({ "type": "string", "enum": values }),
     }
@@ -100,12 +106,14 @@ pub(crate) fn generate_collection_skill(schema: &CollectionSchema, skills_dir: &
 
     // Description words (skip short/common ones)
     let stopwords = [
-        "a", "an", "the", "and", "or", "of", "for", "to", "in", "on", "with", "is", "are",
-        "was", "were", "be", "been", "being", "has", "have", "had", "do", "does", "did", "this",
-        "that", "it", "its", "my", "our", "your",
+        "a", "an", "the", "and", "or", "of", "for", "to", "in", "on", "with", "is", "are", "was",
+        "were", "be", "been", "being", "has", "have", "had", "do", "does", "did", "this", "that",
+        "it", "its", "my", "our", "your",
     ];
     for word in description.split_whitespace() {
-        let w = word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        let w = word
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
         if w.len() > 3 && !stopwords.contains(&w.as_str()) && !keywords.contains(&w) {
             keywords.push(w);
         }
@@ -232,10 +240,7 @@ When the user mentions items to add, ALWAYS call {name}_add immediately:
         );
         return;
     }
-    tracing::info!(
-        "Generated per-collection skill: {}",
-        skill_path.display()
-    );
+    tracing::info!("Generated per-collection skill: {}", skill_path.display());
 }
 
 /// Human-readable display for a field type.
@@ -491,11 +496,10 @@ impl Tool for CollectionListTool {
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
-        let schemas = self
-            .db
-            .list_collections(&ctx.user_id)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to list collections: {e}")))?;
+        let schemas =
+            self.db.list_collections(&ctx.user_id).await.map_err(|e| {
+                ToolError::ExecutionFailed(format!("Failed to list collections: {e}"))
+            })?;
 
         let collections: Vec<serde_json::Value> = schemas
             .iter()
@@ -641,14 +645,12 @@ impl Tool for CollectionRegisterTool {
         let start = std::time::Instant::now();
 
         // Parse the schema from parameters
-        let schema: CollectionSchema = serde_json::from_value(params.clone()).map_err(|e| {
-            ToolError::InvalidParameters(format!("Invalid collection schema: {e}"))
-        })?;
+        let schema: CollectionSchema = serde_json::from_value(params.clone())
+            .map_err(|e| ToolError::InvalidParameters(format!("Invalid collection schema: {e}")))?;
 
         // Validate name
-        CollectionSchema::validate_name(&schema.collection).map_err(|e| {
-            ToolError::InvalidParameters(format!("Invalid collection name: {e}"))
-        })?;
+        CollectionSchema::validate_name(&schema.collection)
+            .map_err(|e| ToolError::InvalidParameters(format!("Invalid collection name: {e}")))?;
 
         // Validate field count limits
         if schema.fields.len() > 50 {
@@ -657,7 +659,9 @@ impl Tool for CollectionRegisterTool {
             ));
         }
         for (name, def) in &schema.fields {
-            if let FieldType::Enum { values } = &def.field_type && values.len() > 100 {
+            if let FieldType::Enum { values } = &def.field_type
+                && values.len() > 100
+            {
                 return Err(ToolError::InvalidParameters(format!(
                     "Enum field '{name}' exceeds maximum of 100 values"
                 )));
@@ -665,9 +669,9 @@ impl Tool for CollectionRegisterTool {
         }
 
         // Validate default values match their declared types
-        schema.validate_defaults().map_err(|e| {
-            ToolError::InvalidParameters(format!("Invalid default value: {e}"))
-        })?;
+        schema
+            .validate_defaults()
+            .map_err(|e| ToolError::InvalidParameters(format!("Invalid default value: {e}")))?;
 
         // Register in database
         self.db
@@ -778,9 +782,7 @@ impl Tool for CollectionDropTool {
         self.db
             .drop_collection(&ctx.user_id, collection)
             .await
-            .map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to drop collection: {e}"))
-            })?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to drop collection: {e}")))?;
 
         // Unregister per-collection tools
         let tool_suffixes = ["_add", "_update", "_delete", "_query", "_summary"];
@@ -816,9 +818,7 @@ impl Tool for CollectionDropTool {
                     match crate::skills::load_and_validate_skill(
                         &router_path,
                         crate::skills::SkillTrust::Trusted,
-                        crate::skills::SkillSource::User(
-                            skills_dir.join("collections-router"),
-                        ),
+                        crate::skills::SkillSource::User(skills_dir.join("collections-router")),
                     )
                     .await
                     {
@@ -1002,7 +1002,10 @@ impl Tool for CollectionsAlterTool {
             field_type,
             required: params.get("required").and_then(|v| v.as_bool()),
             default: params.get("default").cloned(),
-            value: params.get("value").and_then(|v| v.as_str()).map(String::from),
+            value: params
+                .get("value")
+                .and_then(|v| v.as_str())
+                .map(String::from),
         };
 
         // Fetch current schema
@@ -1013,9 +1016,9 @@ impl Tool for CollectionsAlterTool {
             .map_err(|e| ToolError::ExecutionFailed(format!("Collection not found: {e}")))?;
 
         // Apply mutation
-        let new_schema = current.apply_alteration(&alteration).map_err(|e| {
-            ToolError::InvalidParameters(format!("Invalid alteration: {e}"))
-        })?;
+        let new_schema = current
+            .apply_alteration(&alteration)
+            .map_err(|e| ToolError::InvalidParameters(format!("Invalid alteration: {e}")))?;
 
         // Persist updated schema
         self.db
@@ -1139,9 +1142,22 @@ impl Tool for CollectionAddTool {
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
+        // Inject _lineage for provenance tracking.
+        let mut data = params;
+        if let serde_json::Value::Object(ref mut obj) = data {
+            obj.insert(
+                "_lineage".to_string(),
+                json!({
+                    "source": "conversation",
+                    "created_by": "user",
+                    "timestamp": chrono::Utc::now().to_rfc3339()
+                }),
+            );
+        }
+
         let id = self
             .db
-            .insert_record(&ctx.user_id, &self.schema.collection, params)
+            .insert_record(&ctx.user_id, &self.schema.collection, data)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to insert record: {e}")))?;
 
@@ -1206,7 +1222,10 @@ impl Tool for CollectionUpdateTool {
 
         // All collection fields are optional for updates
         for (field_name, field_def) in &self.schema.fields {
-            properties.insert(field_name.clone(), field_type_to_json_schema(&field_def.field_type));
+            properties.insert(
+                field_name.clone(),
+                field_type_to_json_schema(&field_def.field_type),
+            );
         }
 
         json!({
@@ -1224,9 +1243,8 @@ impl Tool for CollectionUpdateTool {
         let start = std::time::Instant::now();
 
         let record_id_str = require_str(&params, "record_id")?;
-        let record_id = uuid::Uuid::parse_str(record_id_str).map_err(|e| {
-            ToolError::InvalidParameters(format!("Invalid record_id: {e}"))
-        })?;
+        let record_id = uuid::Uuid::parse_str(record_id_str)
+            .map_err(|e| ToolError::InvalidParameters(format!("Invalid record_id: {e}")))?;
 
         // Extract only the collection fields (not record_id) for the update
         let mut updates = serde_json::Map::new();
@@ -1245,11 +1263,7 @@ impl Tool for CollectionUpdateTool {
         }
 
         self.db
-            .update_record(
-                &ctx.user_id,
-                record_id,
-                serde_json::Value::Object(updates),
-            )
+            .update_record(&ctx.user_id, record_id, serde_json::Value::Object(updates))
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to update record: {e}")))?;
 
@@ -1321,9 +1335,8 @@ impl Tool for CollectionDeleteTool {
         let start = std::time::Instant::now();
 
         let record_id_str = require_str(&params, "record_id")?;
-        let record_id = uuid::Uuid::parse_str(record_id_str).map_err(|e| {
-            ToolError::InvalidParameters(format!("Invalid record_id: {e}"))
-        })?;
+        let record_id = uuid::Uuid::parse_str(record_id_str)
+            .map_err(|e| ToolError::InvalidParameters(format!("Invalid record_id: {e}")))?;
 
         self.db
             .delete_record(&ctx.user_id, record_id)
@@ -1375,25 +1388,32 @@ impl Tool for CollectionQueryTool {
 
     fn description(&self) -> &str {
         "Query records with optional filters, ordering, and limit. \
-         Returns matching records sorted by the specified field or by creation date."
+         Returns matching records sorted by the specified field or by creation date. \
+         You can filter on 'created_at' (record creation timestamp) and \
+         nested system fields like '_lineage.source' using dot notation."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        let field_names: Vec<&str> = self.schema.fields.keys().map(|s| s.as_str()).collect();
+        let mut field_names: Vec<&str> = self.schema.fields.keys().map(|s| s.as_str()).collect();
+        // Include created_at as a filterable field for time-based queries.
+        let mut filter_field_names = field_names.clone();
+        filter_field_names.push("created_at");
+        // Sort for deterministic schema output.
+        field_names.sort();
+        filter_field_names.sort();
 
         json!({
             "type": "object",
             "properties": {
                 "filters": {
                     "type": "array",
-                    "description": "Optional filters to apply",
+                    "description": "Optional filters to apply. Use 'created_at' for time-based filters (e.g. records created today). Use dot notation for nested system fields (e.g. '_lineage.source').",
                     "items": {
                         "type": "object",
                         "properties": {
                             "field": {
                                 "type": "string",
-                                "enum": field_names,
-                                "description": "Field to filter on"
+                                "description": "Field to filter on. Schema fields, 'created_at', or dot-notation system fields like '_lineage.source'."
                             },
                             "op": {
                                 "type": "string",
@@ -1432,9 +1452,8 @@ impl Tool for CollectionQueryTool {
 
         // Parse filters — LLMs sometimes send "{}" (string) instead of [] (array).
         let filters: Vec<Filter> = match params.get("filters") {
-            Some(v) if v.is_array() => serde_json::from_value(v.clone()).map_err(|e| {
-                ToolError::InvalidParameters(format!("Invalid filters: {e}"))
-            })?,
+            Some(v) if v.is_array() => serde_json::from_value(v.clone())
+                .map_err(|e| ToolError::InvalidParameters(format!("Invalid filters: {e}")))?,
             Some(v) if v.is_string() => {
                 // Try parsing stringified JSON; treat "{}" or empty as no filters.
                 let s = v.as_str().unwrap_or("[]");
@@ -1449,23 +1468,38 @@ impl Tool for CollectionQueryTool {
             _ => Vec::new(),
         };
 
-        // Validate filter fields exist in the schema.
+        // Validate filter fields: allow schema fields, created_at, and dot-notation system fields.
         for f in &filters {
-            if !self.schema.fields.contains_key(&f.field) {
+            let is_schema_field = self.schema.fields.contains_key(&f.field);
+            let is_db_column = f.field == "created_at" || f.field == "updated_at";
+            let is_system_dot = f.field.starts_with('_') && f.field.contains('.');
+            if !is_schema_field && !is_db_column && !is_system_dot {
                 return Err(ToolError::InvalidParameters(format!(
-                    "Unknown filter field '{}'. Available fields: {}",
+                    "Unknown filter field '{}'. Available fields: {}, created_at, or _lineage.* system fields",
                     f.field,
-                    self.schema.fields.keys().cloned().collect::<Vec<_>>().join(", ")
+                    self.schema
+                        .fields
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )));
             }
         }
 
         let order_by = params.get("order_by").and_then(|v| v.as_str());
         // Validate order_by field exists in schema.
-        if let Some(field) = order_by && !self.schema.fields.contains_key(field) {
+        if let Some(field) = order_by
+            && !self.schema.fields.contains_key(field)
+        {
             return Err(ToolError::InvalidParameters(format!(
                 "Unknown order_by field '{field}'. Available fields: {}",
-                self.schema.fields.keys().cloned().collect::<Vec<_>>().join(", ")
+                self.schema
+                    .fields
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )));
         }
         // LLMs sometimes send limit as string "50" instead of 50.
@@ -1543,7 +1577,8 @@ impl Tool for CollectionSummaryTool {
 
     fn description(&self) -> &str {
         "Summarize records with aggregation operations like sum, count, average, \
-         min, or max. Optionally group results by a field and filter before aggregating."
+         min, or max. Optionally group results by a field and filter before aggregating. \
+         Filters support 'created_at' and dot-notation system fields like '_lineage.source'."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1576,14 +1611,13 @@ impl Tool for CollectionSummaryTool {
                 },
                 "filters": {
                     "type": "array",
-                    "description": "Optional filters to apply before aggregating",
+                    "description": "Optional filters to apply before aggregating. Use 'created_at' for time-based filters. Use dot notation for nested system fields (e.g. '_lineage.source').",
                     "items": {
                         "type": "object",
                         "properties": {
                             "field": {
                                 "type": "string",
-                                "enum": field_names,
-                                "description": "Field to filter on"
+                                "description": "Field to filter on. Schema fields, 'created_at', or dot-notation system fields like '_lineage.source'."
                             },
                             "op": {
                                 "type": "string",
@@ -1610,20 +1644,21 @@ impl Tool for CollectionSummaryTool {
         let start = std::time::Instant::now();
 
         let op_str = require_str(&params, "operation")?;
-        let operation: AggOp = serde_json::from_value(json!(op_str)).map_err(|e| {
-            ToolError::InvalidParameters(format!("Invalid operation: {e}"))
-        })?;
+        let operation: AggOp = serde_json::from_value(json!(op_str))
+            .map_err(|e| ToolError::InvalidParameters(format!("Invalid operation: {e}")))?;
 
-        let field = params.get("field").and_then(|v| v.as_str()).map(String::from);
+        let field = params
+            .get("field")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let group_by = params
             .get("group_by")
             .and_then(|v| v.as_str())
             .map(String::from);
 
         let filters: Vec<Filter> = match params.get("filters") {
-            Some(v) if v.is_array() => serde_json::from_value(v.clone()).map_err(|e| {
-                ToolError::InvalidParameters(format!("Invalid filters: {e}"))
-            })?,
+            Some(v) if v.is_array() => serde_json::from_value(v.clone())
+                .map_err(|e| ToolError::InvalidParameters(format!("Invalid filters: {e}")))?,
             Some(v) if v.is_string() => {
                 let s = v.as_str().unwrap_or("[]");
                 if s == "{}" || s.trim().is_empty() {

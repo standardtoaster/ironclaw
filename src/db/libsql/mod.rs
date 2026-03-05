@@ -298,7 +298,6 @@ impl Database for LibSqlBackend {
     }
 }
 
-
 // ==================== Row conversion helpers ====================
 
 pub(crate) fn row_to_memory_document(row: &libsql::Row) -> MemoryDocument {

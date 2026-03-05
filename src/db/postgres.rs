@@ -18,9 +18,7 @@ use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
     ConversationStore, Database, JobStore, RoutineStore, SandboxStore, SettingsStore,
     ToolFailureStore, WorkspaceStore, structured,
-    structured::{
-        Aggregation, CollectionSchema, Filter, Record, StructuredStore,
-    },
+    structured::{Aggregation, CollectionSchema, Filter, Record, StructuredStore},
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
@@ -689,6 +687,54 @@ fn pg_row_to_record(row: &tokio_postgres::Row) -> Result<Record, DatabaseError> 
 /// Boxed dynamic SQL parameter for tokio_postgres queries.
 type PgParam = Box<dyn tokio_postgres::types::ToSql + Sync + Send>;
 
+/// Resolve a filter field name to its SQL expression.
+///
+/// Special fields:
+/// - `created_at` / `updated_at` → use the DB column cast to text for comparison
+/// - Dot-notation (e.g. `_lineage.source`) → nested JSONB access (`data->'_lineage'->>'source'`)
+/// - Everything else → `data->>'field'`
+///
+/// Returns `(sql_expr, is_timestamp_column)`. When `is_timestamp_column` is true,
+/// callers should cast the filter value to timestamp for proper comparison.
+fn resolve_filter_field(field: &str) -> Result<(String, bool), DatabaseError> {
+    // DB column fields.
+    if field == "created_at" || field == "updated_at" {
+        return Ok((format!("{field}::text"), true));
+    }
+
+    // Dot-notation for nested JSONB: `parent.child` → `data->'parent'->>'child'`.
+    if let Some((parent, child)) = field.split_once('.') {
+        // Validate both segments to prevent SQL injection.
+        validate_filter_field_segment(parent)?;
+        validate_filter_field_segment(child)?;
+        return Ok((
+            format!("data->'{parent}'->>'{{child}}'").replace("{child}", child),
+            false,
+        ));
+    }
+
+    // Regular data field.
+    structured::validate_field_name(field).map_err(|e| DatabaseError::Query(e.to_string()))?;
+    Ok((format!("data->>'{field}'"), false))
+}
+
+/// Validate a single segment of a filter field name (for dot-notation).
+///
+/// Allows system-field prefixes (starting with `_`) in addition to regular identifiers.
+fn validate_filter_field_segment(name: &str) -> Result<(), DatabaseError> {
+    if name.is_empty() || name.len() > 64 {
+        return Err(DatabaseError::Query(format!(
+            "filter field segment '{name}' must be 1-64 characters"
+        )));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(DatabaseError::Query(format!(
+            "filter field segment '{name}' contains invalid characters"
+        )));
+    }
+    Ok(())
+}
+
 /// Build filter WHERE clauses and collect parameters for a set of filters.
 ///
 /// Returns (where_clauses, params) where where_clauses is a Vec of SQL fragments
@@ -705,67 +751,69 @@ fn build_filters(
     let mut idx = start_idx;
 
     for filter in filters {
-        let field = &filter.field;
-        structured::validate_field_name(field)
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        let (sql_field, is_ts) = resolve_filter_field(&filter.field)?;
+
+        // For timestamp columns, compare using the column directly with cast.
+        // For JSONB fields, compare as text.
+        let make_compare = |op: &str, idx: &mut i32| -> (String, Vec<PgParam>) {
+            let val = json_value_to_text_string(&filter.value);
+            let clause = if is_ts {
+                // Cast both sides for proper timestamp comparison.
+                format!("{sql_field} {op} ${}", *idx)
+            } else {
+                format!("{sql_field} {op} ${}", *idx)
+            };
+            *idx += 1;
+            (clause, vec![Box::new(val) as PgParam])
+        };
+
         match filter.op {
             structured::FilterOp::IsNull => {
-                clauses.push(format!("data->>'{field}' IS NULL"));
+                clauses.push(format!("{sql_field} IS NULL"));
             }
             structured::FilterOp::IsNotNull => {
-                clauses.push(format!("data->>'{field}' IS NOT NULL"));
+                clauses.push(format!("{sql_field} IS NOT NULL"));
             }
             structured::FilterOp::Eq => {
-                clauses.push(format!("data->>'{field}' = ${idx}"));
-                let val = json_value_to_text_string(&filter.value);
-                params.push(Box::new(val));
-                idx += 1;
+                let (clause, p) = make_compare("=", &mut idx);
+                clauses.push(clause);
+                params.extend(p);
             }
             structured::FilterOp::Neq => {
-                clauses.push(format!("data->>'{field}' != ${idx}"));
-                let val = json_value_to_text_string(&filter.value);
-                params.push(Box::new(val));
-                idx += 1;
+                let (clause, p) = make_compare("!=", &mut idx);
+                clauses.push(clause);
+                params.extend(p);
             }
             structured::FilterOp::Gt => {
-                clauses.push(format!("data->>'{field}' > ${idx}"));
-                let val = json_value_to_text_string(&filter.value);
-                params.push(Box::new(val));
-                idx += 1;
+                let (clause, p) = make_compare(">", &mut idx);
+                clauses.push(clause);
+                params.extend(p);
             }
             structured::FilterOp::Gte => {
-                clauses.push(format!("data->>'{field}' >= ${idx}"));
-                let val = json_value_to_text_string(&filter.value);
-                params.push(Box::new(val));
-                idx += 1;
+                let (clause, p) = make_compare(">=", &mut idx);
+                clauses.push(clause);
+                params.extend(p);
             }
             structured::FilterOp::Lt => {
-                clauses.push(format!("data->>'{field}' < ${idx}"));
-                let val = json_value_to_text_string(&filter.value);
-                params.push(Box::new(val));
-                idx += 1;
+                let (clause, p) = make_compare("<", &mut idx);
+                clauses.push(clause);
+                params.extend(p);
             }
             structured::FilterOp::Lte => {
-                clauses.push(format!("data->>'{field}' <= ${idx}"));
-                let val = json_value_to_text_string(&filter.value);
-                params.push(Box::new(val));
-                idx += 1;
+                let (clause, p) = make_compare("<=", &mut idx);
+                clauses.push(clause);
+                params.extend(p);
             }
             structured::FilterOp::Between => {
                 let arr = filter.value.as_array().ok_or_else(|| {
-                    DatabaseError::Query(
-                        "Between filter requires an array of [lo, hi]".to_string(),
-                    )
+                    DatabaseError::Query("Between filter requires an array of [lo, hi]".to_string())
                 })?;
                 if arr.len() != 2 {
                     return Err(DatabaseError::Query(
                         "Between filter requires exactly 2 elements".to_string(),
                     ));
                 }
-                clauses.push(format!(
-                    "data->>'{field}' BETWEEN ${idx} AND ${}",
-                    idx + 1
-                ));
+                clauses.push(format!("{sql_field} BETWEEN ${idx} AND ${}", idx + 1));
                 params.push(Box::new(json_value_to_text_string(&arr[0])));
                 params.push(Box::new(json_value_to_text_string(&arr[1])));
                 idx += 2;
@@ -782,10 +830,7 @@ fn build_filters(
                         .enumerate()
                         .map(|(i, _)| format!("${}", idx + i as i32))
                         .collect();
-                    clauses.push(format!(
-                        "data->>'{field}' IN ({})",
-                        placeholders.join(", ")
-                    ));
+                    clauses.push(format!("{sql_field} IN ({})", placeholders.join(", ")));
                     for item in arr {
                         params.push(Box::new(json_value_to_text_string(item)));
                     }
@@ -857,8 +902,7 @@ impl StructuredStore for PgBackend {
         })?;
 
         let schema_json: serde_json::Value = row.get("schema");
-        serde_json::from_value(schema_json)
-            .map_err(|e| DatabaseError::Serialization(e.to_string()))
+        serde_json::from_value(schema_json).map_err(|e| DatabaseError::Serialization(e.to_string()))
     }
 
     async fn list_collections(
@@ -883,11 +927,7 @@ impl StructuredStore for PgBackend {
         Ok(schemas)
     }
 
-    async fn drop_collection(
-        &self,
-        user_id: &str,
-        collection: &str,
-    ) -> Result<(), DatabaseError> {
+    async fn drop_collection(&self, user_id: &str, collection: &str) -> Result<(), DatabaseError> {
         let conn = self.store.conn().await?;
         let n = conn
             .execute(
@@ -930,11 +970,7 @@ impl StructuredStore for PgBackend {
         Ok(id)
     }
 
-    async fn get_record(
-        &self,
-        user_id: &str,
-        record_id: Uuid,
-    ) -> Result<Record, DatabaseError> {
+    async fn get_record(&self, user_id: &str, record_id: Uuid) -> Result<Record, DatabaseError> {
         let conn = self.store.conn().await?;
         let rows = conn
             .query(
@@ -1001,11 +1037,7 @@ impl StructuredStore for PgBackend {
         Ok(())
     }
 
-    async fn delete_record(
-        &self,
-        user_id: &str,
-        record_id: Uuid,
-    ) -> Result<(), DatabaseError> {
+    async fn delete_record(&self, user_id: &str, record_id: Uuid) -> Result<(), DatabaseError> {
         let conn = self.store.conn().await?;
         let n = conn
             .execute(
@@ -1068,8 +1100,10 @@ impl StructuredStore for PgBackend {
         params.push(Box::new(capped_limit));
 
         // Build reference slice for tokio_postgres.
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         let conn = self.store.conn().await?;
         let rows = conn.query(&sql, &param_refs).await?;
@@ -1104,27 +1138,31 @@ impl StructuredStore for PgBackend {
         let agg_expr = match aggregation.operation {
             structured::AggOp::Count => "COUNT(*)".to_string(),
             structured::AggOp::Sum => {
-                let field = aggregation.field.as_deref().ok_or_else(|| {
-                    DatabaseError::Query("Sum requires a field".to_string())
-                })?;
+                let field = aggregation
+                    .field
+                    .as_deref()
+                    .ok_or_else(|| DatabaseError::Query("Sum requires a field".to_string()))?;
                 format!("SUM((data->>'{field}')::numeric)")
             }
             structured::AggOp::Avg => {
-                let field = aggregation.field.as_deref().ok_or_else(|| {
-                    DatabaseError::Query("Avg requires a field".to_string())
-                })?;
+                let field = aggregation
+                    .field
+                    .as_deref()
+                    .ok_or_else(|| DatabaseError::Query("Avg requires a field".to_string()))?;
                 format!("AVG((data->>'{field}')::numeric)")
             }
             structured::AggOp::Min => {
-                let field = aggregation.field.as_deref().ok_or_else(|| {
-                    DatabaseError::Query("Min requires a field".to_string())
-                })?;
+                let field = aggregation
+                    .field
+                    .as_deref()
+                    .ok_or_else(|| DatabaseError::Query("Min requires a field".to_string()))?;
                 format!("MIN(data->>'{field}')")
             }
             structured::AggOp::Max => {
-                let field = aggregation.field.as_deref().ok_or_else(|| {
-                    DatabaseError::Query("Max requires a field".to_string())
-                })?;
+                let field = aggregation
+                    .field
+                    .as_deref()
+                    .ok_or_else(|| DatabaseError::Query("Max requires a field".to_string()))?;
                 format!("MAX(data->>'{field}')")
             }
         };
@@ -1159,8 +1197,10 @@ impl StructuredStore for PgBackend {
             sql.push_str(&format!(" GROUP BY data->>'{group_field}'"));
         }
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         let conn = self.store.conn().await?;
         let rows = conn.query(&sql, &param_refs).await?;
@@ -1179,9 +1219,9 @@ impl StructuredStore for PgBackend {
             Ok(serde_json::Value::Object(result_map))
         } else {
             // Single result.
-            let row = rows.first().ok_or_else(|| {
-                DatabaseError::Query("Aggregation returned no rows".to_string())
-            })?;
+            let row = rows
+                .first()
+                .ok_or_else(|| DatabaseError::Query("Aggregation returned no rows".to_string()))?;
             extract_agg_value(row, &aggregation.operation)
         }
     }
@@ -1204,9 +1244,7 @@ fn extract_agg_value(
                 Some(d) => {
                     use rust_decimal::prelude::ToPrimitive;
                     let f = d.to_f64().ok_or_else(|| {
-                        DatabaseError::Query(format!(
-                            "Cannot convert aggregate result {d} to f64"
-                        ))
+                        DatabaseError::Query(format!("Cannot convert aggregate result {d} to f64"))
                     })?;
                     Ok(serde_json::json!(f))
                 }
@@ -1226,5 +1264,45 @@ fn extract_agg_value(
                 None => Ok(serde_json::Value::Null),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_filter_field_regular() {
+        let (sql, is_ts) = resolve_filter_field("name").unwrap();
+        assert_eq!(sql, "data->>'name'");
+        assert!(!is_ts);
+    }
+
+    #[test]
+    fn resolve_filter_field_created_at() {
+        let (sql, is_ts) = resolve_filter_field("created_at").unwrap();
+        assert_eq!(sql, "created_at::text");
+        assert!(is_ts);
+    }
+
+    #[test]
+    fn resolve_filter_field_updated_at() {
+        let (sql, is_ts) = resolve_filter_field("updated_at").unwrap();
+        assert_eq!(sql, "updated_at::text");
+        assert!(is_ts);
+    }
+
+    #[test]
+    fn resolve_filter_field_dot_notation() {
+        let (sql, is_ts) = resolve_filter_field("_lineage.source").unwrap();
+        assert_eq!(sql, "data->'_lineage'->>'source'");
+        assert!(!is_ts);
+    }
+
+    #[test]
+    fn resolve_filter_field_dot_notation_rejects_injection() {
+        assert!(resolve_filter_field("_lineage.so urce").is_err());
+        assert!(resolve_filter_field("_lineage.source;DROP").is_err());
+        assert!(resolve_filter_field(".source").is_err());
     }
 }
