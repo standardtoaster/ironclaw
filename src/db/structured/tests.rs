@@ -700,7 +700,9 @@ fn alter_add_enum_value_non_enum_field() {
     };
     let err = schema.apply_alteration(&alt).unwrap_err();
     match err {
-        ValidationError::TypeMismatch { field, expected, .. } => {
+        ValidationError::TypeMismatch {
+            field, expected, ..
+        } => {
             assert_eq!(field, "name");
             assert_eq!(expected, "enum");
         }
@@ -748,4 +750,60 @@ fn alter_remove_enum_value_not_found() {
         }
         other => panic!("expected InvalidEnumValue, got {other}"),
     }
+}
+
+// ==================== _lineage System Field ====================
+
+#[test]
+fn lineage_is_system_field() {
+    assert!(is_system_field("_lineage"));
+}
+
+#[test]
+fn lineage_passes_through_validation() {
+    let schema = nanny_schema();
+    let data = serde_json::json!({
+        "date": "2026-02-22",
+        "start_time": "2026-02-22T09:00:00+00:00",
+        "end_time": "2026-02-22T17:00:00+00:00",
+        "_lineage": {
+            "source": "conversation",
+            "created_by": "user",
+            "timestamp": "2026-02-22T09:00:00Z"
+        }
+    });
+    let result = schema.validate_record(&data).unwrap();
+
+    // _lineage should be preserved in output.
+    let lineage = &result["_lineage"];
+    assert_eq!(lineage["source"], "conversation");
+    assert_eq!(lineage["created_by"], "user");
+    assert_eq!(lineage["timestamp"], "2026-02-22T09:00:00Z");
+    // Regular fields still validated.
+    assert_eq!(result["date"], "2026-02-22");
+    // Default still applied.
+    assert_eq!(result["status"], "scheduled");
+}
+
+#[test]
+fn lineage_with_full_provenance() {
+    let schema = grocery_schema();
+    let data = serde_json::json!({
+        "name": "Milk",
+        "_source": "webhook",
+        "_timestamp": "2026-03-05T10:00:00Z",
+        "_lineage": {
+            "source": "webhook",
+            "source_id": "evt-123",
+            "created_by": "home_assistant",
+            "context": "Grocery restock webhook",
+            "timestamp": "2026-03-05T10:00:00Z"
+        }
+    });
+    let result = schema.validate_record(&data).unwrap();
+
+    assert_eq!(result["_source"], "webhook");
+    assert_eq!(result["_lineage"]["source"], "webhook");
+    assert_eq!(result["_lineage"]["source_id"], "evt-123");
+    assert_eq!(result["_lineage"]["context"], "Grocery restock webhook");
 }
