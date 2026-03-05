@@ -462,6 +462,9 @@ impl ToolRegistry {
             CollectionDropTool, CollectionListTool, CollectionRegisterTool, CollectionsAlterTool,
             generate_collection_tools,
         };
+        use crate::tools::builtin::collections::{
+            generate_collection_skill, generate_router_skill,
+        };
 
         // Register management tools
         self.register_sync(Arc::new(CollectionListTool::new(Arc::clone(&db))));
@@ -490,7 +493,7 @@ impl ToolRegistry {
         }
         self.register_sync(Arc::new(alter_tool));
 
-        // Load existing schemas and generate per-collection tools
+        // Load existing schemas and generate per-collection tools + skills
         match db.list_collections(user_id).await {
             Ok(schemas) => {
                 let mut tool_count = 0;
@@ -500,7 +503,78 @@ impl ToolRegistry {
                     for tool in tools {
                         self.register(tool).await;
                     }
+
+                    // Regenerate per-collection SKILL.md (best-effort)
+                    if let Some(ref dir) = skills_dir {
+                        generate_collection_skill(schema, dir);
+
+                        if let Some(ref sr) = skill_registry {
+                            let skill_path =
+                                dir.join(&schema.collection).join("SKILL.md");
+                            match crate::skills::load_and_validate_skill(
+                                &skill_path,
+                                crate::skills::SkillTrust::Trusted,
+                                crate::skills::SkillSource::User(
+                                    dir.join(&schema.collection),
+                                ),
+                            )
+                            .await
+                            {
+                                Ok((name, skill)) => {
+                                    if let Ok(mut reg) = sr.write() {
+                                        let _ = reg.commit_remove(&name);
+                                        if let Err(e) = reg.commit_install(&name, skill) {
+                                            tracing::warn!(
+                                                "Failed to install per-collection skill on startup: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to load per-collection skill on startup: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
+
+                // Regenerate the collections-router skill (best-effort)
+                if !schemas.is_empty()
+                    && let Some(ref dir) = skills_dir
+                {
+                    generate_router_skill(&schemas, dir);
+
+                    if let Some(ref sr) = skill_registry {
+                        let router_path =
+                            dir.join("collections-router").join("SKILL.md");
+                        if router_path.exists() {
+                            match crate::skills::load_and_validate_skill(
+                                &router_path,
+                                crate::skills::SkillTrust::Trusted,
+                                crate::skills::SkillSource::User(
+                                    dir.join("collections-router"),
+                                ),
+                            )
+                            .await
+                            {
+                                Ok((rname, rskill)) => {
+                                    if let Ok(mut reg) = sr.write() {
+                                        let _ = reg.commit_remove(&rname);
+                                        let _ = reg.commit_install(&rname, rskill);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to load router skill on startup: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
                 tracing::info!(
                     "Registered 4 collection management tools + {} per-collection tools for {} schemas",
                     tool_count,

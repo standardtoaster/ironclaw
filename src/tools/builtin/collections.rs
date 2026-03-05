@@ -1759,4 +1759,130 @@ mod tests {
         let schema = field_type_to_json_schema(&FieldType::Time);
         assert_eq!(schema["type"], "string");
     }
+
+    #[test]
+    fn generate_collection_skill_produces_valid_skill_md() {
+        use std::collections::BTreeMap;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path();
+
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "task".to_string(),
+            crate::db::structured::FieldDef {
+                field_type: FieldType::Text,
+                required: true,
+                default: None,
+            },
+        );
+        fields.insert(
+            "priority".to_string(),
+            crate::db::structured::FieldDef {
+                field_type: FieldType::Enum {
+                    values: vec!["low".into(), "medium".into(), "high".into()],
+                },
+                required: false,
+                default: None,
+            },
+        );
+
+        let schema = crate::db::structured::CollectionSchema {
+            collection: "todo_items".to_string(),
+            description: Some("Track todo items and tasks".to_string()),
+            fields,
+        };
+
+        generate_collection_skill(&schema, skills_dir);
+
+        let skill_path = skills_dir.join("todo_items").join("SKILL.md");
+        assert!(skill_path.exists(), "SKILL.md should be created");
+
+        let content = std::fs::read_to_string(&skill_path).unwrap();
+
+        // Valid YAML frontmatter
+        assert!(content.starts_with("---\n"), "should start with YAML frontmatter");
+        assert!(content.contains("name: todo_items"), "should contain collection name");
+        assert!(
+            content.contains("Track todo items and tasks"),
+            "should contain description"
+        );
+
+        // Activation keywords from schema metadata
+        assert!(content.contains("todo"), "should have keyword from collection name");
+        assert!(content.contains("items"), "should have keyword from collection name");
+
+        // Tool documentation
+        assert!(content.contains("todo_items_add"), "should document add tool");
+        assert!(content.contains("todo_items_query"), "should document query tool");
+        assert!(content.contains("todo_items_summary"), "should document summary tool");
+
+        // Field documentation
+        assert!(content.contains("`task`"), "should document task field");
+        assert!(content.contains("`priority`"), "should document priority field");
+    }
+
+    #[test]
+    fn generate_collection_skill_without_description() {
+        use std::collections::BTreeMap;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "name".to_string(),
+            crate::db::structured::FieldDef {
+                field_type: FieldType::Text,
+                required: true,
+                default: None,
+            },
+        );
+
+        let schema = crate::db::structured::CollectionSchema {
+            collection: "contacts".to_string(),
+            description: None,
+            fields,
+        };
+
+        generate_collection_skill(&schema, tmp.path());
+
+        let content =
+            std::fs::read_to_string(tmp.path().join("contacts").join("SKILL.md")).unwrap();
+        assert!(
+            content.contains("Structured data collection"),
+            "should use default description"
+        );
+    }
+
+    #[test]
+    fn generate_router_skill_produces_valid_skill_md() {
+        use std::collections::BTreeMap;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+
+        let schemas = vec![
+            crate::db::structured::CollectionSchema {
+                collection: "groceries".to_string(),
+                description: Some("Grocery shopping list".to_string()),
+                fields: BTreeMap::new(),
+            },
+            crate::db::structured::CollectionSchema {
+                collection: "nanny_hours".to_string(),
+                description: Some("Track nanny work hours".to_string()),
+                fields: BTreeMap::new(),
+            },
+        ];
+
+        generate_router_skill(&schemas, tmp.path());
+
+        let router_path = tmp.path().join("collections-router").join("SKILL.md");
+        assert!(router_path.exists(), "router SKILL.md should be created");
+
+        let content = std::fs::read_to_string(&router_path).unwrap();
+        assert!(content.contains("groceries"), "should reference groceries collection");
+        assert!(content.contains("nanny_hours"), "should reference nanny_hours collection");
+    }
 }
