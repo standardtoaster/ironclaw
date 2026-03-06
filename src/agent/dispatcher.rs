@@ -207,6 +207,10 @@ impl Agent {
                 tool_defs
             };
 
+            // Filter collection tools by active skill prefixes
+            let tool_defs =
+                crate::skills::filter_tools_by_active_skills(&tool_defs, &active_skills);
+
             // Call LLM with current context; force_text drops tools to guarantee a
             // text response on the final iteration.
             let mut context = ReasoningContext::new()

@@ -175,14 +175,12 @@ impl WasmToolLoader {
         };
 
         // Inject workspace reader if capability is declared and workspace is available
-        if capabilities.workspace_read.is_some() {
-            if let Some(ref ws) = self.workspace {
-                if let Some(ref mut ws_cap) = capabilities.workspace_read {
-                    ws_cap.reader =
-                        Some(Arc::new(AsyncWorkspaceReader { workspace: Arc::clone(ws) })
-                            as Arc<dyn WorkspaceReader>);
-                }
-            }
+        if let Some(ref ws) = self.workspace
+            && let Some(ref mut ws_cap) = capabilities.workspace_read
+        {
+            ws_cap.reader =
+                Some(Arc::new(AsyncWorkspaceReader { workspace: Arc::clone(ws) })
+                    as Arc<dyn WorkspaceReader>);
         }
 
         // Register the tool

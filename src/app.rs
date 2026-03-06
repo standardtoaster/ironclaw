@@ -307,6 +307,7 @@ impl AppBuilder {
     pub async fn init_tools(
         &self,
         llm: &Arc<dyn LlmProvider>,
+        skill_registry: Option<Arc<std::sync::RwLock<SkillRegistry>>>,
     ) -> Result<
         (
             Arc<SafetyLayer>,
@@ -393,8 +394,19 @@ impl AppBuilder {
                 .as_ref()
                 .map(|g| g.user_id.as_str())
                 .unwrap_or("default");
+            let skills_dir = if self.config.skills.enabled {
+                Some(self.config.skills.local_dir.clone())
+            } else {
+                None
+            };
             tools
-                .register_collection_tools(Arc::clone(db), user_id, None, None, None)
+                .register_collection_tools(
+                    Arc::clone(db),
+                    user_id,
+                    skills_dir,
+                    skill_registry.clone(),
+                    None,
+                )
                 .await;
 
             Some(ws)
@@ -692,7 +704,18 @@ impl AppBuilder {
         self.init_secrets().await?;
 
         let (llm, cheap_llm) = self.init_llm()?;
-        let (safety, tools, embeddings, workspace) = self.init_tools(&llm).await?;
+
+        // Phase 4a: Create skill registry early so collection tools can load skills immediately
+        let skill_registry = if self.config.skills.enabled {
+            let registry = SkillRegistry::new(self.config.skills.local_dir.clone())
+                .with_installed_dir(self.config.skills.installed_dir.clone());
+            Some(Arc::new(std::sync::RwLock::new(registry)))
+        } else {
+            None
+        };
+
+        let (safety, tools, embeddings, workspace) =
+            self.init_tools(&llm, skill_registry.clone()).await?;
 
         // Create hook registry early so runtime extension activation can register hooks.
         let hooks = Arc::new(HookRegistry::new());
@@ -730,20 +753,24 @@ impl AppBuilder {
             }
         }
 
-        // Skills system
-        let (skill_registry, skill_catalog) = if self.config.skills.enabled {
-            let mut registry = SkillRegistry::new(self.config.skills.local_dir.clone())
-                .with_installed_dir(self.config.skills.installed_dir.clone());
-            let loaded = registry.discover_all().await;
+        // Skills system — Phase 4b: discover skills and register skill tools
+        // The registry was created before init_tools so collection tools can
+        // load per-collection skills immediately on register.
+        let skill_catalog = if let Some(ref sr) = skill_registry {
+            // Swap registry out to avoid holding RwLock across the await.
+            // Safe during single-threaded startup init.
+            let placeholder = SkillRegistry::new(self.config.skills.local_dir.clone());
+            let mut reg = std::mem::replace(&mut *sr.write().unwrap(), placeholder);
+            let loaded = reg.discover_all().await;
+            *sr.write().unwrap() = reg;
             if !loaded.is_empty() {
                 tracing::info!("Loaded {} skill(s): {}", loaded.len(), loaded.join(", "));
             }
-            let registry = Arc::new(std::sync::RwLock::new(registry));
             let catalog = crate::skills::catalog::shared_catalog();
-            tools.register_skill_tools(Arc::clone(&registry), Arc::clone(&catalog));
-            (Some(registry), Some(catalog))
+            tools.register_skill_tools(Arc::clone(sr), Arc::clone(&catalog));
+            Some(catalog)
         } else {
-            (None, None)
+            None
         };
 
         let context_manager = Arc::new(ContextManager::new(self.config.agent.max_parallel_jobs));
