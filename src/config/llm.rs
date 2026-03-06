@@ -100,6 +100,10 @@ pub struct AnthropicDirectConfig {
 pub struct OllamaConfig {
     pub base_url: String,
     pub model: String,
+    /// Context window size (num_ctx). If None, Ollama uses the model's default.
+    pub num_ctx: Option<u32>,
+    /// Enable/disable thinking mode. If None, uses the model's default.
+    pub think: Option<bool>,
 }
 
 /// Configuration for any OpenAI-compatible endpoint.
@@ -309,7 +313,11 @@ impl LlmConfig {
                 .or_else(|| settings.ollama_base_url.clone())
                 .unwrap_or_else(|| "http://localhost:11434".to_string());
             let model = Self::resolve_model("OLLAMA_MODEL", settings, "llama3")?;
-            Some(OllamaConfig { base_url, model })
+            let num_ctx = optional_env("OLLAMA_NUM_CTX")?
+                .and_then(|s| s.parse::<u32>().ok());
+            let think = optional_env("OLLAMA_THINK")?
+                .map(|s| !matches!(s.to_lowercase().as_str(), "false" | "0" | "no"));
+            Some(OllamaConfig { base_url, model, num_ctx, think })
         } else {
             None
         };

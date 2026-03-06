@@ -173,12 +173,36 @@ fn create_ollama_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, Ll
         })?;
 
     let model = client.completion_model(&oll.model);
+
+    // Build additional_params for Ollama-specific options (num_ctx, think).
+    let mut extra = serde_json::Map::new();
+    if let Some(ctx) = oll.num_ctx {
+        tracing::info!("Ollama num_ctx set to {}", ctx);
+        extra.insert("num_ctx".to_string(), serde_json::json!(ctx));
+    }
+    if let Some(think) = oll.think {
+        tracing::info!("Ollama think set to {}", think);
+        extra.insert("think".to_string(), serde_json::json!(think));
+    }
+    let additional_params = if extra.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(extra))
+    };
+
     tracing::info!(
-        "Using Ollama (base_url: {}, model: {})",
+        "Using Ollama (base_url: {}, model: {}, num_ctx: {:?}, think: {:?})",
         oll.base_url,
-        oll.model
+        oll.model,
+        oll.num_ctx,
+        oll.think
     );
-    Ok(Arc::new(RigAdapter::new(model, &oll.model)))
+
+    let mut adapter = RigAdapter::new(model, &oll.model);
+    if let Some(params) = additional_params {
+        adapter = adapter.with_additional_params(params);
+    }
+    Ok(Arc::new(adapter))
 }
 
 const TINFOIL_BASE_URL: &str = "https://inference.tinfoil.sh/v1";

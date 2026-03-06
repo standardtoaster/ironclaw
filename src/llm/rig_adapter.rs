@@ -34,6 +34,8 @@ pub struct RigAdapter<M: CompletionModel> {
     model_name: String,
     input_cost: Decimal,
     output_cost: Decimal,
+    /// Extra params injected into every rig-core request (e.g. Ollama `num_ctx`).
+    additional_params: Option<JsonValue>,
 }
 
 impl<M: CompletionModel> RigAdapter<M> {
@@ -47,7 +49,14 @@ impl<M: CompletionModel> RigAdapter<M> {
             model_name: name,
             input_cost,
             output_cost,
+            additional_params: None,
         }
+    }
+
+    /// Set additional params to inject into every request.
+    pub fn with_additional_params(mut self, params: JsonValue) -> Self {
+        self.additional_params = Some(params);
+        self
     }
 }
 
@@ -368,6 +377,7 @@ fn build_rig_request(
     tool_choice: Option<RigToolChoice>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+    additional_params: Option<JsonValue>,
 ) -> Result<RigRequest, LlmError> {
     // rig-core requires at least one message in chat_history
     if history.is_empty() {
@@ -387,7 +397,7 @@ fn build_rig_request(
         temperature: temperature.map(|t| t as f64),
         max_tokens: max_tokens.map(|t| t as u64),
         tool_choice,
-        additional_params: None,
+        additional_params,
     })
 }
 
@@ -427,6 +437,7 @@ where
             None,
             request.temperature,
             request.max_tokens,
+            self.additional_params.clone(),
         )?;
 
         let response =
@@ -478,6 +489,7 @@ where
             tool_choice,
             request.temperature,
             request.max_tokens,
+            self.additional_params.clone(),
         )?;
 
         let response =
