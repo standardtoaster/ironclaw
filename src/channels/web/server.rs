@@ -341,6 +341,129 @@ impl GatewayState {
     }
 }
 
+/// Build an LLM provider from a per-user config.
+///
+/// Constructs an `LlmConfig` from the user-specific fields, then delegates to
+/// `build_provider_chain` to get the full decorator chain (retry, circuit breaker, etc.).
+fn build_user_llm_provider(
+    user_cfg: &crate::config::UserLlmConfig,
+) -> Result<Arc<dyn crate::llm::LlmProvider>, crate::error::LlmError> {
+    use crate::config::{
+        AnthropicDirectConfig, LlmBackend, LlmConfig, NearAiConfig, OllamaConfig,
+        OpenAiCompatibleConfig, OpenAiDirectConfig,
+    };
+    use crate::llm::{SessionConfig, build_provider_chain};
+
+    let backend: LlmBackend = user_cfg
+        .llm_backend
+        .parse()
+        .map_err(|e: String| crate::error::LlmError::AuthFailed { provider: e })?;
+
+    // Build a minimal LlmConfig for this user's backend.
+    let mut config = LlmConfig {
+        backend,
+        nearai: NearAiConfig {
+            model: "unused".to_string(),
+            cheap_model: None,
+            base_url: "https://cloud-api.near.ai".to_string(),
+            auth_base_url: "https://private.near.ai".to_string(),
+            session_path: std::path::PathBuf::from("/tmp/unused"),
+            api_key: None,
+            fallback_model: None,
+            max_retries: 3,
+            circuit_breaker_threshold: None,
+            circuit_breaker_recovery_secs: 30,
+            response_cache_enabled: false,
+            response_cache_ttl_secs: 3600,
+            response_cache_max_entries: 1000,
+            failover_cooldown_secs: 300,
+            failover_cooldown_threshold: 3,
+            smart_routing_cascade: true,
+        },
+        openai: None,
+        anthropic: None,
+        ollama: None,
+        openai_compatible: None,
+        tinfoil: None,
+    };
+
+    match backend {
+        LlmBackend::Anthropic => {
+            let api_key = user_cfg.llm_api_key.as_ref().ok_or_else(|| {
+                crate::error::LlmError::AuthFailed {
+                    provider: "anthropic (per-user): missing llm_api_key".to_string(),
+                }
+            })?;
+            config.anthropic = Some(AnthropicDirectConfig {
+                api_key: api_key.clone(),
+                model: user_cfg.llm_model.clone(),
+                base_url: user_cfg.llm_base_url.clone(),
+            });
+        }
+        LlmBackend::OpenAi => {
+            let api_key = user_cfg.llm_api_key.as_ref().ok_or_else(|| {
+                crate::error::LlmError::AuthFailed {
+                    provider: "openai (per-user): missing llm_api_key".to_string(),
+                }
+            })?;
+            config.openai = Some(OpenAiDirectConfig {
+                api_key: api_key.clone(),
+                model: user_cfg.llm_model.clone(),
+                base_url: user_cfg.llm_base_url.clone(),
+            });
+        }
+        LlmBackend::Ollama => {
+            config.ollama = Some(OllamaConfig {
+                base_url: user_cfg
+                    .llm_base_url
+                    .clone()
+                    .unwrap_or_else(|| "http://localhost:11434".to_string()),
+                model: user_cfg.llm_model.clone(),
+                num_ctx: None,
+                think: None,
+            });
+        }
+        LlmBackend::OpenAiCompatible => {
+            let base_url = user_cfg.llm_base_url.clone().ok_or_else(|| {
+                crate::error::LlmError::AuthFailed {
+                    provider: "openai_compatible (per-user): missing llm_base_url".to_string(),
+                }
+            })?;
+            config.openai_compatible = Some(OpenAiCompatibleConfig {
+                base_url,
+                api_key: user_cfg.llm_api_key.clone(),
+                model: user_cfg.llm_model.clone(),
+                extra_headers: Vec::new(),
+            });
+        }
+        LlmBackend::NearAi => {
+            config.nearai.model = user_cfg.llm_model.clone();
+            config.nearai.api_key = user_cfg.llm_api_key.clone();
+            if let Some(ref base_url) = user_cfg.llm_base_url {
+                config.nearai.base_url = base_url.clone();
+            }
+        }
+        LlmBackend::Tinfoil => {
+            let api_key = user_cfg.llm_api_key.as_ref().ok_or_else(|| {
+                crate::error::LlmError::AuthFailed {
+                    provider: "tinfoil (per-user): missing llm_api_key".to_string(),
+                }
+            })?;
+            config.tinfoil = Some(crate::config::TinfoilConfig {
+                api_key: api_key.clone(),
+                model: user_cfg.llm_model.clone(),
+            });
+        }
+    }
+
+    // Create a minimal session manager (per-user providers don't need session auth
+    // unless they're using NearAi with session tokens, which is unlikely for per-user).
+    let session = std::sync::Arc::new(crate::llm::SessionManager::new(SessionConfig::default()));
+
+    let (provider, _cheap) = build_provider_chain(&config, session)?;
+    Ok(provider)
+}
+
 /// Start the gateway HTTP server.
 ///
 /// Returns the actual bound `SocketAddr` (useful when binding to port 0).
