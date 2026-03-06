@@ -1882,7 +1882,36 @@ mod tests {
         assert!(router_path.exists(), "router SKILL.md should be created");
 
         let content = std::fs::read_to_string(&router_path).unwrap();
+        assert!(content.starts_with("---\n"), "should have YAML frontmatter");
+        assert!(content.contains("collections_list"), "should reference collections_list tool");
         assert!(content.contains("groceries"), "should reference groceries collection");
         assert!(content.contains("nanny_hours"), "should reference nanny_hours collection");
+    }
+
+    #[test]
+    fn generate_router_skill_empty_schemas_removes_directory() {
+        use std::collections::BTreeMap;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+
+        // First, create a router skill with some schemas
+        let schemas = vec![crate::db::structured::CollectionSchema {
+            collection: "groceries".to_string(),
+            description: Some("Grocery shopping list".to_string()),
+            fields: BTreeMap::new(),
+        }];
+
+        generate_router_skill(&schemas, tmp.path());
+
+        let router_dir = tmp.path().join("collections-router");
+        let router_path = router_dir.join("SKILL.md");
+        assert!(router_path.exists(), "router SKILL.md should exist after creation");
+
+        // Now call with empty schemas — should remove the file and directory
+        generate_router_skill(&[], tmp.path());
+
+        assert!(!router_path.exists(), "router SKILL.md should be removed for empty schemas");
+        assert!(!router_dir.exists(), "router directory should be removed for empty schemas");
     }
 }

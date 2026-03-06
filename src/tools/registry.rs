@@ -527,6 +527,8 @@ impl ToolRegistry {
                                             tracing::warn!(
                                                 "Failed to install per-collection skill on startup: {e}"
                                             );
+                                        } else {
+                                            tracing::info!("Loaded per-collection skill into registry: {name}");
                                         }
                                     }
                                 }
@@ -562,7 +564,9 @@ impl ToolRegistry {
                                 Ok((rname, rskill)) => {
                                     if let Ok(mut reg) = sr.write() {
                                         let _ = reg.commit_remove(&rname);
-                                        let _ = reg.commit_install(&rname, rskill);
+                                        if let Err(e) = reg.commit_install(&rname, rskill) {
+                                            tracing::warn!("Failed to install router skill on startup: {e}");
+                                        }
                                     }
                                 }
                                 Err(e) => {
