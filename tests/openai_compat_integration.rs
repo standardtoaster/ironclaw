@@ -197,6 +197,8 @@ async fn start_test_server_with_provider(
         shutdown_tx: tokio::sync::RwLock::new(None),
         ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
         llm_provider: Some(llm_provider),
+        user_llm_providers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        user_tokens: None,
         skill_registry: None,
         skill_catalog: None,
         chat_rate_limiter: PerUserRateLimiter::new(30, 60),
@@ -687,6 +689,8 @@ async fn test_no_llm_provider_returns_503() {
         shutdown_tx: tokio::sync::RwLock::new(None),
         ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
         llm_provider: None, // No LLM!
+        user_llm_providers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        user_tokens: None,
         skill_registry: None,
         skill_catalog: None,
         chat_rate_limiter: PerUserRateLimiter::new(30, 60),

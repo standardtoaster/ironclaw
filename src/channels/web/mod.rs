@@ -93,6 +93,8 @@ impl GatewayChannel {
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(ws::WsConnectionTracker::new())),
             llm_provider: None,
+            user_llm_providers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            user_tokens: None,
             skill_registry: None,
             skill_catalog: None,
             chat_rate_limiter: server::PerUserRateLimiter::new(30, 60),
@@ -111,6 +113,7 @@ impl GatewayChannel {
 
     /// Create a gateway channel with a pre-built multi-user auth state.
     pub fn new_multi_auth(config: GatewayConfig, auth: MultiAuthState) -> Self {
+        let user_tokens = config.user_tokens.clone();
         let state = Arc::new(GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
             sse: Arc::new(SseManager::new()),
@@ -128,6 +131,8 @@ impl GatewayChannel {
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(ws::WsConnectionTracker::new())),
             llm_provider: None,
+            user_llm_providers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            user_tokens,
             skill_registry: None,
             skill_catalog: None,
             chat_rate_limiter: server::PerUserRateLimiter::new(30, 60),
@@ -163,6 +168,8 @@ impl GatewayChannel {
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: self.state.ws_tracker.clone(),
             llm_provider: self.state.llm_provider.clone(),
+            user_llm_providers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            user_tokens: self.state.user_tokens.clone(),
             skill_registry: self.state.skill_registry.clone(),
             skill_catalog: self.state.skill_catalog.clone(),
             chat_rate_limiter: server::PerUserRateLimiter::new(30, 60),
