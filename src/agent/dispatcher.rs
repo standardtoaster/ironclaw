@@ -720,6 +720,26 @@ pub(super) async fn execute_chat_tool_standalone(
     params: &serde_json::Value,
     job_ctx: &crate::context::JobContext,
 ) -> Result<String, Error> {
+    // Small models sometimes double-wrap params in an OpenAI-style envelope:
+    //   {"function": "tool_name", "arguments": {"actual": "params"}}
+    //   {"function": "tool_name", "args": {"actual": "params"}}
+    // Detect and unwrap when `function` matches the tool being called.
+    let params = if let Some(obj) = params.as_object()
+        && obj
+            .get("function")
+            .and_then(|v| v.as_str())
+            .is_some_and(|f| f == tool_name)
+        && let Some(inner) = obj.get("arguments").or_else(|| obj.get("args"))
+    {
+        tracing::debug!(
+            tool = %tool_name,
+            "Unwrapping double-wrapped arguments envelope from LLM"
+        );
+        inner
+    } else {
+        params
+    };
+
     let tool = tools
         .get(tool_name)
         .await
