@@ -1784,6 +1784,9 @@ async fn routines_trigger_handler(
         crate::agent::routine::RoutineAction::Wasm { tool_name, .. } => {
             format!("wasm: {}", tool_name)
         }
+        crate::agent::routine::RoutineAction::Script { language, .. } => {
+            format!("script: {}", language)
+        }
     };
 
     let content = format!("[routine:{}] {}", routine.name, prompt);
@@ -1938,6 +1941,7 @@ fn routine_to_info(r: &crate::agent::routine::Routine) -> RoutineInfo {
         crate::agent::routine::RoutineAction::Lightweight { .. } => "lightweight",
         crate::agent::routine::RoutineAction::FullJob { .. } => "full_job",
         crate::agent::routine::RoutineAction::Wasm { .. } => "wasm",
+        crate::agent::routine::RoutineAction::Script { .. } => "script",
     };
 
     let status = if !r.enabled {

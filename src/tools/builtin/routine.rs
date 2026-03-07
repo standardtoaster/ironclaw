@@ -443,6 +443,9 @@ impl Tool for RoutineUpdateTool {
                 RoutineAction::Wasm { escalation_prompt, .. } => {
                     *escalation_prompt = Some(prompt.to_string());
                 }
+                RoutineAction::Script { escalation_prompt, .. } => {
+                    *escalation_prompt = Some(prompt.to_string());
+                }
             }
         }
 

@@ -444,6 +444,11 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
             )
             .await
         }
+        RoutineAction::Script { .. } => {
+            Err(RoutineError::NotImplemented {
+                feature: "script routine action".to_string(),
+            })
+        }
     };
 
     // Decrement running count

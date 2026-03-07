@@ -203,6 +203,17 @@ pub enum RoutineAction {
         #[serde(skip_serializing_if = "Option::is_none")]
         escalation_prompt: Option<String>,
     },
+    /// Execute a script with the trigger data on stdin. If the script returns
+    /// {"status": "escalate"}, fall back to a Lightweight LLM call.
+    Script {
+        /// Script language: "python" or "bash".
+        language: String,
+        /// Inline script source code.
+        source: String,
+        /// Optional LLM prompt for escalation. Use {{context}} as placeholder.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        escalation_prompt: Option<String>,
+    },
 }
 
 fn default_max_tokens() -> u32 {
@@ -220,6 +231,7 @@ impl RoutineAction {
             RoutineAction::Lightweight { .. } => "lightweight",
             RoutineAction::FullJob { .. } => "full_job",
             RoutineAction::Wasm { .. } => "wasm",
+            RoutineAction::Script { .. } => "script",
         }
     }
 
@@ -300,6 +312,33 @@ impl RoutineAction {
                     escalation_prompt,
                 })
             }
+            "script" => {
+                let language = config
+                    .get("language")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| RoutineError::MissingField {
+                        context: "script action".into(),
+                        field: "language".into(),
+                    })?
+                    .to_string();
+                let source = config
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| RoutineError::MissingField {
+                        context: "script action".into(),
+                        field: "source".into(),
+                    })?
+                    .to_string();
+                let escalation_prompt = config
+                    .get("escalation_prompt")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                Ok(RoutineAction::Script {
+                    language,
+                    source,
+                    escalation_prompt,
+                })
+            }
             other => Err(RoutineError::UnknownActionType {
                 action_type: other.to_string(),
             }),
@@ -332,6 +371,15 @@ impl RoutineAction {
                 escalation_prompt,
             } => serde_json::json!({
                 "tool_name": tool_name,
+                "escalation_prompt": escalation_prompt,
+            }),
+            RoutineAction::Script {
+                language,
+                source,
+                escalation_prompt,
+            } => serde_json::json!({
+                "language": language,
+                "source": source,
                 "escalation_prompt": escalation_prompt,
             }),
         }
@@ -687,6 +735,69 @@ mod tests {
                 assert_eq!(escalation_prompt.unwrap(), "Escalate: {{context}}");
             }
             _ => panic!("Expected Wasm"),
+        }
+    }
+
+    #[test]
+    fn test_script_action_serialization() {
+        let action = RoutineAction::Script {
+            language: "python".to_string(),
+            source: "#!/usr/bin/env python3\nprint('hello')".to_string(),
+            escalation_prompt: Some("Script failed: {{context}}".to_string()),
+        };
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(json["language"], "python");
+        assert_eq!(json["source"], "#!/usr/bin/env python3\nprint('hello')");
+        assert_eq!(json["escalation_prompt"], "Script failed: {{context}}");
+
+        let roundtrip: RoutineAction = serde_json::from_value(json).unwrap();
+        match roundtrip {
+            RoutineAction::Script {
+                language,
+                source,
+                escalation_prompt,
+            } => {
+                assert_eq!(language, "python");
+                assert!(source.contains("print('hello')"));
+                assert_eq!(escalation_prompt.unwrap(), "Script failed: {{context}}");
+            }
+            _ => panic!("Expected Script"),
+        }
+    }
+
+    #[test]
+    fn test_script_action_without_escalation() {
+        let action = RoutineAction::Script {
+            language: "bash".to_string(),
+            source: "#!/bin/bash\necho done".to_string(),
+            escalation_prompt: None,
+        };
+        let json = serde_json::to_value(&action).unwrap();
+        assert!(json.get("escalation_prompt").is_none());
+    }
+
+    #[test]
+    fn test_script_action_db_roundtrip() {
+        let action = RoutineAction::Script {
+            language: "python".to_string(),
+            source: "import json, sys\nprint(json.dumps({'status': 'handled'}))".to_string(),
+            escalation_prompt: Some("Handle this: {{context}}".to_string()),
+        };
+        let tag = action.type_tag();
+        assert_eq!(tag, "script");
+        let config_json = action.to_config_json();
+        let restored = RoutineAction::from_db(tag, config_json).unwrap();
+        match restored {
+            RoutineAction::Script {
+                language,
+                source,
+                escalation_prompt,
+            } => {
+                assert_eq!(language, "python");
+                assert!(source.contains("json.dumps"));
+                assert!(escalation_prompt.unwrap().contains("{{context}}"));
+            }
+            _ => panic!("Expected Script"),
         }
     }
 }
