@@ -88,6 +88,9 @@ pub struct Agent {
     pub(super) heartbeat_config: Option<HeartbeatConfig>,
     pub(super) hygiene_config: Option<crate::config::HygieneConfig>,
     pub(super) routine_config: Option<RoutineConfig>,
+    /// Broadcast sender for collection write events (shared with gateway).
+    pub(super) collection_write_tx:
+        Option<tokio::sync::broadcast::Sender<crate::agent::collection_events::CollectionWriteEvent>>,
 }
 
 impl Agent {
@@ -105,6 +108,7 @@ impl Agent {
         routine_config: Option<RoutineConfig>,
         context_manager: Option<Arc<ContextManager>>,
         session_manager: Option<Arc<SessionManager>>,
+        collection_write_tx: Option<tokio::sync::broadcast::Sender<crate::agent::collection_events::CollectionWriteEvent>>,
     ) -> Self {
         let context_manager = context_manager
             .unwrap_or_else(|| Arc::new(ContextManager::new(config.max_parallel_jobs)));
@@ -133,6 +137,7 @@ impl Agent {
             heartbeat_config,
             hygiene_config,
             routine_config,
+            collection_write_tx,
         }
     }
 
@@ -408,6 +413,7 @@ impl Agent {
                         Arc::clone(workspace),
                         notify_tx,
                         Some(self.scheduler.clone()),
+                        Some(Arc::clone(&self.deps.tools)),
                     ));
 
                     // Register routine tools
@@ -415,8 +421,16 @@ impl Agent {
                         .tools
                         .register_routine_tools(Arc::clone(store), Arc::clone(&engine));
 
-                    // Load initial event cache
+                    // Load initial caches
                     engine.refresh_event_cache().await;
+                    engine.refresh_collection_write_cache().await;
+
+                    // Spawn collection write listener if broadcast channel is available
+                    if let Some(ref tx) = self.collection_write_tx {
+                        let rx = tx.subscribe();
+                        engine.spawn_collection_write_listener(rx);
+                        tracing::info!("CollectionWrite listener spawned");
+                    }
 
                     // Spawn notification forwarder (mirrors heartbeat pattern)
                     let channels = self.channels.clone();

@@ -95,6 +95,7 @@ impl GatewayChannel {
             cost_guard: None,
             startup_time: std::time::Instant::now(),
             restart_requested: std::sync::atomic::AtomicBool::new(false),
+            collection_write_tx: None,
         });
 
         Self {
@@ -129,6 +130,7 @@ impl GatewayChannel {
             cost_guard: self.state.cost_guard.clone(),
             startup_time: self.state.startup_time,
             restart_requested: std::sync::atomic::AtomicBool::new(false),
+            collection_write_tx: self.state.collection_write_tx.clone(),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
@@ -225,6 +227,17 @@ impl GatewayChannel {
     /// Inject the cost guard for token/cost tracking in the status popover.
     pub fn with_cost_guard(mut self, cg: Arc<crate::agent::cost_guard::CostGuard>) -> Self {
         self.rebuild_state(|s| s.cost_guard = Some(cg));
+        self
+    }
+
+    /// Inject the broadcast sender for collection write events.
+    pub fn with_collection_write_tx(
+        mut self,
+        tx: tokio::sync::broadcast::Sender<
+            crate::agent::collection_events::CollectionWriteEvent,
+        >,
+    ) -> Self {
+        self.rebuild_state(|s| s.collection_write_tx = Some(tx));
         self
     }
 

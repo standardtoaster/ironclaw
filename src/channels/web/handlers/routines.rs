@@ -153,6 +153,12 @@ pub async fn routines_trigger_handler(
         crate::agent::routine::RoutineAction::FullJob {
             title, description, ..
         } => format!("{}: {}", title, description),
+        crate::agent::routine::RoutineAction::Wasm { tool_name, .. } => {
+            format!("wasm: {}", tool_name)
+        }
+        crate::agent::routine::RoutineAction::Script { language, .. } => {
+            format!("script: {}", language)
+        }
     };
 
     let content = format!("[routine:{}] {}", routine.name, prompt);
@@ -298,11 +304,16 @@ fn routine_to_info(r: &crate::agent::routine::Routine) -> RoutineInfo {
             ("webhook".to_string(), format!("webhook: {}", p))
         }
         crate::agent::routine::Trigger::Manual => ("manual".to_string(), "manual only".to_string()),
+        crate::agent::routine::Trigger::CollectionWrite { collection } => {
+            ("collection_write".to_string(), format!("on write to {}", collection))
+        }
     };
 
     let action_type = match &r.action {
         crate::agent::routine::RoutineAction::Lightweight { .. } => "lightweight",
         crate::agent::routine::RoutineAction::FullJob { .. } => "full_job",
+        crate::agent::routine::RoutineAction::Wasm { .. } => "wasm",
+        crate::agent::routine::RoutineAction::Script { .. } => "script",
     };
 
     let status = if !r.enabled {
