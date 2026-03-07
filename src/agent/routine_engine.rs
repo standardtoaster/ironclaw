@@ -20,6 +20,7 @@ use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
 use crate::agent::Scheduler;
+use crate::agent::collection_events::CollectionWriteEvent;
 use crate::agent::routine::{
     NotifyConfig, Routine, RoutineAction, RoutineRun, RunStatus, Trigger, next_cron_fire,
 };
@@ -29,6 +30,17 @@ use crate::db::Database;
 use crate::error::RoutineError;
 use crate::llm::{ChatMessage, CompletionRequest, FinishReason, LlmProvider};
 use crate::workspace::Workspace;
+
+/// Check if a routine's CollectionWrite trigger matches an event.
+fn matches_collection_write(routine: &Routine, event: &CollectionWriteEvent) -> bool {
+    if routine.user_id != event.user_id {
+        return false;
+    }
+    match &routine.trigger {
+        Trigger::CollectionWrite { collection } => collection == &event.collection,
+        _ => false,
+    }
+}
 
 /// The routine execution engine.
 pub struct RoutineEngine {
@@ -42,6 +54,8 @@ pub struct RoutineEngine {
     running_count: Arc<AtomicUsize>,
     /// Compiled event regex cache: routine_id -> compiled regex.
     event_cache: Arc<RwLock<Vec<(Uuid, Routine, Regex)>>>,
+    /// Cache of collection-write triggered routines.
+    collection_write_cache: Arc<RwLock<Vec<Routine>>>,
     /// Scheduler for dispatching jobs (FullJob mode).
     scheduler: Option<Arc<Scheduler>>,
 }
@@ -63,6 +77,7 @@ impl RoutineEngine {
             notify_tx,
             running_count: Arc::new(AtomicUsize::new(0)),
             event_cache: Arc::new(RwLock::new(Vec::new())),
+            collection_write_cache: Arc::new(RwLock::new(Vec::new())),
             scheduler,
         }
     }
@@ -94,6 +109,53 @@ impl RoutineEngine {
                 tracing::error!("Failed to refresh event cache: {}", e);
             }
         }
+    }
+
+    /// Refresh the in-memory collection write trigger cache from DB.
+    pub async fn refresh_collection_write_cache(&self) {
+        match self.store.list_all_routines().await {
+            Ok(routines) => {
+                let filtered: Vec<Routine> = routines
+                    .into_iter()
+                    .filter(|r| r.enabled && matches!(r.trigger, Trigger::CollectionWrite { .. }))
+                    .collect();
+                let count = filtered.len();
+                *self.collection_write_cache.write().await = filtered;
+                tracing::debug!("Refreshed collection write cache: {} routines", count);
+            }
+            Err(e) => {
+                tracing::error!("Failed to refresh collection write cache: {}", e);
+            }
+        }
+    }
+
+    /// Check a collection write event against cached triggers. Returns number of routines fired.
+    pub async fn check_collection_write_triggers(&self, event: &CollectionWriteEvent) -> usize {
+        let cache = self.collection_write_cache.read().await;
+        let mut fired = 0;
+
+        for routine in cache.iter() {
+            if !matches_collection_write(routine, event) {
+                continue;
+            }
+            if !self.check_cooldown(routine) {
+                tracing::debug!(routine = %routine.name, "Skipped: cooldown active");
+                continue;
+            }
+            if !self.check_concurrent(routine).await {
+                tracing::debug!(routine = %routine.name, "Skipped: max concurrent reached");
+                continue;
+            }
+            if self.running_count.load(Ordering::Relaxed) >= self.config.max_concurrent_routines {
+                tracing::warn!(routine = %routine.name, "Skipped: global max concurrent reached");
+                continue;
+            }
+            let detail = serde_json::to_string(&event.data).unwrap_or_default();
+            self.spawn_fire(routine.clone(), "collection_write", Some(detail));
+            fired += 1;
+        }
+
+        fired
     }
 
     /// Check incoming message against event triggers. Returns number of routines fired.
@@ -643,7 +705,9 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::routine::{NotifyConfig, RunStatus};
+    use crate::agent::collection_events::CollectionWriteEvent;
+    use crate::agent::routine::{NotifyConfig, Routine, RoutineAction, RoutineGuardrails, RunStatus, Trigger};
+    use super::matches_collection_write;
 
     #[test]
     fn test_notification_gating() {
@@ -671,5 +735,68 @@ mod tests {
         ] {
             let _ = status.to_string();
         }
+    }
+
+    fn make_collection_write_routine(name: &str, collection: &str, user_id: &str) -> Routine {
+        Routine {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            description: String::new(),
+            user_id: user_id.to_string(),
+            enabled: true,
+            trigger: Trigger::CollectionWrite {
+                collection: collection.to_string(),
+            },
+            action: RoutineAction::Lightweight {
+                prompt: "test prompt".to_string(),
+                context_paths: vec![],
+                max_tokens: 1024,
+            },
+            guardrails: RoutineGuardrails::default(),
+            notify: NotifyConfig::default(),
+            last_run_at: None,
+            next_fire_at: None,
+            run_count: 0,
+            consecutive_failures: 0,
+            state: serde_json::Value::Null,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_match_collection_write_trigger() {
+        let routine = make_collection_write_routine("presence-handler", "wifi_presence", "test-user");
+        let event = CollectionWriteEvent {
+            user_id: "test-user".to_string(),
+            collection: "wifi_presence".to_string(),
+            record_id: uuid::Uuid::new_v4(),
+            data: serde_json::json!({"device": "phone", "state": "home"}),
+        };
+        assert!(matches_collection_write(&routine, &event));
+    }
+
+    #[test]
+    fn test_no_match_wrong_collection() {
+        let routine = make_collection_write_routine("presence-handler", "wifi_presence", "test-user");
+        let event = CollectionWriteEvent {
+            user_id: "test-user".to_string(),
+            collection: "nanny_shifts".to_string(),
+            record_id: uuid::Uuid::new_v4(),
+            data: serde_json::json!({}),
+        };
+        assert!(!matches_collection_write(&routine, &event));
+    }
+
+    #[test]
+    fn test_no_match_wrong_user() {
+        let routine = make_collection_write_routine("presence-handler", "wifi_presence", "test-user");
+        let event = CollectionWriteEvent {
+            user_id: "other-user".to_string(),
+            collection: "wifi_presence".to_string(),
+            record_id: uuid::Uuid::new_v4(),
+            data: serde_json::json!({}),
+        };
+        assert!(!matches_collection_write(&routine, &event));
     }
 }
