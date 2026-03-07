@@ -158,6 +158,38 @@ impl RoutineEngine {
         fired
     }
 
+    /// Spawn a background task that listens for collection write events and fires matching triggers.
+    pub fn spawn_collection_write_listener(
+        self: &Arc<Self>,
+        mut rx: tokio::sync::broadcast::Receiver<CollectionWriteEvent>,
+    ) {
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        let fired = engine.check_collection_write_triggers(&event).await;
+                        if fired > 0 {
+                            tracing::info!(
+                                collection = %event.collection,
+                                record_id = %event.record_id,
+                                fired,
+                                "CollectionWrite triggers fired"
+                            );
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "CollectionWrite listener lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::info!("CollectionWrite broadcast channel closed");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     /// Check incoming message against event triggers. Returns number of routines fired.
     ///
     /// Called synchronously from the main loop after handle_message(). The actual

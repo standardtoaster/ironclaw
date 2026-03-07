@@ -478,6 +478,11 @@ async fn async_main() -> anyhow::Result<()> {
         components.secrets_store.clone(),
     );
 
+    // ── Collection write broadcast channel ──────────────────────────────
+    // Shared between the gateway (event ingest sends) and the routine engine (listens).
+    let (collection_write_tx, _collection_write_rx) =
+        ironclaw::agent::collection_events::collection_write_channel();
+
     // ── Gateway channel ────────────────────────────────────────────────
 
     let mut gateway_url: Option<String> = None;
@@ -515,6 +520,7 @@ async fn async_main() -> anyhow::Result<()> {
             gw = gw.with_skill_catalog(Arc::clone(sc));
         }
         gw = gw.with_cost_guard(Arc::clone(&components.cost_guard));
+        gw = gw.with_collection_write_tx(collection_write_tx.clone());
         if config.sandbox.enabled {
             gw = gw.with_prompt_queue(Arc::clone(&prompt_queue));
 
@@ -678,6 +684,7 @@ async fn async_main() -> anyhow::Result<()> {
         Some(config.routines.clone()),
         Some(components.context_manager),
         Some(session_manager),
+        Some(collection_write_tx),
     );
 
     // Fill the scheduler slot now that Agent (and its Scheduler) exist.

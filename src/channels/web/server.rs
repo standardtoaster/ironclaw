@@ -168,6 +168,9 @@ pub struct GatewayState {
     pub startup_time: std::time::Instant,
     /// Flag set when a restart has been requested via the API.
     pub restart_requested: std::sync::atomic::AtomicBool,
+    /// Broadcast sender for collection write events (fires routine triggers).
+    pub collection_write_tx:
+        Option<tokio::sync::broadcast::Sender<crate::agent::collection_events::CollectionWriteEvent>>,
 }
 
 /// Start the gateway HTTP server.

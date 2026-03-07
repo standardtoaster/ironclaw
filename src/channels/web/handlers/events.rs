@@ -83,19 +83,34 @@ pub async fn events_ingest_handler(
         }
     }
 
+    // Clone data before insert (insert_record takes ownership).
+    let data_for_event = data.clone();
+
     match db
         .insert_record(&state.user_id, &req.collection, data)
         .await
     {
-        Ok(id) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!(EventIngestResponse {
-                status: "created".to_string(),
-                record_id: id.to_string(),
-                collection: req.collection,
-            })),
-        )
-            .into_response(),
+        Ok(id) => {
+            // Fire collection write triggers
+            if let Some(tx) = &state.collection_write_tx {
+                let _ = tx.send(crate::agent::collection_events::CollectionWriteEvent {
+                    user_id: state.user_id.clone(),
+                    collection: req.collection.clone(),
+                    record_id: id,
+                    data: data_for_event,
+                });
+            }
+
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!(EventIngestResponse {
+                    status: "created".to_string(),
+                    record_id: id.to_string(),
+                    collection: req.collection,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => {
             let status = if e.to_string().contains("NotFound") {
                 StatusCode::NOT_FOUND
