@@ -1274,4 +1274,183 @@ mod tests {
         );
         assert_eq!(output.unwrap(), "this is not json at all");
     }
+
+    // ── subprocess integration tests ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_execute_script_python_handled() {
+        use tokio::io::AsyncWriteExt;
+
+        let source = r#"#!/usr/bin/env python3
+import json, sys
+data = json.load(sys.stdin)
+print(json.dumps({"status": "handled"}))
+"#;
+        let script_path = std::env::temp_dir().join("ironclaw-test-handled.py");
+        tokio::fs::write(&script_path, source).await.unwrap();
+
+        let mut child = tokio::process::Command::new("python3")
+            .arg(&script_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(b"{}").await.unwrap();
+            drop(stdin);
+        }
+
+        let output = child.wait_with_output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (result, _) = parse_script_response(&stdout, output.status.code().unwrap_or(-1));
+        assert_eq!(result, ScriptResult::Handled);
+
+        let _ = tokio::fs::remove_file(&script_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_script_bash_noop() {
+        use tokio::io::AsyncWriteExt;
+
+        let source = r#"#!/usr/bin/env bash
+echo '{"status": "noop"}'
+"#;
+        let script_path = std::env::temp_dir().join("ironclaw-test-noop.sh");
+        tokio::fs::write(&script_path, source).await.unwrap();
+
+        let mut child = tokio::process::Command::new("bash")
+            .arg(&script_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(b"{}").await.unwrap();
+            drop(stdin);
+        }
+
+        let output = child.wait_with_output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (result, _) = parse_script_response(&stdout, output.status.code().unwrap_or(-1));
+        assert_eq!(result, ScriptResult::Noop);
+
+        let _ = tokio::fs::remove_file(&script_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_script_reads_stdin() {
+        use tokio::io::AsyncWriteExt;
+
+        let source = r#"#!/usr/bin/env python3
+import json, sys
+data = json.load(sys.stdin)
+if data.get("state") == "home":
+    print(json.dumps({"status": "handled", "summary": "user is home"}))
+else:
+    print(json.dumps({"status": "noop"}))
+"#;
+        let script_path = std::env::temp_dir().join("ironclaw-test-reads-stdin.py");
+        tokio::fs::write(&script_path, source).await.unwrap();
+
+        let mut child = tokio::process::Command::new("python3")
+            .arg(&script_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(br#"{"state": "home"}"#).await.unwrap();
+            drop(stdin);
+        }
+
+        let output = child.wait_with_output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (result, _) = parse_script_response(&stdout, output.status.code().unwrap_or(-1));
+        assert_eq!(result, ScriptResult::Handled);
+
+        let _ = tokio::fs::remove_file(&script_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_script_nonzero_exit() {
+        use tokio::io::AsyncWriteExt;
+
+        let source = "#!/usr/bin/env bash\nexit 1\n";
+        let script_path = std::env::temp_dir().join("ironclaw-test-nonzero.sh");
+        tokio::fs::write(&script_path, source).await.unwrap();
+
+        let mut child = tokio::process::Command::new("bash")
+            .arg(&script_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(b"{}").await.unwrap();
+            drop(stdin);
+        }
+
+        let output = child.wait_with_output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (result, _) = parse_script_response(&stdout, output.status.code().unwrap_or(-1));
+        assert_eq!(result, ScriptResult::Failed);
+
+        let _ = tokio::fs::remove_file(&script_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_script_env_vars() {
+        use tokio::io::AsyncWriteExt;
+
+        let source = r#"#!/usr/bin/env python3
+import json, os, sys
+_ = sys.stdin.read()
+result = {
+    "port_set": os.environ.get("IRONCLAW_PORT") == "3003",
+    "token_set": os.environ.get("IRONCLAW_TOKEN") == "test-token",
+    "user_id_set": os.environ.get("IRONCLAW_USER_ID") == "test-user",
+    "anthropic_scrubbed": os.environ.get("ANTHROPIC_API_KEY") is None,
+}
+if all(result.values()):
+    print(json.dumps({"status": "handled", "checks": result}))
+else:
+    print(json.dumps({"status": "escalate", "context": json.dumps(result)}))
+"#;
+        let script_path = std::env::temp_dir().join("ironclaw-test-env-vars.py");
+        tokio::fs::write(&script_path, source).await.unwrap();
+
+        let mut child = tokio::process::Command::new("python3")
+            .arg(&script_path)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("IRONCLAW_PORT", "3003")
+            .env("IRONCLAW_TOKEN", "test-token")
+            .env("IRONCLAW_USER_ID", "test-user")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(b"{}").await.unwrap();
+            drop(stdin);
+        }
+
+        let output = child.wait_with_output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (result, _) = parse_script_response(&stdout, output.status.code().unwrap_or(-1));
+        assert_eq!(result, ScriptResult::Handled);
+
+        let _ = tokio::fs::remove_file(&script_path).await;
+    }
 }
