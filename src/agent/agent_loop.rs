@@ -96,6 +96,9 @@ pub struct Agent {
     pub(super) heartbeat_config: Option<HeartbeatConfig>,
     pub(super) hygiene_config: Option<crate::config::HygieneConfig>,
     pub(super) routine_config: Option<RoutineConfig>,
+    /// Optional slot to expose the routine engine to the gateway for manual triggering.
+    pub(super) routine_engine_slot:
+        Option<Arc<tokio::sync::RwLock<Option<Arc<crate::agent::routine_engine::RoutineEngine>>>>>,
 }
 
 impl Agent {
@@ -148,7 +151,16 @@ impl Agent {
             heartbeat_config,
             hygiene_config,
             routine_config,
+            routine_engine_slot: None,
         }
+    }
+
+    /// Set the routine engine slot for exposing the engine to the gateway.
+    pub fn set_routine_engine_slot(
+        &mut self,
+        slot: Arc<tokio::sync::RwLock<Option<Arc<crate::agent::routine_engine::RoutineEngine>>>>,
+    ) {
+        self.routine_engine_slot = Some(slot);
     }
 
     // Convenience accessors
@@ -342,8 +354,13 @@ impl Agent {
         let heartbeat_handle = if let Some(ref hb_config) = self.heartbeat_config {
             if hb_config.enabled {
                 if let Some(workspace) = self.workspace() {
-                    let config = AgentHeartbeatConfig::default()
+                    let mut config = AgentHeartbeatConfig::default()
                         .with_interval(std::time::Duration::from_secs(hb_config.interval_secs));
+                    if let (Some(user), Some(channel)) =
+                        (&hb_config.notify_user, &hb_config.notify_channel)
+                    {
+                        config = config.with_notify(user, channel);
+                    }
 
                     // Set up notification channel
                     let (notify_tx, mut notify_rx) =
@@ -396,6 +413,7 @@ impl Agent {
                         self.cheap_llm().clone(),
                         self.safety().clone(),
                         Some(notify_tx),
+                        self.store().map(Arc::clone),
                     ))
                 } else {
                     tracing::warn!("Heartbeat enabled but no workspace available");
@@ -485,6 +503,11 @@ impl Agent {
                     let engine_ref = Arc::clone(&engine);
                     // SAFETY: self is consumed by run(), we can smuggle the engine in
                     // via a local to use in the message loop below.
+
+                    // Expose engine to gateway for manual triggering
+                    if let Some(ref slot) = self.routine_engine_slot {
+                        *slot.write().await = Some(Arc::clone(&engine));
+                    }
 
                     tracing::info!(
                         "Routines enabled: cron ticker every {}s, max {} concurrent",
