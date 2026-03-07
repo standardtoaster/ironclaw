@@ -197,6 +197,25 @@ impl Tool for RoutineCreateTool {
                 description: prompt.to_string(),
                 max_iterations: 10,
             },
+            "wasm" => {
+                let tool_name = params
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        ToolError::InvalidParameters(
+                            "wasm action requires tool_name".to_string(),
+                        )
+                    })?
+                    .to_string();
+                let escalation_prompt = params
+                    .get("escalation_prompt")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                RoutineAction::Wasm {
+                    tool_name,
+                    escalation_prompt,
+                }
+            }
             other => {
                 return Err(ToolError::InvalidParameters(format!(
                     "unknown action_type: {other}"
@@ -421,6 +440,9 @@ impl Tool for RoutineUpdateTool {
             match &mut routine.action {
                 RoutineAction::Lightweight { prompt: p, .. } => *p = prompt.to_string(),
                 RoutineAction::FullJob { description: d, .. } => *d = prompt.to_string(),
+                RoutineAction::Wasm { escalation_prompt, .. } => {
+                    *escalation_prompt = Some(prompt.to_string());
+                }
             }
         }
 

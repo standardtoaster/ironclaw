@@ -194,6 +194,15 @@ pub enum RoutineAction {
         #[serde(default = "default_max_iterations")]
         max_iterations: u32,
     },
+    /// Execute a WASM tool with the trigger data. If the tool returns "escalate",
+    /// fall back to a Lightweight LLM call with the escalation prompt.
+    Wasm {
+        /// Name of the WASM tool to invoke.
+        tool_name: String,
+        /// Optional LLM prompt for escalation. Use {{context}} as placeholder for WASM context.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        escalation_prompt: Option<String>,
+    },
 }
 
 fn default_max_tokens() -> u32 {
@@ -210,6 +219,7 @@ impl RoutineAction {
         match self {
             RoutineAction::Lightweight { .. } => "lightweight",
             RoutineAction::FullJob { .. } => "full_job",
+            RoutineAction::Wasm { .. } => "wasm",
         }
     }
 
@@ -272,6 +282,24 @@ impl RoutineAction {
                     max_iterations,
                 })
             }
+            "wasm" => {
+                let tool_name = config
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| RoutineError::MissingField {
+                        context: "wasm action".into(),
+                        field: "tool_name".into(),
+                    })?
+                    .to_string();
+                let escalation_prompt = config
+                    .get("escalation_prompt")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                Ok(RoutineAction::Wasm {
+                    tool_name,
+                    escalation_prompt,
+                })
+            }
             other => Err(RoutineError::UnknownActionType {
                 action_type: other.to_string(),
             }),
@@ -298,6 +326,13 @@ impl RoutineAction {
                 "title": title,
                 "description": description,
                 "max_iterations": max_iterations,
+            }),
+            RoutineAction::Wasm {
+                tool_name,
+                escalation_prompt,
+            } => serde_json::json!({
+                "tool_name": tool_name,
+                "escalation_prompt": escalation_prompt,
             }),
         }
     }
@@ -587,6 +622,71 @@ mod tests {
         match restored {
             Trigger::CollectionWrite { collection } => assert_eq!(collection, "nanny_shifts"),
             _ => panic!("Expected CollectionWrite"),
+        }
+    }
+
+    #[test]
+    fn test_wasm_action_serialization() {
+        let action = RoutineAction::Wasm {
+            tool_name: "presence_to_shift".to_string(),
+            escalation_prompt: Some(
+                "Handle ambiguous presence event: {{context}}".to_string(),
+            ),
+        };
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(json["type"], "wasm");
+        assert_eq!(json["tool_name"], "presence_to_shift");
+        assert!(json["escalation_prompt"]
+            .as_str()
+            .unwrap()
+            .contains("{{context}}"));
+
+        let roundtrip: RoutineAction = serde_json::from_value(json).unwrap();
+        match roundtrip {
+            RoutineAction::Wasm {
+                tool_name,
+                escalation_prompt,
+            } => {
+                assert_eq!(tool_name, "presence_to_shift");
+                assert!(escalation_prompt.is_some());
+            }
+            _ => panic!("Expected Wasm"),
+        }
+    }
+
+    #[test]
+    fn test_wasm_action_without_escalation() {
+        let action = RoutineAction::Wasm {
+            tool_name: "simple_transform".to_string(),
+            escalation_prompt: None,
+        };
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(json["type"], "wasm");
+        assert!(json
+            .get("escalation_prompt")
+            .is_none_or(|v| v.is_null()));
+    }
+
+    #[test]
+    fn test_wasm_action_db_roundtrip() {
+        let action = RoutineAction::Wasm {
+            tool_name: "presence_to_shift".to_string(),
+            escalation_prompt: Some("Escalate: {{context}}".to_string()),
+        };
+        let tag = action.type_tag();
+        let config_json = action.to_config_json();
+        assert_eq!(tag, "wasm");
+
+        let restored = RoutineAction::from_db(tag, config_json).unwrap();
+        match restored {
+            RoutineAction::Wasm {
+                tool_name,
+                escalation_prompt,
+            } => {
+                assert_eq!(tool_name, "presence_to_shift");
+                assert_eq!(escalation_prompt.unwrap(), "Escalate: {{context}}");
+            }
+            _ => panic!("Expected Wasm"),
         }
     }
 }

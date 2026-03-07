@@ -422,6 +422,12 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
             description,
             max_iterations,
         } => execute_full_job(&ctx, &routine, &run, title, description, *max_iterations).await,
+        RoutineAction::Wasm { .. } => {
+            tracing::warn!(routine = %routine.name, "WASM routine actions not yet implemented");
+            Err(RoutineError::NotImplemented {
+                feature: "WASM routine actions".to_string(),
+            })
+        }
     };
 
     // Decrement running count
