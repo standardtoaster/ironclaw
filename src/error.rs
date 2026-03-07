@@ -419,6 +419,9 @@ pub enum RoutineError {
     #[error("WASM action failed: {reason}")]
     WasmFailed { reason: String },
 
+    #[error("Script execution failed: {reason}")]
+    ScriptFailed { reason: String },
+
     #[error("Not implemented: {feature}")]
     NotImplemented { feature: String },
 }

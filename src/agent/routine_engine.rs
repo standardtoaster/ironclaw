@@ -10,12 +10,14 @@
 //! Lightweight routines execute inline (single LLM call, no scheduler slot).
 //! Full-job routines are delegated to the existing `Scheduler`.
 
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
 use regex::Regex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
@@ -332,6 +334,8 @@ impl RoutineEngine {
             running_count: self.running_count.clone(),
             scheduler: self.scheduler.clone(),
             tool_registry: self.tool_registry.clone(),
+            gateway_port: None,
+            user_token: None,
         };
 
         tokio::spawn(async move {
@@ -365,6 +369,8 @@ impl RoutineEngine {
             running_count: self.running_count.clone(),
             scheduler: self.scheduler.clone(),
             tool_registry: self.tool_registry.clone(),
+            gateway_port: None,
+            user_token: None,
         };
 
         // Record the run in DB, then spawn execution
@@ -413,6 +419,10 @@ struct EngineContext {
     running_count: Arc<AtomicUsize>,
     scheduler: Option<Arc<Scheduler>>,
     tool_registry: Option<Arc<ToolRegistry>>,
+    /// Gateway port for script IRONCLAW_PORT env var.
+    gateway_port: Option<u16>,
+    /// Auth token for script IRONCLAW_TOKEN env var.
+    user_token: Option<String>,
 }
 
 /// Execute a routine run. Handles both lightweight and full_job modes.
@@ -444,10 +454,20 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
             )
             .await
         }
-        RoutineAction::Script { .. } => {
-            Err(RoutineError::NotImplemented {
-                feature: "script routine action".to_string(),
-            })
+        RoutineAction::Script {
+            language,
+            source,
+            escalation_prompt,
+        } => {
+            execute_script(
+                &ctx,
+                &routine,
+                language,
+                source,
+                escalation_prompt,
+                run.trigger_detail.as_deref(),
+            )
+            .await
         }
     };
 
@@ -865,6 +885,251 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Maximum script output size before truncation (64KB).
+const SCRIPT_MAX_OUTPUT: usize = 64 * 1024;
+
+/// Default script timeout.
+const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Safe environment variables forwarded to script subprocesses.
+const SCRIPT_SAFE_ENV_VARS: &[&str] = &[
+    "PATH", "HOME", "USER", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TMP", "TEMP",
+];
+
+/// Result of parsing script subprocess output.
+#[derive(Debug, PartialEq)]
+enum ScriptResult {
+    Handled,
+    Noop,
+    Escalate(String),
+    Failed,
+}
+
+/// Parse the stdout + exit code from a script subprocess.
+fn parse_script_response(stdout: &str, exit_code: i32) -> (ScriptResult, Option<String>) {
+    if exit_code != 0 {
+        return (ScriptResult::Failed, Some(stdout.to_string()));
+    }
+
+    let stdout_trimmed = stdout.trim();
+    if stdout_trimmed.is_empty() {
+        return (ScriptResult::Noop, None);
+    }
+
+    match serde_json::from_str::<serde_json::Value>(stdout_trimmed) {
+        Ok(response) => match response.get("status").and_then(|s| s.as_str()) {
+            Some("handled") => (ScriptResult::Handled, Some(stdout_trimmed.to_string())),
+            Some("noop") => (ScriptResult::Noop, None),
+            Some("escalate") => {
+                let context = response
+                    .get("context")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("script requested escalation")
+                    .to_string();
+                (ScriptResult::Escalate(context), Some(stdout_trimmed.to_string()))
+            }
+            _ => (ScriptResult::Handled, Some(stdout_trimmed.to_string())),
+        },
+        Err(_) => (
+            ScriptResult::Escalate(stdout_trimmed.to_string()),
+            Some(stdout_trimmed.to_string()),
+        ),
+    }
+}
+
+/// Execute a script routine action.
+///
+/// Writes the script source to a temp file, spawns the appropriate interpreter
+/// (python3 or bash), pipes trigger data to stdin, captures output with timeout,
+/// and parses the response. Escalation falls back to a lightweight LLM call.
+async fn execute_script(
+    ctx: &EngineContext,
+    routine: &Routine,
+    language: &str,
+    source: &str,
+    escalation_prompt: &Option<String>,
+    trigger_detail: Option<&str>,
+) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
+    let ext = match language {
+        "python" => "py",
+        "bash" => "sh",
+        other => {
+            return Err(RoutineError::ScriptFailed {
+                reason: format!("unsupported script language: {other}"),
+            });
+        }
+    };
+
+    let interpreter = match language {
+        "python" => "python3",
+        _ => "bash",
+    };
+
+    // Write script to temp file
+    let script_id = Uuid::new_v4();
+    let script_path = format!("/tmp/ironclaw-script-{script_id}.{ext}");
+
+    if let Err(e) = tokio::fs::write(&script_path, source).await {
+        return Err(RoutineError::ScriptFailed {
+            reason: format!("failed to write temp script: {e}"),
+        });
+    }
+
+    // Ensure cleanup on all exit paths
+    let result = execute_script_inner(
+        ctx, routine, interpreter, &script_path, escalation_prompt, trigger_detail,
+    )
+    .await;
+
+    // Clean up temp file (best-effort)
+    let _ = tokio::fs::remove_file(&script_path).await;
+
+    result
+}
+
+/// Inner script execution (separated for cleanup guarantee).
+async fn execute_script_inner(
+    ctx: &EngineContext,
+    routine: &Routine,
+    interpreter: &str,
+    script_path: &str,
+    escalation_prompt: &Option<String>,
+    trigger_detail: Option<&str>,
+) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
+    let mut command = tokio::process::Command::new(interpreter);
+    command.arg(script_path);
+
+    // Scrub environment: only safe vars + IRONCLAW_* context
+    command.env_clear();
+    for var in SCRIPT_SAFE_ENV_VARS {
+        if let Ok(val) = std::env::var(var) {
+            command.env(var, val);
+        }
+    }
+    if let Some(port) = ctx.gateway_port {
+        command.env("IRONCLAW_PORT", port.to_string());
+    }
+    if let Some(ref token) = ctx.user_token {
+        command.env("IRONCLAW_TOKEN", token);
+    }
+    command.env("IRONCLAW_USER_ID", &routine.user_id);
+
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|e| RoutineError::ScriptFailed {
+        reason: format!("failed to spawn {interpreter}: {e}"),
+    })?;
+
+    // Write trigger data to stdin, then close it so script sees EOF
+    if let Some(mut stdin) = child.stdin.take() {
+        let data = trigger_detail.unwrap_or("{}");
+        // Best-effort write — if it fails the script just gets empty stdin
+        let _ = stdin.write_all(data.as_bytes()).await;
+        let _ = stdin.shutdown().await;
+    }
+
+    // Drain stdout/stderr concurrently with timeout
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    let result = tokio::time::timeout(SCRIPT_TIMEOUT, async {
+        let stdout_fut = async {
+            if let Some(mut out) = stdout_handle {
+                let mut buf = Vec::new();
+                (&mut out)
+                    .take(SCRIPT_MAX_OUTPUT as u64)
+                    .read_to_end(&mut buf)
+                    .await
+                    .ok();
+                tokio::io::copy(&mut out, &mut tokio::io::sink()).await.ok();
+                String::from_utf8_lossy(&buf).to_string()
+            } else {
+                String::new()
+            }
+        };
+
+        let stderr_fut = async {
+            if let Some(mut err) = stderr_handle {
+                let mut buf = Vec::new();
+                (&mut err)
+                    .take(SCRIPT_MAX_OUTPUT as u64)
+                    .read_to_end(&mut buf)
+                    .await
+                    .ok();
+                tokio::io::copy(&mut err, &mut tokio::io::sink()).await.ok();
+                String::from_utf8_lossy(&buf).to_string()
+            } else {
+                String::new()
+            }
+        };
+
+        let (stdout, stderr, wait_result) = tokio::join!(stdout_fut, stderr_fut, child.wait());
+        let status = wait_result.map_err(|e| RoutineError::ScriptFailed {
+            reason: format!("failed to wait for script: {e}"),
+        })?;
+
+        Ok::<_, RoutineError>((stdout, stderr, status.code().unwrap_or(-1)))
+    })
+    .await;
+
+    let (stdout, stderr, exit_code) = match result {
+        Ok(Ok(tuple)) => tuple,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            // Timeout — kill the process
+            let _ = child.kill().await;
+            return Err(RoutineError::ScriptFailed {
+                reason: format!(
+                    "script timed out after {}s",
+                    SCRIPT_TIMEOUT.as_secs()
+                ),
+            });
+        }
+    };
+
+    let (script_result, output) = parse_script_response(&stdout, exit_code);
+
+    match script_result {
+        ScriptResult::Handled => Ok((RunStatus::Ok, output, None)),
+        ScriptResult::Noop => Ok((RunStatus::Ok, None, None)),
+        ScriptResult::Escalate(context) => {
+            match escalation_prompt {
+                Some(prompt) => {
+                    let full_prompt = prompt.replace("{{context}}", &context);
+                    tracing::info!(
+                        routine = %routine.name,
+                        "Script escalated to LLM: {}",
+                        context
+                    );
+                    execute_lightweight(ctx, routine, &full_prompt, &[], 4096).await
+                }
+                None => {
+                    tracing::warn!(
+                        routine = %routine.name,
+                        "Script escalated but no escalation_prompt configured"
+                    );
+                    Ok((
+                        RunStatus::Attention,
+                        Some(format!("Escalation needed: {context}")),
+                        None,
+                    ))
+                }
+            }
+        }
+        ScriptResult::Failed => {
+            let reason = if stderr.is_empty() {
+                stdout
+            } else {
+                format!("{stdout}\n--- stderr ---\n{stderr}")
+            };
+            Err(RoutineError::ScriptFailed { reason })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::agent::collection_events::CollectionWriteEvent;
@@ -960,5 +1225,53 @@ mod tests {
             data: serde_json::json!({}),
         };
         assert!(!matches_collection_write(&routine, &event));
+    }
+
+    // ── parse_script_response tests ──────────────────────────────────
+
+    use super::{ScriptResult, parse_script_response};
+
+    #[test]
+    fn test_parse_script_response_handled() {
+        let stdout = r#"{"status": "handled", "summary": "done"}"#;
+        let (result, output) = parse_script_response(stdout, 0);
+        assert_eq!(result, ScriptResult::Handled);
+        assert!(output.is_some());
+        assert!(output.unwrap().contains("handled"));
+    }
+
+    #[test]
+    fn test_parse_script_response_noop() {
+        let stdout = r#"{"status": "noop"}"#;
+        let (result, output) = parse_script_response(stdout, 0);
+        assert_eq!(result, ScriptResult::Noop);
+        assert!(output.is_none());
+    }
+
+    #[test]
+    fn test_parse_script_response_escalate() {
+        let stdout = r#"{"status": "escalate", "context": "need human help"}"#;
+        let (result, output) = parse_script_response(stdout, 0);
+        assert_eq!(result, ScriptResult::Escalate("need human help".to_string()));
+        assert!(output.is_some());
+    }
+
+    #[test]
+    fn test_parse_script_response_nonzero_exit() {
+        let stdout = "some error output";
+        let (result, output) = parse_script_response(stdout, 1);
+        assert_eq!(result, ScriptResult::Failed);
+        assert_eq!(output.unwrap(), "some error output");
+    }
+
+    #[test]
+    fn test_parse_script_response_invalid_json() {
+        let stdout = "this is not json at all";
+        let (result, output) = parse_script_response(stdout, 0);
+        assert_eq!(
+            result,
+            ScriptResult::Escalate("this is not json at all".to_string())
+        );
+        assert_eq!(output.unwrap(), "this is not json at all");
     }
 }
