@@ -84,7 +84,7 @@ async fn generates_five_tools_per_collection() {
     let (db, _dir) = setup().await;
     let schema = nanny_schema();
 
-    let tools = generate_collection_tools(&schema, db);
+    let tools = generate_collection_tools(&schema, db, None);
     assert_eq!(tools.len(), 5);
 
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -99,7 +99,7 @@ async fn generates_five_tools_per_collection() {
 async fn add_tool_has_typed_parameters() {
     let (db, _dir) = setup().await;
     let schema = nanny_schema();
-    let tool = CollectionAddTool::new(schema, Arc::clone(&db));
+    let tool = CollectionAddTool::new(schema, Arc::clone(&db), None);
 
     let params = tool.parameters_schema();
     // date field should have format: "date"
@@ -129,7 +129,7 @@ async fn add_and_query_via_tools() {
         .await
         .expect("register schema");
 
-    let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db));
+    let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db), None);
     let query_tool = CollectionQueryTool::new(schema, Arc::clone(&db));
 
     // Add a record via tool
@@ -171,7 +171,7 @@ async fn add_rejects_invalid_data_via_tool() {
         .await
         .expect("register schema");
 
-    let add_tool = CollectionAddTool::new(schema, Arc::clone(&db));
+    let add_tool = CollectionAddTool::new(schema, Arc::clone(&db), None);
 
     // Missing required field
     let err = add_tool.execute(json!({ "notes": "no date" }), &ctx).await;
@@ -188,7 +188,7 @@ async fn update_via_tool() {
         .await
         .expect("register schema");
 
-    let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db));
+    let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db), None);
     let update_tool = CollectionUpdateTool::new(schema, Arc::clone(&db));
 
     // Add a record
@@ -240,7 +240,7 @@ async fn delete_via_tool() {
         .await
         .expect("register schema");
 
-    let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db));
+    let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db), None);
     let delete_tool = CollectionDeleteTool::new(schema, Arc::clone(&db));
 
     // Add and delete
@@ -283,7 +283,7 @@ async fn query_with_filters_via_tool() {
         .await
         .expect("register schema");
 
-    let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db));
+    let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db), None);
     let query_tool = CollectionQueryTool::new(schema, Arc::clone(&db));
 
     // Add items
@@ -337,7 +337,7 @@ async fn summary_sum_via_tool() {
         .await
         .expect("register schema");
 
-    let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db));
+    let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db), None);
     let summary_tool = CollectionSummaryTool::new(schema, Arc::clone(&db));
 
     // Add shifts with hours
@@ -386,7 +386,7 @@ async fn summary_count_via_tool() {
         .await
         .expect("register schema");
 
-    let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db));
+    let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db), None);
     let summary_tool = CollectionSummaryTool::new(schema, Arc::clone(&db));
 
     // Add items
@@ -430,7 +430,7 @@ async fn tools_respect_user_isolation() {
         .await
         .expect("register for grace");
 
-    let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db));
+    let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db), None);
     let query_tool = CollectionQueryTool::new(schema, Arc::clone(&db));
 
     let andrew_ctx = test_ctx("andrew");

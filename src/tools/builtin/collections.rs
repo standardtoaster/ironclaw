@@ -25,6 +25,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
+use tokio::sync::broadcast;
+
+use crate::agent::collection_events::CollectionWriteEvent;
 use crate::context::JobContext;
 use crate::db::Database;
 use crate::db::structured::{
@@ -58,9 +61,10 @@ fn field_type_to_json_schema(field_type: &FieldType) -> serde_json::Value {
 pub fn generate_collection_tools(
     schema: &CollectionSchema,
     db: Arc<dyn Database>,
+    collection_write_tx: Option<broadcast::Sender<CollectionWriteEvent>>,
 ) -> Vec<Arc<dyn Tool>> {
     vec![
-        Arc::new(CollectionAddTool::new(schema.clone(), Arc::clone(&db))),
+        Arc::new(CollectionAddTool::new(schema.clone(), Arc::clone(&db), collection_write_tx)),
         Arc::new(CollectionUpdateTool::new(schema.clone(), Arc::clone(&db))),
         Arc::new(CollectionDeleteTool::new(schema.clone(), Arc::clone(&db))),
         Arc::new(CollectionQueryTool::new(schema.clone(), Arc::clone(&db))),
@@ -383,6 +387,7 @@ async fn refresh_collection_tools(
     skills_dir: Option<&Path>,
     skill_registry: Option<&Arc<std::sync::RwLock<crate::skills::SkillRegistry>>>,
     user_id: &str,
+    collection_write_tx: Option<&broadcast::Sender<CollectionWriteEvent>>,
 ) -> Vec<String> {
     // Unregister old per-collection tools (if they exist)
     let suffixes = ["_add", "_update", "_delete", "_query", "_summary"];
@@ -392,7 +397,7 @@ async fn refresh_collection_tools(
     }
 
     // Generate and register new per-collection tools
-    let tools = generate_collection_tools(schema, Arc::clone(db));
+    let tools = generate_collection_tools(schema, Arc::clone(db), collection_write_tx.cloned());
     let tool_names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
     for tool in tools {
         registry.register(tool).await;
@@ -550,6 +555,7 @@ pub struct CollectionRegisterTool {
     registry: Arc<ToolRegistry>,
     skills_dir: Option<PathBuf>,
     skill_registry: Option<Arc<std::sync::RwLock<crate::skills::SkillRegistry>>>,
+    collection_write_tx: Option<broadcast::Sender<CollectionWriteEvent>>,
 }
 
 impl CollectionRegisterTool {
@@ -559,6 +565,7 @@ impl CollectionRegisterTool {
             registry,
             skills_dir: None,
             skill_registry: None,
+            collection_write_tx: None,
         }
     }
 
@@ -572,6 +579,14 @@ impl CollectionRegisterTool {
         sr: Arc<std::sync::RwLock<crate::skills::SkillRegistry>>,
     ) -> Self {
         self.skill_registry = Some(sr);
+        self
+    }
+
+    pub fn with_collection_write_tx(
+        mut self,
+        tx: broadcast::Sender<CollectionWriteEvent>,
+    ) -> Self {
+        self.collection_write_tx = Some(tx);
         self
     }
 }
@@ -689,6 +704,7 @@ impl Tool for CollectionRegisterTool {
             self.skills_dir.as_deref(),
             self.skill_registry.as_ref(),
             &ctx.user_id,
+            self.collection_write_tx.as_ref(),
         )
         .await;
 
@@ -871,6 +887,7 @@ pub struct CollectionsAlterTool {
     registry: Arc<ToolRegistry>,
     skills_dir: Option<PathBuf>,
     skill_registry: Option<Arc<std::sync::RwLock<crate::skills::SkillRegistry>>>,
+    collection_write_tx: Option<broadcast::Sender<CollectionWriteEvent>>,
 }
 
 impl CollectionsAlterTool {
@@ -880,6 +897,7 @@ impl CollectionsAlterTool {
             registry,
             skills_dir: None,
             skill_registry: None,
+            collection_write_tx: None,
         }
     }
 
@@ -893,6 +911,14 @@ impl CollectionsAlterTool {
         sr: Arc<std::sync::RwLock<crate::skills::SkillRegistry>>,
     ) -> Self {
         self.skill_registry = Some(sr);
+        self
+    }
+
+    pub fn with_collection_write_tx(
+        mut self,
+        tx: broadcast::Sender<CollectionWriteEvent>,
+    ) -> Self {
+        self.collection_write_tx = Some(tx);
         self
     }
 }
@@ -1036,6 +1062,7 @@ impl Tool for CollectionsAlterTool {
             self.skills_dir.as_deref(),
             self.skill_registry.as_ref(),
             &ctx.user_id,
+            self.collection_write_tx.as_ref(),
         )
         .await;
 
@@ -1083,15 +1110,21 @@ pub struct CollectionAddTool {
     tool_name: String,
     schema: CollectionSchema,
     db: Arc<dyn Database>,
+    collection_write_tx: Option<broadcast::Sender<CollectionWriteEvent>>,
 }
 
 impl CollectionAddTool {
-    pub fn new(schema: CollectionSchema, db: Arc<dyn Database>) -> Self {
+    pub fn new(
+        schema: CollectionSchema,
+        db: Arc<dyn Database>,
+        collection_write_tx: Option<broadcast::Sender<CollectionWriteEvent>>,
+    ) -> Self {
         let tool_name = format!("{}_add", schema.collection);
         Self {
             tool_name,
             schema,
             db,
+            collection_write_tx,
         }
     }
 }
@@ -1155,11 +1188,24 @@ impl Tool for CollectionAddTool {
             );
         }
 
+        // Clone before insert_record consumes `data`.
+        let data_for_event = data.clone();
+
         let id = self
             .db
             .insert_record(&ctx.user_id, &self.schema.collection, data)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to insert record: {e}")))?;
+
+        // Fire collection write triggers.
+        if let Some(tx) = &self.collection_write_tx {
+            let _ = tx.send(CollectionWriteEvent {
+                user_id: ctx.user_id.clone(),
+                collection: self.schema.collection.clone(),
+                record_id: id,
+                data: data_for_event,
+            });
+        }
 
         Ok(ToolOutput::success(
             json!({

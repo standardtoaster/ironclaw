@@ -457,6 +457,7 @@ impl ToolRegistry {
         user_id: &str,
         skills_dir: Option<std::path::PathBuf>,
         skill_registry: Option<Arc<std::sync::RwLock<SkillRegistry>>>,
+        collection_write_tx: Option<tokio::sync::broadcast::Sender<crate::agent::collection_events::CollectionWriteEvent>>,
     ) {
         use crate::tools::builtin::{
             CollectionDropTool, CollectionListTool, CollectionRegisterTool, CollectionsAlterTool,
@@ -475,6 +476,9 @@ impl ToolRegistry {
         if let Some(ref sr) = skill_registry {
             register_tool = register_tool.with_skill_registry(Arc::clone(sr));
         }
+        if let Some(ref tx) = collection_write_tx {
+            register_tool = register_tool.with_collection_write_tx(tx.clone());
+        }
         self.register_sync(Arc::new(register_tool));
         let mut drop_tool = CollectionDropTool::new(Arc::clone(&db), Arc::clone(self));
         if let Some(ref dir) = skills_dir {
@@ -491,6 +495,9 @@ impl ToolRegistry {
         if let Some(ref sr) = skill_registry {
             alter_tool = alter_tool.with_skill_registry(Arc::clone(sr));
         }
+        if let Some(ref tx) = collection_write_tx {
+            alter_tool = alter_tool.with_collection_write_tx(tx.clone());
+        }
         self.register_sync(Arc::new(alter_tool));
 
         // Load existing schemas and generate per-collection tools + skills
@@ -498,7 +505,7 @@ impl ToolRegistry {
             Ok(schemas) => {
                 let mut tool_count = 0;
                 for schema in &schemas {
-                    let tools = generate_collection_tools(schema, Arc::clone(&db));
+                    let tools = generate_collection_tools(schema, Arc::clone(&db), collection_write_tx.clone());
                     tool_count += tools.len();
                     for tool in tools {
                         self.register(tool).await;
