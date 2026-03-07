@@ -298,6 +298,9 @@ fn routine_to_info(r: &crate::agent::routine::Routine) -> RoutineInfo {
             ("webhook".to_string(), format!("webhook: {}", p))
         }
         crate::agent::routine::Trigger::Manual => ("manual".to_string(), "manual only".to_string()),
+        crate::agent::routine::Trigger::CollectionWrite { collection } => {
+            ("collection_write".to_string(), format!("on write to {}", collection))
+        }
     };
 
     let action_type = match &r.action {

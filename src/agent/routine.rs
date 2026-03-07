@@ -74,6 +74,11 @@ pub enum Trigger {
     },
     /// Only fires via tool call or CLI.
     Manual,
+    /// Fire when a record is written to a structured collection.
+    CollectionWrite {
+        /// Collection name to watch (e.g., "wifi_presence").
+        collection: String,
+    },
 }
 
 impl Trigger {
@@ -84,6 +89,7 @@ impl Trigger {
             Trigger::Event { .. } => "event",
             Trigger::Webhook { .. } => "webhook",
             Trigger::Manual => "manual",
+            Trigger::CollectionWrite { .. } => "collection_write",
         }
     }
 
@@ -128,6 +134,17 @@ impl Trigger {
                 Ok(Trigger::Webhook { path, secret })
             }
             "manual" => Ok(Trigger::Manual),
+            "collection_write" => {
+                let collection = config
+                    .get("collection")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| RoutineError::MissingField {
+                        context: "collection_write trigger".into(),
+                        field: "collection".into(),
+                    })?
+                    .to_string();
+                Ok(Trigger::CollectionWrite { collection })
+            }
             other => Err(RoutineError::UnknownTriggerType {
                 trigger_type: other.to_string(),
             }),
@@ -147,6 +164,7 @@ impl Trigger {
                 "secret": secret,
             }),
             Trigger::Manual => serde_json::json!({}),
+            Trigger::CollectionWrite { collection } => serde_json::json!({ "collection": collection }),
         }
     }
 }
@@ -530,5 +548,45 @@ mod tests {
             "webhook"
         );
         assert_eq!(Trigger::Manual.type_tag(), "manual");
+        assert_eq!(
+            Trigger::CollectionWrite {
+                collection: String::new()
+            }
+            .type_tag(),
+            "collection_write"
+        );
+    }
+
+    #[test]
+    fn test_collection_write_trigger_serialization() {
+        let trigger = Trigger::CollectionWrite {
+            collection: "wifi_presence".to_string(),
+        };
+        let json = serde_json::to_value(&trigger).unwrap();
+        assert_eq!(json["type"], "collection_write");
+        assert_eq!(json["collection"], "wifi_presence");
+
+        let roundtrip: Trigger = serde_json::from_value(json).unwrap();
+        match roundtrip {
+            Trigger::CollectionWrite { collection } => assert_eq!(collection, "wifi_presence"),
+            _ => panic!("Expected CollectionWrite"),
+        }
+    }
+
+    #[test]
+    fn test_collection_write_trigger_db_roundtrip() {
+        let trigger = Trigger::CollectionWrite {
+            collection: "nanny_shifts".to_string(),
+        };
+        let tag = trigger.type_tag();
+        let config_json = trigger.to_config_json();
+
+        assert_eq!(tag, "collection_write");
+
+        let restored = Trigger::from_db(tag, config_json).unwrap();
+        match restored {
+            Trigger::CollectionWrite { collection } => assert_eq!(collection, "nanny_shifts"),
+            _ => panic!("Expected CollectionWrite"),
+        }
     }
 }
