@@ -34,14 +34,18 @@ pub use response_cache::{CachedProvider, ResponseCacheConfig};
 pub use retry::{RetryConfig, RetryProvider};
 pub use rig_adapter::RigAdapter;
 pub use session::{SessionConfig, SessionManager, create_session_manager};
-pub use smart_routing::{SmartRoutingConfig, SmartRoutingProvider, TaskComplexity};
+pub use smart_routing::{
+    CascadeConfig, DefaultClassifier, MessageClassifier, RoutingOperation, SkillAwareClassifier,
+    SkillRoutingHint, SmartRoutingConfig, SmartRoutingProvider, SmartRoutingSnapshot,
+    TaskComplexity, META_ROUTING_OPERATION, META_ROUTING_SKILL_HINTS,
+};
 
 use std::sync::Arc;
 
 use rig::client::CompletionClient;
 use secrecy::ExposeSecret;
 
-use crate::config::{LlmBackend, LlmConfig, NearAiConfig};
+use crate::config::{LlmBackend, LlmConfig, NearAiConfig, TierConfig};
 use crate::error::LlmError;
 
 /// Create an LLM provider based on configuration.
@@ -265,6 +269,102 @@ fn create_openai_compatible_provider(config: &LlmConfig) -> Result<Arc<dyn LlmPr
     Ok(Arc::new(RigAdapter::new(model, &compat.model)))
 }
 
+/// Create an LLM provider from a `TierConfig` (N-tier routing).
+///
+/// Builds a minimal `LlmConfig` for the tier's backend and delegates to `create_llm_provider`.
+/// Only supports backends that don't require session auth (Ollama, OpenAI-compatible, OpenAI, Anthropic).
+fn create_tier_provider(
+    tier: &TierConfig,
+    session: Arc<SessionManager>,
+) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    use crate::config::{
+        AnthropicDirectConfig, OllamaConfig, OpenAiCompatibleConfig, OpenAiDirectConfig,
+    };
+
+    // Build a LlmConfig with only the tier's backend populated.
+    let mut config = LlmConfig {
+        backend: tier.backend,
+        nearai: NearAiConfig {
+            model: tier.model.clone(),
+            cheap_model: None,
+            base_url: tier.base_url.clone().unwrap_or_default(),
+            auth_base_url: String::new(),
+            session_path: std::path::PathBuf::new(),
+            api_key: tier.api_key.clone(),
+            fallback_model: None,
+            max_retries: 0,
+            circuit_breaker_threshold: None,
+            circuit_breaker_recovery_secs: 30,
+            response_cache_enabled: false,
+            response_cache_ttl_secs: 3600,
+            response_cache_max_entries: 1000,
+            failover_cooldown_secs: 300,
+            failover_cooldown_threshold: 3,
+            smart_routing_cascade: false,
+        },
+        openai: None,
+        anthropic: None,
+        ollama: None,
+        openai_compatible: None,
+        tinfoil: None,
+        routing_tiers: Vec::new(),
+    };
+
+    match tier.backend {
+        LlmBackend::NearAi => {
+            // NearAi tier uses session auth — nearai config is already populated above.
+        }
+        LlmBackend::Ollama => {
+            config.ollama = Some(OllamaConfig {
+                base_url: tier
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "http://localhost:11434".to_string()),
+                model: tier.model.clone(),
+            });
+        }
+        LlmBackend::OpenAiCompatible => {
+            config.openai_compatible = Some(OpenAiCompatibleConfig {
+                base_url: tier.base_url.clone().unwrap_or_default(),
+                api_key: tier.api_key.clone(),
+                model: tier.model.clone(),
+                extra_headers: Vec::new(),
+            });
+        }
+        LlmBackend::OpenAi => {
+            let api_key = tier.api_key.clone().ok_or_else(|| LlmError::AuthFailed {
+                provider: format!("openai (tier {})", tier.name),
+            })?;
+            config.openai = Some(OpenAiDirectConfig {
+                api_key,
+                model: tier.model.clone(),
+                base_url: tier.base_url.clone(),
+            });
+        }
+        LlmBackend::Anthropic => {
+            let api_key = tier.api_key.clone().ok_or_else(|| LlmError::AuthFailed {
+                provider: format!("anthropic (tier {})", tier.name),
+            })?;
+            config.anthropic = Some(AnthropicDirectConfig {
+                api_key,
+                model: tier.model.clone(),
+                base_url: tier.base_url.clone(),
+            });
+        }
+        LlmBackend::Tinfoil => {
+            let api_key = tier.api_key.clone().ok_or_else(|| LlmError::AuthFailed {
+                provider: format!("tinfoil (tier {})", tier.name),
+            })?;
+            config.tinfoil = Some(crate::config::TinfoilConfig {
+                api_key,
+                model: tier.model.clone(),
+            });
+        }
+    }
+
+    create_llm_provider(&config, session)
+}
+
 /// Create a cheap/fast LLM provider for lightweight tasks (heartbeat, routing, evaluation).
 ///
 /// Uses `NEARAI_CHEAP_MODEL` if set, otherwise falls back to the main provider.
@@ -332,8 +432,39 @@ pub fn build_provider_chain(
         llm
     };
 
-    // 2. Smart routing (cheap/primary split)
-    let llm: Arc<dyn LlmProvider> = if let Some(ref cheap_model) = config.nearai.cheap_model {
+    // 2. Smart routing
+    let llm: Arc<dyn LlmProvider> = if !config.routing_tiers.is_empty() {
+        // N-tier routing from LLM_ROUTING_TIERS config
+        let mut tier_providers: Vec<Arc<dyn LlmProvider>> = Vec::new();
+        for tier in &config.routing_tiers {
+            let provider = create_tier_provider(tier, session.clone())?;
+            let provider: Arc<dyn LlmProvider> = if retry_config.max_retries > 0 {
+                Arc::new(RetryProvider::new(provider, retry_config.clone()))
+            } else {
+                provider
+            };
+            tracing::info!(
+                tier = %tier.name,
+                backend = %tier.backend,
+                model = %tier.model,
+                "Routing tier initialized"
+            );
+            tier_providers.push(provider);
+        }
+        tracing::info!(
+            num_tiers = tier_providers.len(),
+            "N-tier smart routing enabled"
+        );
+        Arc::new(SmartRoutingProvider::tiered(
+            tier_providers,
+            Arc::new(SkillAwareClassifier),
+            SmartRoutingConfig {
+                cascade_enabled: config.nearai.smart_routing_cascade,
+                ..SmartRoutingConfig::default()
+            },
+        ))
+    } else if let Some(ref cheap_model) = config.nearai.cheap_model {
+        // Backward-compatible 2-tier routing from NEARAI_CHEAP_MODEL
         let mut cheap_config = config.nearai.clone();
         cheap_config.model = cheap_model.clone();
         let cheap = create_llm_provider_with_config(&cheap_config, session.clone())?;
@@ -345,7 +476,7 @@ pub fn build_provider_chain(
         tracing::info!(
             primary = %llm.model_name(),
             cheap = %cheap.model_name(),
-            "Smart routing enabled"
+            "Smart routing enabled (2-tier)"
         );
         Arc::new(SmartRoutingProvider::new(
             llm,
@@ -472,6 +603,7 @@ mod tests {
             ollama: None,
             openai_compatible: None,
             tinfoil: None,
+            routing_tiers: Vec::new(),
         }
     }
 
