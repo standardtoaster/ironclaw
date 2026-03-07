@@ -395,6 +395,9 @@ pub struct RoutineGuardrails {
     pub max_concurrent: u32,
     /// Window for content-hash dedup (event triggers). None = no dedup.
     pub dedup_window: Option<Duration>,
+    /// Max execution time for script/wasm actions. None = use default (30s).
+    #[serde(default)]
+    pub max_execution_time: Option<Duration>,
 }
 
 impl Default for RoutineGuardrails {
@@ -403,6 +406,7 @@ impl Default for RoutineGuardrails {
             cooldown: Duration::from_secs(300),
             max_concurrent: 1,
             dedup_window: None,
+            max_execution_time: None,
         }
     }
 }
