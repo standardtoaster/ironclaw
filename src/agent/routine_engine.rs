@@ -26,9 +26,11 @@ use crate::agent::routine::{
 };
 use crate::channels::{IncomingMessage, OutgoingResponse};
 use crate::config::RoutineConfig;
+use crate::context::JobContext;
 use crate::db::Database;
 use crate::error::RoutineError;
 use crate::llm::{ChatMessage, CompletionRequest, FinishReason, LlmProvider};
+use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
 
 /// Check if a routine's CollectionWrite trigger matches an event.
@@ -58,6 +60,8 @@ pub struct RoutineEngine {
     collection_write_cache: Arc<RwLock<Vec<Routine>>>,
     /// Scheduler for dispatching jobs (FullJob mode).
     scheduler: Option<Arc<Scheduler>>,
+    /// Tool registry for WASM routine execution.
+    tool_registry: Option<Arc<ToolRegistry>>,
 }
 
 impl RoutineEngine {
@@ -68,6 +72,7 @@ impl RoutineEngine {
         workspace: Arc<Workspace>,
         notify_tx: mpsc::Sender<OutgoingResponse>,
         scheduler: Option<Arc<Scheduler>>,
+        tool_registry: Option<Arc<ToolRegistry>>,
     ) -> Self {
         Self {
             config,
@@ -79,6 +84,7 @@ impl RoutineEngine {
             event_cache: Arc::new(RwLock::new(Vec::new())),
             collection_write_cache: Arc::new(RwLock::new(Vec::new())),
             scheduler,
+            tool_registry,
         }
     }
 
@@ -325,6 +331,7 @@ impl RoutineEngine {
             notify_tx: self.notify_tx.clone(),
             running_count: self.running_count.clone(),
             scheduler: self.scheduler.clone(),
+            tool_registry: self.tool_registry.clone(),
         };
 
         tokio::spawn(async move {
@@ -357,6 +364,7 @@ impl RoutineEngine {
             notify_tx: self.notify_tx.clone(),
             running_count: self.running_count.clone(),
             scheduler: self.scheduler.clone(),
+            tool_registry: self.tool_registry.clone(),
         };
 
         // Record the run in DB, then spawn execution
@@ -404,6 +412,7 @@ struct EngineContext {
     notify_tx: mpsc::Sender<OutgoingResponse>,
     running_count: Arc<AtomicUsize>,
     scheduler: Option<Arc<Scheduler>>,
+    tool_registry: Option<Arc<ToolRegistry>>,
 }
 
 /// Execute a routine run. Handles both lightweight and full_job modes.
@@ -422,11 +431,18 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
             description,
             max_iterations,
         } => execute_full_job(&ctx, &routine, &run, title, description, *max_iterations).await,
-        RoutineAction::Wasm { .. } => {
-            tracing::warn!(routine = %routine.name, "WASM routine actions not yet implemented");
-            Err(RoutineError::NotImplemented {
-                feature: "WASM routine actions".to_string(),
-            })
+        RoutineAction::Wasm {
+            tool_name,
+            escalation_prompt,
+        } => {
+            execute_wasm(
+                &ctx,
+                &routine,
+                tool_name,
+                escalation_prompt,
+                run.trigger_detail.as_deref(),
+            )
+            .await
         }
     };
 
@@ -503,6 +519,109 @@ fn sanitize_routine_name(name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Execute a WASM tool routine action.
+///
+/// Looks up the tool in the registry, executes it with the trigger data,
+/// and parses the response. If the tool returns `{"status": "escalate"}`,
+/// falls back to a lightweight LLM call with the escalation prompt.
+async fn execute_wasm(
+    ctx: &EngineContext,
+    routine: &Routine,
+    tool_name: &str,
+    escalation_prompt: &Option<String>,
+    trigger_detail: Option<&str>,
+) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
+    let registry = ctx
+        .tool_registry
+        .as_ref()
+        .ok_or_else(|| RoutineError::WasmFailed {
+            reason: "tool registry not available".to_string(),
+        })?;
+
+    let tool: Arc<dyn crate::tools::Tool> =
+        registry
+            .get(tool_name)
+            .await
+            .ok_or_else(|| RoutineError::WasmFailed {
+                reason: format!("tool '{}' not found in registry", tool_name),
+            })?;
+
+    // Build params from trigger detail
+    let params = match trigger_detail {
+        Some(detail) => serde_json::from_str(detail)
+            .unwrap_or_else(|_| serde_json::json!({"trigger_data": detail})),
+        None => serde_json::json!({}),
+    };
+
+    // Build a minimal JobContext for the routine's user
+    let job_ctx = JobContext::with_user(
+        &routine.user_id,
+        format!("routine:{}", routine.name),
+        "WASM routine action",
+    );
+
+    match tool.execute(params, &job_ctx).await {
+        Ok(output) => {
+            // Extract text from the result Value
+            let response_text = match &output.result {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+
+            // Try to parse as structured response
+            if let Ok(response) = serde_json::from_str::<serde_json::Value>(&response_text) {
+                match response.get("status").and_then(|s| s.as_str()) {
+                    Some("handled") => Ok((RunStatus::Ok, Some(response_text), None)),
+                    Some("noop") => Ok((RunStatus::Ok, None, None)),
+                    Some("escalate") => {
+                        let escalation_context = response
+                            .get("context")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("WASM module requested escalation");
+
+                        match escalation_prompt {
+                            Some(prompt) => {
+                                let full_prompt =
+                                    prompt.replace("{{context}}", escalation_context);
+                                tracing::info!(
+                                    routine = %routine.name,
+                                    "WASM escalated to LLM: {}",
+                                    escalation_context
+                                );
+                                execute_lightweight(ctx, routine, &full_prompt, &[], 4096).await
+                            }
+                            None => {
+                                tracing::warn!(
+                                    routine = %routine.name,
+                                    "WASM escalated but no escalation_prompt configured"
+                                );
+                                Ok((
+                                    RunStatus::Attention,
+                                    Some(format!(
+                                        "Escalation needed: {}",
+                                        escalation_context
+                                    )),
+                                    None,
+                                ))
+                            }
+                        }
+                    }
+                    _ => {
+                        // Unrecognized status — treat as handled
+                        Ok((RunStatus::Ok, Some(response_text), None))
+                    }
+                }
+            } else {
+                // Non-JSON response — treat as handled
+                Ok((RunStatus::Ok, Some(response_text), None))
+            }
+        }
+        Err(e) => Err(RoutineError::WasmFailed {
+            reason: format!("tool execution failed: {}", e),
+        }),
+    }
 }
 
 /// Execute a full-job routine by dispatching to the scheduler.

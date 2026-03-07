@@ -413,6 +413,7 @@ impl Agent {
                         Arc::clone(workspace),
                         notify_tx,
                         Some(self.scheduler.clone()),
+                        Some(Arc::clone(&self.deps.tools)),
                     ));
 
                     // Register routine tools
