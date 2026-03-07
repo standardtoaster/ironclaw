@@ -64,6 +64,10 @@ pub struct RoutineEngine {
     scheduler: Option<Arc<Scheduler>>,
     /// Tool registry for WASM routine execution.
     tool_registry: Option<Arc<ToolRegistry>>,
+    /// Gateway port for script `IRONCLAW_PORT` env var (resolved at construction).
+    gateway_port: Option<u16>,
+    /// Default auth token for script `IRONCLAW_TOKEN` env var.
+    gateway_auth_token: Option<String>,
 }
 
 impl RoutineEngine {
@@ -76,6 +80,12 @@ impl RoutineEngine {
         scheduler: Option<Arc<Scheduler>>,
         tool_registry: Option<Arc<ToolRegistry>>,
     ) -> Self {
+        // Resolve gateway connection details from environment for script actions.
+        let gateway_port = std::env::var("GATEWAY_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let gateway_auth_token = std::env::var("GATEWAY_AUTH_TOKEN").ok();
+
         Self {
             config,
             store,
@@ -87,6 +97,8 @@ impl RoutineEngine {
             collection_write_cache: Arc::new(RwLock::new(Vec::new())),
             scheduler,
             tool_registry,
+            gateway_port,
+            gateway_auth_token,
         }
     }
 
@@ -334,8 +346,8 @@ impl RoutineEngine {
             running_count: self.running_count.clone(),
             scheduler: self.scheduler.clone(),
             tool_registry: self.tool_registry.clone(),
-            gateway_port: None,
-            user_token: None,
+            gateway_port: self.gateway_port,
+            user_token: self.gateway_auth_token.clone(),
         };
 
         tokio::spawn(async move {
@@ -369,8 +381,8 @@ impl RoutineEngine {
             running_count: self.running_count.clone(),
             scheduler: self.scheduler.clone(),
             tool_registry: self.tool_registry.clone(),
-            gateway_port: None,
-            user_token: None,
+            gateway_port: self.gateway_port,
+            user_token: self.gateway_auth_token.clone(),
         };
 
         // Record the run in DB, then spawn execution
@@ -975,9 +987,15 @@ async fn execute_script(
         });
     }
 
+    // Use per-routine timeout if configured, otherwise default
+    let timeout = routine
+        .guardrails
+        .max_execution_time
+        .unwrap_or(SCRIPT_TIMEOUT);
+
     // Ensure cleanup on all exit paths
     let result = execute_script_inner(
-        ctx, routine, interpreter, &script_path, escalation_prompt, trigger_detail,
+        ctx, routine, interpreter, &script_path, escalation_prompt, trigger_detail, timeout,
     )
     .await;
 
@@ -995,6 +1013,7 @@ async fn execute_script_inner(
     script_path: &str,
     escalation_prompt: &Option<String>,
     trigger_detail: Option<&str>,
+    timeout: Duration,
 ) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
     let mut command = tokio::process::Command::new(interpreter);
     command.arg(script_path);
@@ -1035,7 +1054,7 @@ async fn execute_script_inner(
     let stdout_handle = child.stdout.take();
     let stderr_handle = child.stderr.take();
 
-    let result = tokio::time::timeout(SCRIPT_TIMEOUT, async {
+    let result = tokio::time::timeout(timeout, async {
         let stdout_fut = async {
             if let Some(mut out) = stdout_handle {
                 let mut buf = Vec::new();
@@ -1084,7 +1103,7 @@ async fn execute_script_inner(
             return Err(RoutineError::ScriptFailed {
                 reason: format!(
                     "script timed out after {}s",
-                    SCRIPT_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 ),
             });
         }

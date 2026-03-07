@@ -1305,6 +1305,7 @@ fn row_to_routine(row: &tokio_postgres::Row) -> Result<Routine, DatabaseError> {
             cooldown: std::time::Duration::from_secs(cooldown_secs as u64),
             max_concurrent: max_concurrent as u32,
             dedup_window: dedup_window_secs.map(|s| std::time::Duration::from_secs(s as u64)),
+            max_execution_time: None,
         },
         notify: NotifyConfig {
             channel: row.get("notify_channel"),

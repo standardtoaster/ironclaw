@@ -297,6 +297,7 @@ impl Tool for RoutineCreateTool {
                 cooldown: Duration::from_secs(cooldown_secs),
                 max_concurrent: 1,
                 dedup_window: None,
+                max_execution_time: None,
             },
             notify: NotifyConfig::default(),
             last_run_at: None,
