@@ -1,9 +1,12 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use secrecy::SecretString;
+use serde::Deserialize;
 
 use crate::bootstrap::ironclaw_base_dir;
 use crate::config::helpers::{optional_env, parse_bool_env, parse_optional_env};
+use crate::config::LlmBackend;
 use crate::error::ConfigError;
 use crate::settings::Settings;
 
@@ -51,6 +54,79 @@ pub struct GatewayConfig {
     pub workspace_read_scopes: Vec<String>,
     /// Memory layer definitions (JSON in env var, or from external config).
     pub memory_layers: Vec<crate::workspace::layer::MemoryLayer>,
+    /// Multi-user token map. When set, each token maps to a user identity.
+    /// Parsed from `GATEWAY_USER_TOKENS` (JSON string). When absent, falls back
+    /// to single-user mode via `auth_token` + `user_id`.
+    pub user_tokens: Option<HashMap<String, UserTokenConfig>>,
+}
+
+/// Per-user token configuration for multi-user mode.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserTokenConfig {
+    pub user_id: String,
+    #[serde(default)]
+    pub workspace_read_scopes: Vec<String>,
+    /// LLM backend override for this user (e.g. "anthropic", "ollama", "openai").
+    #[serde(default)]
+    pub llm_backend: Option<String>,
+    /// LLM model override for this user (e.g. "claude-haiku-4-5-20251001").
+    #[serde(default)]
+    pub llm_model: Option<String>,
+    /// LLM API key for this user's provider.
+    #[serde(default, deserialize_with = "deserialize_optional_secret")]
+    pub llm_api_key: Option<SecretString>,
+    /// LLM base URL override for this user's provider.
+    #[serde(default)]
+    pub llm_base_url: Option<String>,
+}
+
+/// Resolved per-user LLM configuration.
+///
+/// Only constructed when all required fields (`llm_backend` + `llm_model`) are
+/// present on a `UserTokenConfig`. The API key and base URL are optional
+/// depending on the backend (e.g. Ollama needs no key).
+#[derive(Debug, Clone)]
+pub struct UserLlmConfig {
+    pub backend: LlmBackend,
+    pub model: String,
+    pub api_key: Option<SecretString>,
+    pub base_url: Option<String>,
+}
+
+impl UserTokenConfig {
+    /// Try to extract a resolved `UserLlmConfig` from this token config.
+    ///
+    /// Returns `Some` when at least `llm_backend` and `llm_model` are set.
+    /// Returns an error if the backend string is invalid.
+    pub fn llm_config(&self) -> Result<Option<UserLlmConfig>, String> {
+        match (&self.llm_backend, &self.llm_model) {
+            (Some(backend_str), Some(model)) => {
+                let backend: LlmBackend = backend_str.parse().map_err(|e: String| {
+                    format!("user '{}': {}", self.user_id, e)
+                })?;
+                Ok(Some(UserLlmConfig {
+                    backend,
+                    model: model.clone(),
+                    api_key: self.llm_api_key.clone(),
+                    base_url: self.llm_base_url.clone(),
+                }))
+            }
+            (Some(_), None) | (None, Some(_)) => Err(format!(
+                "user '{}': llm_backend and llm_model must both be set (or both omitted)",
+                self.user_id
+            )),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+/// Deserialize an optional `SecretString` from a JSON string.
+fn deserialize_optional_secret<'de, D>(deserializer: D) -> Result<Option<SecretString>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(opt.map(SecretString::from))
 }
 
 /// Signal channel configuration (signal-cli daemon HTTP/JSON-RPC).
@@ -179,6 +255,41 @@ impl ChannelsConfig {
                 }
             }
 
+            let user_tokens: Option<HashMap<String, UserTokenConfig>> =
+                match optional_env("GATEWAY_USER_TOKENS")? {
+                    Some(json_str) => {
+                        let tokens: HashMap<String, UserTokenConfig> =
+                            serde_json::from_str(&json_str).map_err(|e| {
+                                ConfigError::InvalidValue {
+                                    key: "GATEWAY_USER_TOKENS".to_string(),
+                                    message: format!(
+                                        "must be valid JSON object mapping tokens to user configs: {e}"
+                                    ),
+                                }
+                            })?;
+                        if tokens.is_empty() {
+                            return Err(ConfigError::InvalidValue {
+                                key: "GATEWAY_USER_TOKENS".to_string(),
+                                message: "token map is empty — remove the variable to use single-user mode".to_string(),
+                            });
+                        }
+                        for (tok, cfg) in &tokens {
+                            if cfg.user_id.trim().is_empty() {
+                                return Err(ConfigError::InvalidValue {
+                                    key: "GATEWAY_USER_TOKENS".to_string(),
+                                    message: format!(
+                                        "token '{}...' has an empty user_id",
+                                        &tok[..tok.len().min(8)]
+                                    ),
+                                });
+                            }
+                        }
+                        Some(tokens)
+                    }
+                    None => None,
+                };
+
+
             let workspace_read_scopes: Vec<String> = optional_env("WORKSPACE_READ_SCOPES")?
                 .map(|s| {
                     s.split(',')
@@ -200,6 +311,7 @@ impl ChannelsConfig {
                 }
             }
 
+
             Some(GatewayConfig {
                 host: optional_env("GATEWAY_HOST")?.unwrap_or_else(|| "127.0.0.1".to_string()),
                 port: parse_optional_env("GATEWAY_PORT", 3000)?,
@@ -207,6 +319,7 @@ impl ChannelsConfig {
                 user_id,
                 workspace_read_scopes,
                 memory_layers,
+                user_tokens,
             })
         } else {
             None
