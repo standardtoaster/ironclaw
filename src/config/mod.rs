@@ -41,7 +41,7 @@ pub use self::heartbeat::HeartbeatConfig;
 pub use self::hygiene::HygieneConfig;
 pub use self::llm::{
     AnthropicDirectConfig, LlmBackend, LlmConfig, NearAiConfig, OllamaConfig,
-    OpenAiCompatibleConfig, OpenAiDirectConfig, TinfoilConfig,
+    OpenAiCompatibleConfig, OpenAiDirectConfig, TierConfig, TinfoilConfig,
 };
 pub use self::routines::RoutineConfig;
 pub use self::safety::SafetyConfig;
