@@ -345,6 +345,8 @@ fn create_tier_provider(
                     .clone()
                     .unwrap_or_else(|| "http://localhost:11434".to_string()),
                 model: tier.model.clone(),
+                num_ctx: None,
+                think: None,
             });
         }
         LlmBackend::OpenAiCompatible => {
