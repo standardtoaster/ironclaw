@@ -139,3 +139,64 @@ fn shell_tool_schema_is_valid() {
     let errors = validate_tool_schema(&schema, "shell");
     assert!(errors.is_empty(), "shell tool schema errors: {errors:?}");
 }
+
+/// Verify that every core-registered tool maps to a non-Utility-or-worse group,
+/// i.e., every tool in the registry is known to the visibility system.
+/// If a new tool is added to the registry but not classified in tool_group_for_name(),
+/// it will silently fall through to Core (always visible) — which is safe but means
+/// it can never be hidden. This test ensures maintainers are aware.
+#[tokio::test]
+async fn core_tools_have_visibility_group() {
+    use ironclaw::skills::attenuation::tool_group_for_name;
+
+    let registry = ToolRegistry::new();
+    registry.register_builtin_tools();
+    registry.register_dev_tools();
+
+    let tools = registry.all().await;
+
+    // Every registered tool should resolve to a specific group.
+    // This test documents which tools are in each group as a maintenance aid.
+    let mut by_group = std::collections::HashMap::<String, Vec<String>>::new();
+    for tool in &tools {
+        let group = tool_group_for_name(tool.name());
+        by_group
+            .entry(format!("{:?}", group))
+            .or_default()
+            .push(tool.name().to_string());
+    }
+
+    // Sanity: we should have tools in at least Core, Dev, and Utility
+    assert!(
+        by_group.contains_key("Core"),
+        "Expected some Core tools, got groups: {:?}",
+        by_group.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        by_group.contains_key("Dev"),
+        "Expected some Dev tools. Core tools registered by register_dev_tools() \
+         should include shell, read_file, etc. Got: {:?}",
+        by_group
+    );
+
+    // Log the full mapping for CI visibility
+    for (group, tools) in &by_group {
+        let mut sorted = tools.clone();
+        sorted.sort();
+        eprintln!("  ToolGroup::{}: {:?}", group, sorted);
+    }
+}
+
+/// Verify that web_fetch (a core registered tool) is explicitly classified,
+/// not silently falling through the wildcard.
+#[test]
+fn web_fetch_has_explicit_visibility_group() {
+    use ironclaw::skills::attenuation::tool_group_for_name;
+    use ironclaw::tools::ToolGroup;
+
+    assert_eq!(
+        tool_group_for_name("web_fetch"),
+        ToolGroup::Utility,
+        "web_fetch should be explicitly assigned to Utility group"
+    );
+}

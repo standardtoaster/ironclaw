@@ -61,6 +61,41 @@ impl Default for ToolRateLimitConfig {
     }
 }
 
+/// Visibility group for a tool, controlling when it appears in the LLM's tool list.
+///
+/// Tools in always-visible groups (Core, Memory, Collections) are always shown.
+/// Tools in on-demand groups are hidden unless a matching skill activates them.
+/// This reduces context overhead for small models by limiting the tool list to
+/// what's relevant for the current task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolGroup {
+    /// Essential tools always available (time, message).
+    Core,
+    /// Memory tools always available (search, write, read, tree).
+    Memory,
+    /// Collection management tools always available (register, list, drop, alter).
+    Collections,
+    /// Developer tools: shell, file I/O, patch (on-demand).
+    Dev,
+    /// Job management tools: create, list, status, cancel (on-demand).
+    Jobs,
+    /// Extension management: install, auth, activate MCP/WASM (on-demand).
+    Extensions,
+    /// Skill management: list, search, install, remove (on-demand).
+    Skills,
+    /// Routine management: create, list, update, cron (on-demand).
+    Routines,
+    /// Utility tools: echo, json, http, build_software (on-demand).
+    Utility,
+}
+
+impl ToolGroup {
+    /// Whether this group is always shown to the LLM regardless of active skills.
+    pub fn is_always_visible(self) -> bool {
+        matches!(self, Self::Core | Self::Memory | Self::Collections)
+    }
+}
+
 /// Where a tool should execute: orchestrator process or inside a container.
 ///
 /// Orchestrator tools run in the main agent process (memory access, job mgmt, etc).
