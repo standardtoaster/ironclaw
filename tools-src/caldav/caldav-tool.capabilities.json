@@ -1,0 +1,60 @@
+{
+  "http": {
+    "allowlist": [
+      {
+        "host": "caldav.icloud.com",
+        "path_prefix": "/",
+        "methods": ["PROPFIND", "REPORT", "GET", "OPTIONS"]
+      },
+      {
+        "host": "p*.icloud.com",
+        "path_prefix": "/",
+        "methods": ["PROPFIND", "REPORT", "GET", "OPTIONS"]
+      },
+      {
+        "host": "caldav.fastmail.com",
+        "path_prefix": "/",
+        "methods": ["PROPFIND", "REPORT", "GET", "OPTIONS"]
+      },
+      {
+        "host": "www.google.com",
+        "path_prefix": "/calendar/dav/",
+        "methods": ["PROPFIND", "REPORT", "GET", "OPTIONS"]
+      }
+    ],
+    "credentials": {
+      "caldav_password": {
+        "secret_name": "caldav_password",
+        "location": { "type": "basic", "username": "CALDAV_USERNAME_PLACEHOLDER" },
+        "host_patterns": ["caldav.icloud.com", "*.icloud.com", "caldav.fastmail.com", "www.google.com"]
+      }
+    },
+    "rate_limit": {
+      "requests_per_minute": 30,
+      "requests_per_hour": 300
+    },
+    "timeout_secs": 30
+  },
+  "secrets": {
+    "allowed_names": ["caldav_password"]
+  },
+  "workspace_read": {
+    "allowed_paths": ["CALDAV_CONFIG"]
+  },
+  "auth": {
+    "secret_name": "caldav_password",
+    "display_name": "CalDAV",
+    "manual": {
+      "prompt": "CalDAV app-specific password (for iCloud: appleid.apple.com > Sign-In and Security > App-Specific Passwords)"
+    },
+    "env_var": "CALDAV_PASSWORD"
+  },
+  "setup": {
+    "required_secrets": [
+      {
+        "name": "caldav_password",
+        "prompt": "CalDAV app-specific password"
+      }
+    ]
+  }
+}
