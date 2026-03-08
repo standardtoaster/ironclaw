@@ -125,6 +125,62 @@ impl Scheduler {
         Ok(job_id)
     }
 
+    /// Create, persist, and schedule a job attached to an existing conversation.
+    ///
+    /// Like `dispatch_job`, but instead of creating a new conversation the job
+    /// references an existing `conversation_id`. The `prompt` is appended as a
+    /// new user message to that conversation before the worker starts, so the
+    /// worker will see the full history when it hydrates the thread.
+    ///
+    /// Returns the new job ID.
+    pub async fn dispatch_job_to_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: Uuid,
+        title: &str,
+        prompt: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<Uuid, JobError> {
+        // 1. Create job context linked to the existing conversation
+        let job_id = self
+            .context_manager
+            .create_job_for_conversation(user_id, conversation_id, title, prompt)
+            .await?;
+
+        // 2. Apply metadata if provided
+        if let Some(meta) = metadata {
+            self.context_manager
+                .update_context(job_id, |ctx| {
+                    ctx.metadata = meta;
+                })
+                .await?;
+        }
+
+        // 3. Append the prompt as a user message to the existing conversation
+        if let Some(ref store) = self.store {
+            store
+                .add_conversation_message(conversation_id, "user", prompt)
+                .await
+                .map_err(|e| JobError::Failed {
+                    id: job_id,
+                    reason: format!("failed to append message to conversation: {e}"),
+                })?;
+        }
+
+        // 4. Persist job to DB before scheduling so FK references are valid
+        if let Some(ref store) = self.store {
+            let ctx = self.context_manager.get_context(job_id).await?;
+            store.save_job(&ctx).await.map_err(|e| JobError::Failed {
+                id: job_id,
+                reason: format!("failed to persist job: {e}"),
+            })?;
+        }
+
+        // 5. Schedule the worker
+        self.schedule(job_id).await?;
+        Ok(job_id)
+    }
+
     /// Schedule a job for execution.
     pub async fn schedule(&self, job_id: Uuid) -> Result<(), JobError> {
         // Hold write lock for the entire check-insert sequence to prevent
