@@ -16,11 +16,12 @@ use crate::skills::catalog::SkillCatalog;
 use crate::skills::registry::SkillRegistry;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
 use crate::tools::builtin::{
-    ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, HttpTool, JobEventsTool, JobPromptTool,
-    JobStatusTool, JsonTool, ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool,
-    MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, ShellTool, SkillInstallTool,
-    SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool, ToolActivateTool, ToolAuthTool,
-    ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool, WebFetchTool, WriteFileTool,
+    ApplyPatchTool, CancelJobTool, CreateJobTool, DelegateToWorkspaceTool, EchoTool, HttpTool,
+    JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool,
+    MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool,
+    ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool,
+    ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
+    WebFetchTool, WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::tool::{Tool, ToolDomain};
@@ -73,6 +74,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "collections_list",
     "collections_register",
     "collections_drop",
+    "delegate_to_workspace",
 ];
 
 /// Registry of available tools.
@@ -412,6 +414,23 @@ impl ToolRegistry {
         )));
         self.register_sync(Arc::new(RoutineHistoryTool::new(store)));
         tracing::info!("Registered 5 routine management tools");
+    }
+
+    /// Register workspace delegation tools.
+    ///
+    /// These allow the LLM to delegate tasks to persistent workspaces that
+    /// retain context across calls. The scheduler slot is filled later after
+    /// the agent is fully initialized.
+    pub fn register_workspace_tools(
+        &self,
+        router: Arc<crate::agent::workspace_router::WorkspaceRouter>,
+        scheduler: crate::tools::builtin::SchedulerSlot,
+        db: Arc<dyn Database>,
+    ) {
+        self.register_sync(Arc::new(DelegateToWorkspaceTool::new(
+            router, scheduler, db,
+        )));
+        tracing::info!("Registered workspace delegation tools");
     }
 
     /// Register message tool for sending messages to channels.
