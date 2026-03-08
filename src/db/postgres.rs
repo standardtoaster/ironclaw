@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
+use pgvector::Vector;
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
@@ -16,8 +17,8 @@ use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
-    ConversationStore, Database, JobStore, RoutineStore, SandboxStore, SettingsStore,
-    ToolFailureStore, WorkspaceStore, structured,
+    AgentWorkspace, AgentWorkspaceStore, ConversationStore, Database, JobStore, RoutineStore,
+    SandboxStore, SettingsStore, ToolFailureStore, WorkspaceStore, structured,
     structured::{Aggregation, CollectionSchema, Filter, Record, StructuredStore},
 };
 use crate::error::{DatabaseError, WorkspaceError};
@@ -1302,6 +1303,198 @@ fn extract_agg_value(
                 None => Ok(serde_json::Value::Null),
             }
         }
+    }
+}
+
+// ==================== AgentWorkspaceStore ====================
+
+/// Map a tokio_postgres row to an `AgentWorkspace`.
+fn pg_row_to_agent_workspace(row: &tokio_postgres::Row) -> AgentWorkspace {
+    AgentWorkspace {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        topic: row.get("topic"),
+        conversation_id: row.get("conversation_id"),
+        status: row.get("status"),
+        last_accessed: row.get("last_accessed"),
+        turn_count: row.get("turn_count"),
+        created_at: row.get("created_at"),
+    }
+}
+
+#[async_trait]
+impl AgentWorkspaceStore for PgBackend {
+    async fn create_agent_workspace(
+        &self,
+        user_id: &str,
+        conversation_id: Uuid,
+    ) -> Result<AgentWorkspace, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                r#"
+                INSERT INTO agent_workspaces (user_id, conversation_id)
+                VALUES ($1, $2)
+                RETURNING id, user_id, topic, conversation_id, status,
+                          last_accessed, turn_count, created_at
+                "#,
+                &[&user_id, &conversation_id],
+            )
+            .await?;
+        Ok(pg_row_to_agent_workspace(&row))
+    }
+
+    async fn update_agent_workspace_topic(
+        &self,
+        id: Uuid,
+        topic: &str,
+        embedding: &[f32],
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        let embedding_vec = Vector::from(embedding.to_vec());
+        conn.execute(
+            "UPDATE agent_workspaces SET topic = $2, topic_embedding = $3 WHERE id = $1",
+            &[&id, &topic, &embedding_vec],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn find_matching_workspace(
+        &self,
+        user_id: &str,
+        embedding: &[f32],
+        threshold: f64,
+    ) -> Result<Option<AgentWorkspace>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let embedding_vec = Vector::from(embedding.to_vec());
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, user_id, topic, conversation_id, status,
+                       last_accessed, turn_count, created_at,
+                       1 - (topic_embedding <=> $2) AS similarity
+                FROM agent_workspaces
+                WHERE user_id = $1
+                  AND status != 'archived'
+                  AND topic_embedding IS NOT NULL
+                ORDER BY topic_embedding <=> $2
+                LIMIT 1
+                "#,
+                &[&user_id, &embedding_vec],
+            )
+            .await?;
+
+        match rows.first() {
+            Some(row) => {
+                let similarity: f64 = row.get("similarity");
+                if similarity >= threshold {
+                    Ok(Some(pg_row_to_agent_workspace(row)))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn get_agent_workspace(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<AgentWorkspace>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, user_id, topic, conversation_id, status,
+                       last_accessed, turn_count, created_at
+                FROM agent_workspaces WHERE id = $1
+                "#,
+                &[&id],
+            )
+            .await?;
+        Ok(rows.first().map(pg_row_to_agent_workspace))
+    }
+
+    async fn list_agent_workspaces(
+        &self,
+        user_id: &str,
+        status: Option<&str>,
+    ) -> Result<Vec<AgentWorkspace>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = match status {
+            Some(s) => {
+                conn.query(
+                    r#"
+                    SELECT id, user_id, topic, conversation_id, status,
+                           last_accessed, turn_count, created_at
+                    FROM agent_workspaces
+                    WHERE user_id = $1 AND status = $2
+                    ORDER BY last_accessed DESC
+                    "#,
+                    &[&user_id, &s],
+                )
+                .await?
+            }
+            None => {
+                conn.query(
+                    r#"
+                    SELECT id, user_id, topic, conversation_id, status,
+                           last_accessed, turn_count, created_at
+                    FROM agent_workspaces
+                    WHERE user_id = $1
+                    ORDER BY last_accessed DESC
+                    "#,
+                    &[&user_id],
+                )
+                .await?
+            }
+        };
+        Ok(rows.iter().map(pg_row_to_agent_workspace).collect())
+    }
+
+    async fn touch_agent_workspace(&self, id: Uuid) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "UPDATE agent_workspaces SET turn_count = turn_count + 1, last_accessed = now() WHERE id = $1",
+            &[&id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn update_agent_workspace_status(
+        &self,
+        id: Uuid,
+        status: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "UPDATE agent_workspaces SET status = $2 WHERE id = $1",
+            &[&id, &status],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn archive_stale_workspaces(
+        &self,
+        user_id: &str,
+        stale_days: i64,
+    ) -> Result<u64, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let n = conn
+            .execute(
+                r#"
+                UPDATE agent_workspaces SET status = 'archived'
+                WHERE user_id = $1
+                  AND status = 'active'
+                  AND last_accessed < now() - make_interval(days => $2)
+                "#,
+                &[&user_id, &stale_days],
+            )
+            .await?;
+        Ok(n)
     }
 }
 
