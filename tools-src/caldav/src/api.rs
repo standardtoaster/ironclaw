@@ -1,4 +1,4 @@
-//! CalDAV HTTP requests (PROPFIND, REPORT, GET).
+//! CalDAV HTTP requests (PROPFIND, REPORT, GET, PUT, DELETE).
 //!
 //! All requests go through the host's HTTP capability, which handles
 //! credential injection (Basic Auth) and rate limiting. The WASM tool
@@ -8,16 +8,23 @@ use crate::ical;
 use crate::near::agent::host;
 use crate::types::*;
 
+/// Simple UID counter for generating unique IDs within a single execution.
+static mut UID_COUNTER: u32 = 0;
+
 /// Make a CalDAV HTTP request.
 fn caldav_request(method: &str, url: &str, body: Option<&str>) -> Result<String, String> {
-    let mut headers = String::from("{\"Content-Type\": \"application/xml; charset=utf-8\"");
+    // PUT uses text/calendar content type; everything else uses application/xml
+    let content_type = if method == "PUT" {
+        "text/calendar; charset=utf-8"
+    } else {
+        "application/xml; charset=utf-8"
+    };
+
+    let mut headers = format!("{{\"Content-Type\": \"{}\"", content_type);
 
     // PROPFIND and REPORT need Depth header
     match method {
-        "PROPFIND" => {
-            headers.push_str(", \"Depth\": \"1\"");
-        }
-        "REPORT" => {
+        "PROPFIND" | "REPORT" => {
             headers.push_str(", \"Depth\": \"1\"");
         }
         _ => {}
@@ -34,7 +41,7 @@ fn caldav_request(method: &str, url: &str, body: Option<&str>) -> Result<String,
 
     let response = host::http_request(method, url, &headers, body_bytes.as_deref(), None)?;
 
-    // 2xx (including 207 Multi-Status) is success for WebDAV
+    // 2xx (including 201 Created, 204 No Content, 207 Multi-Status) is success for WebDAV
     if response.status < 200 || response.status >= 300 {
         let body_text = String::from_utf8_lossy(&response.body);
         return Err(format!(
@@ -247,6 +254,195 @@ pub fn free_busy(
         .collect();
 
     Ok(FreeBusyResult { busy })
+}
+
+/// Generate a unique UID for a new event.
+/// Uses now_millis + a counter since WASM has no RNG.
+fn generate_uid() -> String {
+    let millis = host::now_millis();
+    // Safety: WASM is single-threaded, no data race.
+    let count = unsafe {
+        UID_COUNTER += 1;
+        UID_COUNTER
+    };
+    format!("ironclaw-{}-{}@caldav", millis, count)
+}
+
+/// Create a new calendar event.
+pub fn create_event(
+    calendar_url: &str,
+    summary: &str,
+    start_datetime: Option<&str>,
+    end_datetime: Option<&str>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+    location: Option<&str>,
+    description: Option<&str>,
+    timezone: Option<&str>,
+) -> Result<CreateEventResult, String> {
+    let uid = generate_uid();
+    let now = host::now_millis();
+
+    let fields = ical::EventFields {
+        uid: uid.clone(),
+        summary: summary.to_string(),
+        start_datetime: start_datetime.map(|s| s.to_string()),
+        end_datetime: end_datetime.map(|s| s.to_string()),
+        start_date: start_date.map(|s| s.to_string()),
+        end_date: end_date.map(|s| s.to_string()),
+        location: location.map(|s| s.to_string()),
+        description: description.map(|s| s.to_string()),
+        timezone: timezone.map(|s| s.to_string()),
+    };
+
+    let ical_text = ical::build_vcalendar(&fields, now)?;
+
+    let url = format!(
+        "{}/{}.ics",
+        calendar_url.trim_end_matches('/'),
+        uid
+    );
+
+    caldav_request("PUT", &url, Some(&ical_text))?;
+
+    // Parse back from what we built to return a consistent Event
+    let events = ical::parse_vevents(&ical_text);
+    let vevent = events.into_iter().next().ok_or("Failed to parse created event")?;
+
+    Ok(CreateEventResult {
+        event: Event {
+            uid: vevent.uid,
+            summary: vevent.summary,
+            start: vevent.dtstart,
+            end: vevent.dtend,
+            location: vevent.location,
+            description: vevent.description,
+            status: vevent.status,
+            href: Some(url),
+        },
+    })
+}
+
+/// Update an existing calendar event.
+/// Fetches the existing .ics, merges changes, and PUTs back.
+pub fn update_event(
+    calendar_url: &str,
+    uid: &str,
+    summary: Option<&str>,
+    start_datetime: Option<&str>,
+    end_datetime: Option<&str>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+    location: Option<&str>,
+    description: Option<&str>,
+    timezone: Option<&str>,
+) -> Result<UpdateEventResult, String> {
+    // Fetch the existing event to get current values
+    let existing = get_event(calendar_url, uid)?;
+    let existing_event = &existing.event;
+
+    let now = host::now_millis();
+
+    // Determine start/end: prefer new values, fall back to existing.
+    // If the caller provides start_date, we switch to all-day mode.
+    // If the caller provides start_datetime, we switch to timed mode.
+    // Otherwise, preserve the existing event's style.
+    let (final_start_datetime, final_end_datetime, final_start_date, final_end_date) =
+        if start_date.is_some() {
+            // Caller wants all-day
+            (None, None, start_date.map(|s| s.to_string()), end_date.map(|s| s.to_string()))
+        } else if start_datetime.is_some() {
+            // Caller wants timed
+            (
+                start_datetime.map(|s| s.to_string()),
+                end_datetime.map(|s| s.to_string()).or_else(|| existing_event.end.clone()),
+                None,
+                None,
+            )
+        } else if is_date_only(&existing_event.start) {
+            // Existing is all-day, preserve
+            (
+                None,
+                None,
+                Some(existing_event.start.clone()),
+                existing_event.end.clone(),
+            )
+        } else {
+            // Existing is timed, preserve
+            (
+                Some(existing_event.start.clone()),
+                existing_event.end.clone(),
+                None,
+                None,
+            )
+        };
+
+    let fields = ical::EventFields {
+        uid: uid.to_string(),
+        summary: summary.unwrap_or(&existing_event.summary).to_string(),
+        start_datetime: final_start_datetime,
+        end_datetime: final_end_datetime,
+        start_date: final_start_date,
+        end_date: final_end_date,
+        location: if location.is_some() {
+            location.map(|s| s.to_string())
+        } else {
+            existing_event.location.clone()
+        },
+        description: if description.is_some() {
+            description.map(|s| s.to_string())
+        } else {
+            existing_event.description.clone()
+        },
+        timezone: timezone.map(|s| s.to_string()),
+    };
+
+    let ical_text = ical::build_vcalendar(&fields, now)?;
+
+    let url = format!(
+        "{}/{}.ics",
+        calendar_url.trim_end_matches('/'),
+        uid
+    );
+
+    caldav_request("PUT", &url, Some(&ical_text))?;
+
+    let events = ical::parse_vevents(&ical_text);
+    let vevent = events.into_iter().next().ok_or("Failed to parse updated event")?;
+
+    Ok(UpdateEventResult {
+        event: Event {
+            uid: vevent.uid,
+            summary: vevent.summary,
+            start: vevent.dtstart,
+            end: vevent.dtend,
+            location: vevent.location,
+            description: vevent.description,
+            status: vevent.status,
+            href: Some(url),
+        },
+    })
+}
+
+/// Delete a calendar event.
+pub fn delete_event(calendar_url: &str, uid: &str) -> Result<DeleteEventResult, String> {
+    let url = format!(
+        "{}/{}.ics",
+        calendar_url.trim_end_matches('/'),
+        uid
+    );
+
+    caldav_request("DELETE", &url, None)?;
+
+    Ok(DeleteEventResult {
+        uid: uid.to_string(),
+        deleted: true,
+    })
+}
+
+/// Check if a datetime string looks like a date-only value (no T).
+fn is_date_only(dt: &str) -> bool {
+    !dt.contains('T')
 }
 
 // ── XML helpers ──────────────────────────────────────────────────────

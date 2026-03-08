@@ -4,22 +4,22 @@
       {
         "host": "caldav.icloud.com",
         "path_prefix": "/",
-        "methods": ["PROPFIND", "REPORT", "GET", "OPTIONS"]
+        "methods": ["PROPFIND", "REPORT", "GET", "PUT", "DELETE", "OPTIONS"]
       },
       {
         "host": "p*.icloud.com",
         "path_prefix": "/",
-        "methods": ["PROPFIND", "REPORT", "GET", "OPTIONS"]
+        "methods": ["PROPFIND", "REPORT", "GET", "PUT", "DELETE", "OPTIONS"]
       },
       {
         "host": "caldav.fastmail.com",
         "path_prefix": "/",
-        "methods": ["PROPFIND", "REPORT", "GET", "OPTIONS"]
+        "methods": ["PROPFIND", "REPORT", "GET", "PUT", "DELETE", "OPTIONS"]
       },
       {
         "host": "www.google.com",
         "path_prefix": "/calendar/dav/",
-        "methods": ["PROPFIND", "REPORT", "GET", "OPTIONS"]
+        "methods": ["PROPFIND", "REPORT", "GET", "PUT", "DELETE", "OPTIONS"]
       }
     ],
     "credentials": {

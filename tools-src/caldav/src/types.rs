@@ -43,6 +43,75 @@ pub enum CalDavAction {
         /// RFC3339 end of time range.
         time_max: String,
     },
+
+    /// Create a new calendar event.
+    CreateEvent {
+        /// Full URL to the calendar collection.
+        calendar_url: String,
+        /// Event summary/title.
+        summary: String,
+        /// Start datetime (RFC3339, e.g., "2026-03-15T09:00:00Z"). For timed events.
+        #[serde(default)]
+        start_datetime: Option<String>,
+        /// End datetime (RFC3339). For timed events.
+        #[serde(default)]
+        end_datetime: Option<String>,
+        /// Start date (YYYY-MM-DD). For all-day events.
+        #[serde(default)]
+        start_date: Option<String>,
+        /// End date (YYYY-MM-DD). For all-day events (exclusive, so next day).
+        #[serde(default)]
+        end_date: Option<String>,
+        /// Event location.
+        #[serde(default)]
+        location: Option<String>,
+        /// Event description.
+        #[serde(default)]
+        description: Option<String>,
+        /// IANA timezone (e.g., "America/New_York"). For non-UTC timed events.
+        #[serde(default)]
+        timezone: Option<String>,
+    },
+
+    /// Update an existing calendar event.
+    UpdateEvent {
+        /// Full URL to the calendar collection.
+        calendar_url: String,
+        /// The event UID to update.
+        uid: String,
+        /// New summary/title.
+        #[serde(default)]
+        summary: Option<String>,
+        /// New start datetime (RFC3339). For timed events.
+        #[serde(default)]
+        start_datetime: Option<String>,
+        /// New end datetime (RFC3339). For timed events.
+        #[serde(default)]
+        end_datetime: Option<String>,
+        /// New start date (YYYY-MM-DD). For all-day events.
+        #[serde(default)]
+        start_date: Option<String>,
+        /// New end date (YYYY-MM-DD). For all-day events.
+        #[serde(default)]
+        end_date: Option<String>,
+        /// New location.
+        #[serde(default)]
+        location: Option<String>,
+        /// New description.
+        #[serde(default)]
+        description: Option<String>,
+        /// IANA timezone for non-UTC timed events.
+        #[serde(default)]
+        timezone: Option<String>,
+    },
+
+    /// Delete a calendar event.
+    DeleteEvent {
+        /// Full URL to the calendar collection.
+        calendar_url: String,
+        /// The event UID to delete.
+        uid: String,
+    },
 }
 
 /// CalDAV configuration read from workspace.
@@ -132,4 +201,23 @@ pub struct GetEventResult {
 #[derive(Debug, Serialize)]
 pub struct FreeBusyResult {
     pub busy: Vec<BusyInterval>,
+}
+
+/// Result from create_event.
+#[derive(Debug, Serialize)]
+pub struct CreateEventResult {
+    pub event: Event,
+}
+
+/// Result from update_event.
+#[derive(Debug, Serialize)]
+pub struct UpdateEventResult {
+    pub event: Event,
+}
+
+/// Result from delete_event.
+#[derive(Debug, Serialize)]
+pub struct DeleteEventResult {
+    pub uid: String,
+    pub deleted: bool,
 }

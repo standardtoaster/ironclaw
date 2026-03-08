@@ -1,11 +1,11 @@
 //! CalDAV WASM Tool for IronClaw.
 //!
-//! Provides read-only CalDAV calendar integration for querying calendars
+//! Provides CalDAV calendar integration for querying and managing calendars
 //! and events via the standard CalDAV protocol (RFC 4791).
 //!
 //! # Capabilities Required
 //!
-//! - HTTP: CalDAV servers (PROPFIND, REPORT, GET)
+//! - HTTP: CalDAV servers (PROPFIND, REPORT, GET, PUT, DELETE)
 //! - Secrets: `caldav_password` (app-specific password, injected as Basic Auth)
 //! - Workspace: `CALDAV_CONFIG` (JSON with base_url, username)
 //!
@@ -15,6 +15,9 @@
 //! - `list_events`: List events in a time range
 //! - `get_event`: Get a specific event by UID
 //! - `free_busy`: Query free/busy intervals for a time range
+//! - `create_event`: Create a new calendar event
+//! - `update_event`: Update an existing calendar event
+//! - `delete_event`: Delete a calendar event
 //!
 //! # Setup
 //!
@@ -64,7 +67,7 @@ impl exports::near::agent::tool::Guest for CalDavTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list_calendars", "list_events", "get_event", "free_busy"],
+                    "enum": ["list_calendars", "list_events", "get_event", "free_busy", "create_event", "update_event", "delete_event"],
                     "description": "The calendar operation to perform"
                 },
                 "base_url": {
@@ -73,7 +76,7 @@ impl exports::near::agent::tool::Guest for CalDavTool {
                 },
                 "calendar_url": {
                     "type": "string",
-                    "description": "Full URL to the calendar collection. Required for: list_events, get_event, free_busy"
+                    "description": "Full URL to the calendar collection. Required for: list_events, get_event, free_busy, create_event, update_event, delete_event"
                 },
                 "time_min": {
                     "type": "string",
@@ -85,7 +88,39 @@ impl exports::near::agent::tool::Guest for CalDavTool {
                 },
                 "uid": {
                     "type": "string",
-                    "description": "Event UID. Required for: get_event"
+                    "description": "Event UID. Required for: get_event, update_event, delete_event"
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Event title/summary. Required for: create_event. Optional for: update_event"
+                },
+                "start_datetime": {
+                    "type": "string",
+                    "description": "Start datetime (RFC3339, e.g., '2026-03-15T09:00:00Z'). For timed events. Used by: create_event, update_event"
+                },
+                "end_datetime": {
+                    "type": "string",
+                    "description": "End datetime (RFC3339). For timed events. Used by: create_event, update_event"
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Start date (YYYY-MM-DD). For all-day events. Used by: create_event, update_event"
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "End date (YYYY-MM-DD, exclusive). For all-day events. Used by: create_event, update_event"
+                },
+                "location": {
+                    "type": "string",
+                    "description": "Event location. Used by: create_event, update_event"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Event description. Used by: create_event, update_event"
+                },
+                "timezone": {
+                    "type": "string",
+                    "description": "IANA timezone (e.g., 'America/New_York'). For non-UTC timed events. Used by: create_event, update_event"
                 }
             }
         }"#
@@ -93,12 +128,12 @@ impl exports::near::agent::tool::Guest for CalDavTool {
     }
 
     fn description() -> String {
-        "CalDAV calendar integration for reading calendars and events. Supports iCloud, \
-         Fastmail, and Google CalDAV. Use list_calendars to discover available calendars, \
-         list_events to see events in a time range, get_event for full event details, \
-         and free_busy to check availability. Read-only (no create/update/delete). \
-         Requires a CALDAV_CONFIG workspace file with base_url and username, plus a \
-         caldav_password secret (app-specific password)."
+        "CalDAV calendar integration. Supports iCloud, Fastmail, and Google CalDAV. \
+         Actions: list_calendars (discover calendars), list_events (events in time range), \
+         get_event (by UID), free_busy (availability), create_event (new event), \
+         update_event (modify existing), delete_event (remove). For timed events use \
+         start_datetime/end_datetime (RFC3339); for all-day use start_date/end_date \
+         (YYYY-MM-DD). Requires CALDAV_CONFIG workspace file and caldav_password secret."
             .to_string()
     }
 }
@@ -165,6 +200,63 @@ fn execute_inner(params: &str) -> Result<String, String> {
             time_max,
         } => {
             let result = api::free_busy(&calendar_url, &time_min, &time_max)?;
+            serde_json::to_string(&result).map_err(|e| e.to_string())?
+        }
+
+        CalDavAction::CreateEvent {
+            calendar_url,
+            summary,
+            start_datetime,
+            end_datetime,
+            start_date,
+            end_date,
+            location,
+            description,
+            timezone,
+        } => {
+            let result = api::create_event(
+                &calendar_url,
+                &summary,
+                start_datetime.as_deref(),
+                end_datetime.as_deref(),
+                start_date.as_deref(),
+                end_date.as_deref(),
+                location.as_deref(),
+                description.as_deref(),
+                timezone.as_deref(),
+            )?;
+            serde_json::to_string(&result).map_err(|e| e.to_string())?
+        }
+
+        CalDavAction::UpdateEvent {
+            calendar_url,
+            uid,
+            summary,
+            start_datetime,
+            end_datetime,
+            start_date,
+            end_date,
+            location,
+            description,
+            timezone,
+        } => {
+            let result = api::update_event(
+                &calendar_url,
+                &uid,
+                summary.as_deref(),
+                start_datetime.as_deref(),
+                end_datetime.as_deref(),
+                start_date.as_deref(),
+                end_date.as_deref(),
+                location.as_deref(),
+                description.as_deref(),
+                timezone.as_deref(),
+            )?;
+            serde_json::to_string(&result).map_err(|e| e.to_string())?
+        }
+
+        CalDavAction::DeleteEvent { calendar_url, uid } => {
+            let result = api::delete_event(&calendar_url, &uid)?;
             serde_json::to_string(&result).map_err(|e| e.to_string())?
         }
     };
