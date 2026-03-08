@@ -53,7 +53,8 @@ mod search;
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{MemoryChunk, MemoryDocument, WorkspaceEntry, merge_workspace_entries, paths};
 pub use embeddings::{
-    EmbeddingProvider, MockEmbeddings, NearAiEmbeddings, OllamaEmbeddings, OpenAiEmbeddings,
+    EmbeddingError, EmbeddingProvider, MockEmbeddings, NearAiEmbeddings, OllamaEmbeddings,
+    OpenAiEmbeddings,
 };
 #[cfg(feature = "postgres")]
 pub use repository::Repository;
