@@ -291,6 +291,18 @@ pub struct HeartbeatSettings {
     /// User ID to notify on heartbeat findings.
     #[serde(default)]
     pub notify_user: Option<String>,
+
+    /// Hour (0-23) when quiet hours start (heartbeat skipped).
+    #[serde(default)]
+    pub quiet_hours_start: Option<u32>,
+
+    /// Hour (0-23) when quiet hours end (heartbeat resumes).
+    #[serde(default)]
+    pub quiet_hours_end: Option<u32>,
+
+    /// Timezone for quiet hours evaluation (IANA name, e.g. "America/New_York").
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 fn default_heartbeat_interval() -> u64 {
@@ -304,6 +316,9 @@ impl Default for HeartbeatSettings {
             interval_secs: default_heartbeat_interval(),
             notify_channel: None,
             notify_user: None,
+            quiet_hours_start: None,
+            quiet_hours_end: None,
+            timezone: None,
         }
     }
 }
@@ -351,6 +366,10 @@ pub struct AgentSettings {
     /// When true, skip tool approval checks entirely. For benchmarks/CI.
     #[serde(default)]
     pub auto_approve_tools: bool,
+
+    /// Default timezone for new sessions (IANA name, e.g. "America/New_York").
+    #[serde(default = "default_timezone")]
+    pub default_timezone: String,
 }
 
 fn default_agent_name() -> String {
@@ -385,6 +404,10 @@ fn default_max_tool_iterations() -> usize {
     50
 }
 
+fn default_timezone() -> String {
+    "UTC".to_string()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -402,6 +425,7 @@ impl Default for AgentSettings {
             session_idle_timeout_secs: default_session_idle_timeout(),
             max_tool_iterations: default_max_tool_iterations(),
             auto_approve_tools: false,
+            default_timezone: default_timezone(),
         }
     }
 }
