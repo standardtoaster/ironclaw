@@ -17,7 +17,7 @@ use crate::skills::registry::SkillRegistry;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
 use crate::tools::builtin::{
     ApplyPatchTool, CancelJobTool, CreateJobTool, DelegateToWorkspaceTool, EchoTool, HttpTool,
-    JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool,
+    JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool, ListWorkspacesTool,
     MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool,
     ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool,
     ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
@@ -75,6 +75,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "collections_register",
     "collections_drop",
     "delegate_to_workspace",
+    "list_workspaces",
 ];
 
 /// Registry of available tools.
@@ -428,9 +429,10 @@ impl ToolRegistry {
         db: Arc<dyn Database>,
     ) {
         self.register_sync(Arc::new(DelegateToWorkspaceTool::new(
-            router, scheduler, db,
+            router, scheduler, db.clone(),
         )));
-        tracing::info!("Registered workspace delegation tools");
+        self.register_sync(Arc::new(ListWorkspacesTool::new(db)));
+        tracing::info!("Registered workspace tools");
     }
 
     /// Register message tool for sending messages to channels.
