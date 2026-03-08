@@ -55,6 +55,9 @@ pub struct Scheduler {
     jobs: Arc<RwLock<HashMap<Uuid, ScheduledJob>>>,
     /// Running sub-tasks (tool executions, background tasks).
     subtasks: Arc<RwLock<HashMap<Uuid, ScheduledSubtask>>>,
+    /// Waiters for job completion. When a job's worker handle finishes,
+    /// all registered oneshot senders are fired.
+    completion_waiters: Arc<RwLock<HashMap<Uuid, Vec<oneshot::Sender<()>>>>>,
 }
 
 impl Scheduler {
@@ -78,6 +81,7 @@ impl Scheduler {
             hooks,
             jobs: Arc::new(RwLock::new(HashMap::new())),
             subtasks: Arc::new(RwLock::new(HashMap::new())),
+            completion_waiters: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -181,6 +185,105 @@ impl Scheduler {
         Ok(job_id)
     }
 
+    /// Block until a dispatched job completes and return its final response text.
+    ///
+    /// Registers a completion waiter for the given job, then blocks until either
+    /// the worker finishes or the timeout elapses. On completion, reads the job
+    /// context to determine success/failure and extracts the last assistant
+    /// message from the conversation as the response text.
+    pub async fn await_job(
+        &self,
+        job_id: Uuid,
+        timeout: Duration,
+    ) -> Result<String, JobError> {
+        // Check if the job is already finished (handle already cleaned up)
+        let already_done = !self.jobs.read().await.contains_key(&job_id);
+
+        let rx = if already_done {
+            // Job already finished before we registered -- skip waiting
+            None
+        } else {
+            // Register a waiter
+            let (tx, rx) = oneshot::channel();
+            self.completion_waiters
+                .write()
+                .await
+                .entry(job_id)
+                .or_default()
+                .push(tx);
+            Some(rx)
+        };
+
+        // Wait for completion (with timeout)
+        if let Some(rx) = rx {
+            tokio::time::timeout(timeout, rx)
+                .await
+                .map_err(|_| JobError::Stuck {
+                    id: job_id,
+                    duration: timeout,
+                })?
+                .map_err(|_| JobError::Failed {
+                    id: job_id,
+                    reason: "Job completion channel dropped unexpectedly".to_string(),
+                })?;
+        }
+
+        // Read final job state
+        let job_ctx = self.context_manager.get_context(job_id).await?;
+
+        match job_ctx.state {
+            JobState::Completed | JobState::Submitted | JobState::Accepted => {}
+            JobState::Failed => {
+                let reason = job_ctx
+                    .transitions
+                    .last()
+                    .and_then(|t| t.reason.clone())
+                    .unwrap_or_else(|| "unknown failure".to_string());
+                return Err(JobError::Failed {
+                    id: job_id,
+                    reason,
+                });
+            }
+            JobState::Stuck => {
+                return Err(JobError::Stuck {
+                    id: job_id,
+                    duration: Duration::from_secs(0),
+                });
+            }
+            JobState::Cancelled => {
+                return Err(JobError::Failed {
+                    id: job_id,
+                    reason: "Job was cancelled".to_string(),
+                });
+            }
+            other => {
+                return Err(JobError::Failed {
+                    id: job_id,
+                    reason: format!("Job ended in unexpected state: {other}"),
+                });
+            }
+        }
+
+        // Extract the last assistant message from the conversation
+        if let (Some(store), Some(conversation_id)) = (&self.store, job_ctx.conversation_id) {
+            let messages = store
+                .list_conversation_messages(conversation_id)
+                .await
+                .map_err(|e| JobError::Failed {
+                    id: job_id,
+                    reason: format!("Failed to read conversation messages: {e}"),
+                })?;
+
+            // Find the last assistant message
+            if let Some(msg) = messages.iter().rev().find(|m| m.role == "assistant") {
+                return Ok(msg.content.clone());
+            }
+        }
+
+        // Fallback: no conversation or no assistant messages found
+        Ok("Job completed successfully.".to_string())
+    }
+
     /// Schedule a job for execution.
     pub async fn schedule(&self, job_id: Uuid) -> Result<(), JobError> {
         // Hold write lock for the entire check-insert sequence to prevent
@@ -246,6 +349,7 @@ impl Scheduler {
 
         // Cleanup task for this job to avoid capacity leaks
         let jobs = Arc::clone(&self.jobs);
+        let completion_waiters = Arc::clone(&self.completion_waiters);
         tokio::spawn(async move {
             loop {
                 let finished = {
@@ -258,6 +362,12 @@ impl Scheduler {
 
                 if finished {
                     jobs.write().await.remove(&job_id);
+                    // Notify any waiters that the job has finished
+                    if let Some(waiters) = completion_waiters.write().await.remove(&job_id) {
+                        for tx in waiters {
+                            let _ = tx.send(());
+                        }
+                    }
                     break;
                 }
 
