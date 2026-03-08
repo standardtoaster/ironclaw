@@ -34,15 +34,13 @@ fn caldav_request(method: &str, url: &str, body: Option<&str>) -> Result<String,
 
     let response = host::http_request(method, url, &headers, body_bytes.as_deref(), None)?;
 
+    // 2xx (including 207 Multi-Status) is success for WebDAV
     if response.status < 200 || response.status >= 300 {
-        // 207 Multi-Status is success for WebDAV
-        if response.status != 207 {
-            let body_text = String::from_utf8_lossy(&response.body);
-            return Err(format!(
-                "CalDAV server returned status {}: {}",
-                response.status, body_text
-            ));
-        }
+        let body_text = String::from_utf8_lossy(&response.body);
+        return Err(format!(
+            "CalDAV server returned status {}: {}",
+            response.status, body_text
+        ));
     }
 
     String::from_utf8(response.body).map_err(|e| format!("Invalid UTF-8 in response: {}", e))
@@ -244,7 +242,6 @@ pub fn free_busy(
             Some(BusyInterval {
                 start: e.start.clone(),
                 end: end.clone(),
-                summary: Some(e.summary.clone()),
             })
         })
         .collect();

@@ -101,16 +101,13 @@ pub struct Event {
     pub href: Option<String>,
 }
 
-/// A busy interval.
+/// A busy interval (privacy-preserving: no event details, only times).
 #[derive(Debug, Serialize)]
 pub struct BusyInterval {
     /// Start of busy period (RFC3339).
     pub start: String,
     /// End of busy period (RFC3339).
     pub end: String,
-    /// Optional summary if available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
 }
 
 /// Result from list_calendars.
