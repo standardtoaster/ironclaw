@@ -293,6 +293,7 @@ impl TestHarnessBuilder {
             skills_config: SkillsConfig::default(),
             hooks,
             cost_guard,
+            workspace_router: None,
         };
 
         TestHarness {

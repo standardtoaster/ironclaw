@@ -479,7 +479,7 @@ async fn async_main() -> anyhow::Result<()> {
     );
 
     // Register workspace tools if we have a database and embeddings.
-    if let (Some(db), Some(embedder)) = (&components.db, &components.embeddings) {
+    let workspace_router_for_agent = if let (Some(db), Some(embedder)) = (&components.db, &components.embeddings) {
         let workspace_router = Arc::new(ironclaw::agent::workspace_router::WorkspaceRouter::new(
             Arc::clone(db) as Arc<dyn ironclaw::db::AgentWorkspaceStore>,
             Arc::clone(embedder),
@@ -489,13 +489,16 @@ async fn async_main() -> anyhow::Result<()> {
             ironclaw::agent::workspace_queue::WorkspaceQueueManager::new(32),
         );
         components.tools.register_workspace_tools(
-            workspace_router,
+            Arc::clone(&workspace_router),
             scheduler_slot.clone(),
             Arc::clone(db),
             Arc::clone(embedder),
             workspace_queue,
         );
-    }
+        Some(workspace_router)
+    } else {
+        None
+    };
 
     // ── Collection write broadcast channel ──────────────────────────────
     // Shared between the gateway (event ingest sends) and the routine engine (listens).
@@ -721,6 +724,7 @@ async fn async_main() -> anyhow::Result<()> {
         skills_config: config.skills.clone(),
         hooks: components.hooks,
         cost_guard: components.cost_guard,
+        workspace_router: workspace_router_for_agent,
     };
 
     let agent = Agent::new(
