@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, RwLock, oneshot};
 use uuid::Uuid;
 
+use crate::agent::scheduler::Scheduler;
+use crate::db::Database;
+
 /// Message priority levels. Higher value = higher priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MessagePriority {
@@ -180,6 +183,116 @@ impl WorkspaceQueueManager {
     pub async fn mark_idle(&self, workspace_id: Uuid) {
         let queue = self.get_or_create_queue(workspace_id).await;
         *queue.busy.lock().await = false;
+    }
+
+    /// Process a single message by dispatching a job to the workspace's conversation.
+    ///
+    /// Returns `Ok(result_text)` on success, `Err(error_string)` on failure.
+    pub async fn process_message(
+        scheduler: &Arc<Scheduler>,
+        db: &Arc<dyn Database>,
+        workspace_id: Uuid,
+        conversation_id: Uuid,
+        msg: WorkspaceMessage,
+    ) {
+        let user_id = msg
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("user_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("default")
+            .to_string();
+
+        let title = msg
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("title"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Workspace task")
+            .to_string();
+
+        let job_metadata = msg
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("job_metadata"))
+            .cloned();
+
+        let result = async {
+            let job_id = scheduler
+                .dispatch_job_to_conversation(
+                    &user_id,
+                    conversation_id,
+                    &title,
+                    &msg.prompt,
+                    job_metadata,
+                )
+                .await
+                .map_err(|e| format!("failed to dispatch job: {e}"))?;
+
+            scheduler
+                .await_job(job_id, Duration::from_secs(300))
+                .await
+                .map_err(|e| format!("workspace job failed or timed out: {e}"))
+        }
+        .await;
+
+        // Touch the workspace to update last_accessed (best-effort).
+        if let Err(e) = db.touch_agent_workspace(workspace_id).await {
+            tracing::warn!(
+                workspace_id = %workspace_id,
+                "failed to touch workspace: {e}"
+            );
+        }
+
+        // Send result back through the response channel.
+        let _ = msg.response_tx.send(result);
+    }
+
+    /// Start processing the queue for a workspace.
+    ///
+    /// If the workspace is already busy, this is a no-op (messages will be
+    /// picked up by the existing processing loop). If idle, spawns a tokio
+    /// task that drains the queue until empty, then marks the workspace idle.
+    pub async fn start_processing(
+        self: &Arc<Self>,
+        workspace_id: Uuid,
+        conversation_id: Uuid,
+        scheduler: Arc<Scheduler>,
+        db: Arc<dyn Database>,
+    ) {
+        let queue = self.get_or_create_queue(workspace_id).await;
+
+        // Only start if not already busy.
+        {
+            let mut busy = queue.busy.lock().await;
+            if *busy {
+                return;
+            }
+            *busy = true;
+        }
+
+        let mgr = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                match mgr.dequeue(workspace_id).await {
+                    Some(msg) => {
+                        Self::process_message(
+                            &scheduler,
+                            &db,
+                            workspace_id,
+                            conversation_id,
+                            msg,
+                        )
+                        .await;
+                    }
+                    None => {
+                        // Queue is empty — mark idle and exit.
+                        mgr.mark_idle(workspace_id).await;
+                        break;
+                    }
+                }
+            }
+        });
     }
 }
 

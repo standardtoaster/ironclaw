@@ -422,16 +422,18 @@ impl ToolRegistry {
     ///
     /// These allow the LLM to delegate tasks to persistent workspaces that
     /// retain context across calls. The scheduler slot is filled later after
-    /// the agent is fully initialized.
+    /// the agent is fully initialized. The queue manager enforces
+    /// single-writer access to workspace conversations.
     pub fn register_workspace_tools(
         &self,
         router: Arc<crate::agent::workspace_router::WorkspaceRouter>,
         scheduler: crate::tools::builtin::SchedulerSlot,
         db: Arc<dyn Database>,
         embedder: Arc<dyn crate::workspace::EmbeddingProvider>,
+        queue: Arc<crate::agent::workspace_queue::WorkspaceQueueManager>,
     ) {
         self.register_sync(Arc::new(DelegateToWorkspaceTool::new(
-            router, scheduler, db.clone(),
+            router, scheduler, db.clone(), queue,
         )));
         self.register_sync(Arc::new(ListWorkspacesTool::new(db.clone())));
         self.register_sync(Arc::new(SetWorkspaceTopicTool::new(db, embedder)));

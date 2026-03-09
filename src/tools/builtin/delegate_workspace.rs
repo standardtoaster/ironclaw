@@ -9,8 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
+use crate::agent::workspace_queue::{MessagePriority, WorkspaceMessage, WorkspaceQueueManager};
 use crate::agent::workspace_router::WorkspaceRouter;
 use crate::context::JobContext;
 use crate::db::Database;
@@ -20,12 +22,13 @@ use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
 /// Tool for delegating work to a persistent workspace.
 ///
 /// Routes the prompt to an existing workspace by embedding similarity (or
-/// explicit ID), dispatches a job to the workspace's conversation, and
-/// blocks until the job completes (up to 5 minutes).
+/// explicit ID), enqueues the work through the `WorkspaceQueueManager` to
+/// enforce single-writer access, and blocks until the job completes.
 pub struct DelegateToWorkspaceTool {
     router: Arc<WorkspaceRouter>,
     scheduler: SchedulerSlot,
     db: Arc<dyn Database>,
+    queue: Arc<WorkspaceQueueManager>,
 }
 
 impl DelegateToWorkspaceTool {
@@ -33,11 +36,13 @@ impl DelegateToWorkspaceTool {
         router: Arc<WorkspaceRouter>,
         scheduler: SchedulerSlot,
         db: Arc<dyn Database>,
+        queue: Arc<WorkspaceQueueManager>,
     ) -> Self {
         Self {
             router,
             scheduler,
             db,
+            queue,
         }
     }
 }
@@ -181,42 +186,63 @@ impl Tool for DelegateToWorkspaceTool {
             })?
         };
 
-        // 3. Dispatch a job to the workspace's conversation
+        // 3. Determine priority: depth > 0 means workspace-to-workspace delegation
+        let priority = if delegation_depth > 0 {
+            MessagePriority::Delegated
+        } else {
+            MessagePriority::User
+        };
+
+        // 4. Enqueue the message through the queue manager
         let title = workspace_hint
             .map(|h| format!("Workspace: {h}"))
             .unwrap_or_else(|| "Workspace task".to_string());
 
-        let metadata = serde_json::json!({
+        let job_metadata = serde_json::json!({
             "workspace_id": workspace.id.to_string(),
             "delegation_depth": delegation_depth + 1,
         });
 
-        let job_id = scheduler
-            .dispatch_job_to_conversation(
-                user_id,
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let msg = WorkspaceMessage {
+            prompt: prompt.to_string(),
+            priority,
+            response_tx,
+            ttl: Some(Duration::from_secs(600)),
+            enqueued_at: std::time::Instant::now(),
+            metadata: Some(serde_json::json!({
+                "user_id": user_id,
+                "title": title,
+                "job_metadata": job_metadata,
+            })),
+        };
+
+        self.queue
+            .enqueue(workspace.id, msg)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("queue error: {e}")))?;
+
+        // 5. Kick off processing if the workspace is idle
+        self.queue
+            .start_processing(
+                workspace.id,
                 workspace.conversation_id,
-                &title,
-                prompt,
-                Some(metadata),
+                scheduler,
+                Arc::clone(&self.db),
             )
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("failed to dispatch job: {e}")))?;
+            .await;
 
-        // 4. Wait for completion (up to 5 minutes)
-        let result = scheduler
-            .await_job(job_id, Duration::from_secs(300))
+        // 6. Wait for the result via the response channel
+        let result = tokio::time::timeout(Duration::from_secs(600), response_rx)
             .await
+            .map_err(|_| ToolError::ExecutionFailed("workspace job timed out".to_string()))?
+            .map_err(|_| {
+                ToolError::ExecutionFailed("workspace job was cancelled".to_string())
+            })?
             .map_err(|e| {
-                ToolError::ExecutionFailed(format!("workspace job failed or timed out: {e}"))
+                ToolError::ExecutionFailed(format!("workspace job failed: {e}"))
             })?;
-
-        // 5. Touch the workspace to update last_accessed
-        if let Err(e) = self.db.touch_agent_workspace(workspace.id).await {
-            tracing::warn!(
-                workspace_id = %workspace.id,
-                "failed to touch workspace: {e}"
-            );
-        }
 
         Ok(ToolOutput::text(result, start.elapsed()))
     }
