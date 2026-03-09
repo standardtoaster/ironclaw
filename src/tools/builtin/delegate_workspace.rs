@@ -159,14 +159,39 @@ impl Tool for DelegateToWorkspaceTool {
                             ))
                         })?;
 
-                    self.db
+                    let mut ws = self.db
                         .create_agent_workspace(user_id, conversation_id)
                         .await
                         .map_err(|e| {
                             ToolError::ExecutionFailed(format!(
                                 "failed to create workspace: {e}"
                             ))
-                        })?
+                        })?;
+
+                    // Auto-set topic from prompt + hint so the workspace is routable
+                    let topic_text = if let Some(hint) = workspace_hint {
+                        format!("{hint}: {prompt}")
+                    } else {
+                        prompt.to_string()
+                    };
+                    let topic_for_embed = &topic_text[..topic_text.len().min(500)];
+                    if let Ok(embedding) = self.router.embed(topic_for_embed).await {
+                        if let Err(e) = self
+                            .db
+                            .update_agent_workspace_topic(ws.id, topic_for_embed, &embedding)
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to auto-set workspace topic: {}",
+                                e
+                            );
+                        } else {
+                            // Update in-memory struct so job metadata reflects the topic
+                            ws.topic = topic_for_embed.to_string();
+                        }
+                    }
+
+                    ws
                 }
                 Err(e) => {
                     return Err(ToolError::ExecutionFailed(format!(

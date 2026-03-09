@@ -50,6 +50,11 @@ impl WorkspaceRouter {
         Ok(workspace)
     }
 
+    /// Embed text using the router's embedding provider.
+    pub async fn embed(&self, text: &str) -> Result<Vec<f32>, RouterError> {
+        Ok(self.embedder.embed(text).await?)
+    }
+
     /// Route with an optional hint prepended to the prompt for embedding.
     ///
     /// The hint biases the embedding toward a topic (e.g. a workspace name)
