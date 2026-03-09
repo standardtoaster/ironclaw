@@ -196,26 +196,26 @@ impl Scheduler {
         job_id: Uuid,
         timeout: Duration,
     ) -> Result<String, JobError> {
-        // Check if the job is already finished (handle already cleaned up)
+        // Register a waiter unconditionally, then check if the job is already
+        // gone. This closes the race where the cleanup task fires between
+        // checking `jobs` and registering the waiter -- if that happens the
+        // waiter would never be notified and we'd hang until timeout.
+        let (tx, rx) = oneshot::channel();
+        self.completion_waiters
+            .write()
+            .await
+            .entry(job_id)
+            .or_default()
+            .push(tx);
+
+        // Re-check: if the job is no longer in `jobs`, the cleanup task
+        // already fired (and already notified all waiters that were registered
+        // at that point). Our waiter might or might not have been notified
+        // depending on timing, so just skip straight to reading the result.
         let already_done = !self.jobs.read().await.contains_key(&job_id);
 
-        let rx = if already_done {
-            // Job already finished before we registered -- skip waiting
-            None
-        } else {
-            // Register a waiter
-            let (tx, rx) = oneshot::channel();
-            self.completion_waiters
-                .write()
-                .await
-                .entry(job_id)
-                .or_default()
-                .push(tx);
-            Some(rx)
-        };
-
-        // Wait for completion (with timeout)
-        if let Some(rx) = rx {
+        if !already_done {
+            // Wait for completion (with timeout)
             tokio::time::timeout(timeout, rx)
                 .await
                 .map_err(|_| JobError::Stuck {
@@ -232,7 +232,7 @@ impl Scheduler {
         let job_ctx = self.context_manager.get_context(job_id).await?;
 
         match job_ctx.state {
-            JobState::Completed | JobState::Submitted | JobState::Accepted => {}
+            JobState::Completed => {}
             JobState::Failed => {
                 let reason = job_ctx
                     .transitions

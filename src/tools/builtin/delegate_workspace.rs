@@ -98,19 +98,42 @@ impl Tool for DelegateToWorkspaceTool {
 
         let user_id = &ctx.user_id;
 
+        // 0. Check delegation depth limit (max 3 levels)
+        const MAX_DELEGATION_DEPTH: u64 = 3;
+        let delegation_depth = ctx
+            .metadata
+            .get("delegation_depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if delegation_depth >= MAX_DELEGATION_DEPTH {
+            return Err(ToolError::ExecutionFailed(format!(
+                "delegation depth limit exceeded (max {MAX_DELEGATION_DEPTH})"
+            )));
+        }
+
         // 1. Resolve the target workspace
         let workspace = if let Some(id_str) = workspace_id_str {
             // Explicit workspace ID provided — look it up directly
             let ws_id = Uuid::parse_str(id_str).map_err(|e| {
                 ToolError::InvalidParameters(format!("invalid workspace_id: {e}"))
             })?;
-            self.db
+            let ws = self
+                .db
                 .get_agent_workspace(ws_id)
                 .await
                 .map_err(|e| ToolError::ExecutionFailed(format!("failed to get workspace: {e}")))?
                 .ok_or_else(|| {
                     ToolError::ExecutionFailed(format!("workspace {ws_id} not found"))
-                })?
+                })?;
+
+            // Verify the workspace belongs to the calling user
+            if ws.user_id != *user_id {
+                return Err(ToolError::ExecutionFailed(
+                    "workspace belongs to a different user".to_string(),
+                ));
+            }
+
+            ws
         } else {
             // Route by embedding similarity
             match self
@@ -165,6 +188,7 @@ impl Tool for DelegateToWorkspaceTool {
 
         let metadata = serde_json::json!({
             "workspace_id": workspace.id.to_string(),
+            "delegation_depth": delegation_depth + 1,
         });
 
         let job_id = scheduler

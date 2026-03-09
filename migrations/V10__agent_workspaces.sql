@@ -7,6 +7,7 @@ CREATE TABLE agent_workspaces (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id TEXT NOT NULL,
     topic TEXT NOT NULL DEFAULT '',
+    -- Dimension-free VECTOR: supports any embedding model (see V9__flexible_embedding_dimension.sql)
     topic_embedding VECTOR,
     conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     status TEXT NOT NULL DEFAULT 'active',
@@ -18,6 +19,9 @@ CREATE TABLE agent_workspaces (
 
 CREATE INDEX idx_agent_workspaces_user_id ON agent_workspaces(user_id);
 CREATE INDEX idx_agent_workspaces_user_status ON agent_workspaces(user_id, status);
+
+-- Prevent multiple workspaces pointing to the same conversation for a user
+CREATE UNIQUE INDEX idx_agent_workspaces_user_conversation ON agent_workspaces(user_id, conversation_id);
 
 CREATE TRIGGER update_agent_workspaces_updated_at
     BEFORE UPDATE ON agent_workspaces
