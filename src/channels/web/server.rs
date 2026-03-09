@@ -1388,6 +1388,9 @@ async fn chat_send_handler(
         msg = msg.with_thread(thread_id);
         meta["thread_id"] = serde_json::json!(thread_id);
     }
+    if req.suppress_response {
+        meta["suppress_response"] = serde_json::json!(true);
+    }
     msg = msg.with_metadata(meta);
 
     // Convert uploaded images to IncomingAttachments
