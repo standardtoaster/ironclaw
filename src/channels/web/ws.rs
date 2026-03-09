@@ -156,10 +156,18 @@ async fn handle_client_message(
     direct_tx: &mpsc::Sender<WsServerMessage>,
 ) {
     match msg {
-        WsClientMessage::Message { content, thread_id } => {
+        WsClientMessage::Message {
+            content,
+            thread_id,
+            suppress_response,
+        } => {
             let mut incoming = IncomingMessage::new("gateway", user_id, &content);
             if let Some(ref tid) = thread_id {
                 incoming = incoming.with_thread(tid);
+            }
+            if suppress_response {
+                incoming =
+                    incoming.with_metadata(serde_json::json!({"suppress_response": true}));
             }
 
             let tx_guard = state.msg_tx.read().await;
@@ -349,6 +357,7 @@ mod tests {
             WsClientMessage::Message {
                 content: "hello agent".to_string(),
                 thread_id: Some("t1".to_string()),
+                suppress_response: false,
             },
             &state,
             "user1",
@@ -373,6 +382,7 @@ mod tests {
             WsClientMessage::Message {
                 content: "hello".to_string(),
                 thread_id: None,
+                suppress_response: false,
             },
             &state,
             "user1",

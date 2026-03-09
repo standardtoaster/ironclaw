@@ -9,6 +9,11 @@ use uuid::Uuid;
 pub struct SendMessageRequest {
     pub content: String,
     pub thread_id: Option<String>,
+    /// When true, the agent processes the message (including tool calls) but
+    /// suppresses the final text response.  Useful for passive ingestion where
+    /// the caller wants extraction/side-effects without a reply.
+    #[serde(default)]
+    pub suppress_response: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -592,6 +597,9 @@ pub enum WsClientMessage {
     Message {
         content: String,
         thread_id: Option<String>,
+        /// When true, suppress the final text response (passive ingestion).
+        #[serde(default)]
+        suppress_response: bool,
     },
     /// Approve or deny a pending tool execution.
     #[serde(rename = "approval")]
@@ -777,7 +785,9 @@ mod tests {
         let json = r#"{"type":"message","content":"hello","thread_id":"t1"}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            WsClientMessage::Message { content, thread_id } => {
+            WsClientMessage::Message {
+                content, thread_id, ..
+            } => {
                 assert_eq!(content, "hello");
                 assert_eq!(thread_id.as_deref(), Some("t1"));
             }
@@ -790,10 +800,50 @@ mod tests {
         let json = r#"{"type":"message","content":"hi"}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            WsClientMessage::Message { content, thread_id } => {
+            WsClientMessage::Message {
+                content, thread_id, ..
+            } => {
                 assert_eq!(content, "hi");
                 assert!(thread_id.is_none());
             }
+            _ => panic!("Expected Message variant"),
+        }
+    }
+
+    #[test]
+    fn test_send_message_suppress_response_default() {
+        let json = r#"{"content":"hello"}"#;
+        let req: SendMessageRequest = serde_json::from_str(json).unwrap();
+        assert!(!req.suppress_response);
+    }
+
+    #[test]
+    fn test_send_message_suppress_response_true() {
+        let json = r#"{"content":"hello","suppress_response":true}"#;
+        let req: SendMessageRequest = serde_json::from_str(json).unwrap();
+        assert!(req.suppress_response);
+    }
+
+    #[test]
+    fn test_ws_client_message_suppress_response() {
+        let json = r#"{"type":"message","content":"hello","suppress_response":true}"#;
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WsClientMessage::Message {
+                suppress_response, ..
+            } => assert!(suppress_response),
+            _ => panic!("Expected Message variant"),
+        }
+    }
+
+    #[test]
+    fn test_ws_client_message_suppress_response_default() {
+        let json = r#"{"type":"message","content":"hello"}"#;
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WsClientMessage::Message {
+                suppress_response, ..
+            } => assert!(!suppress_response),
             _ => panic!("Expected Message variant"),
         }
     }
