@@ -9,7 +9,7 @@ use libsql::params;
 use uuid::Uuid;
 
 use super::{LibSqlBackend, fmt_ts, get_i64, get_text, get_ts};
-use crate::db::{AgentWorkspace, AgentWorkspaceStore};
+use crate::db::{AgentWorkspace, AgentWorkspaceStore, WorkspaceMessageResult};
 use crate::error::DatabaseError;
 
 /// Column list for agent_workspaces (matches positional access in `row_to_agent_workspace`).
@@ -250,5 +250,67 @@ impl AgentWorkspaceStore for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(n)
+    }
+
+    async fn search_workspace_messages(
+        &self,
+        user_id: &str,
+        query: &str,
+        workspace_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<WorkspaceMessageResult>, DatabaseError> {
+        let conn = self.connect().await?;
+        let search_pattern = format!("%{query}%");
+
+        let mut rows = if let Some(ws_id) = workspace_id {
+            conn.query(
+                r#"
+                SELECT m.content, m.role, m.created_at, w.topic, w.id as workspace_id
+                FROM conversation_messages m
+                JOIN agent_workspaces w ON w.conversation_id = m.conversation_id
+                WHERE w.user_id = ?1
+                  AND w.id = ?4
+                  AND m.role IN ('user', 'assistant')
+                  AND m.content LIKE ?2
+                ORDER BY m.created_at DESC
+                LIMIT ?3
+                "#,
+                params![user_id, search_pattern, limit, ws_id.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        } else {
+            conn.query(
+                r#"
+                SELECT m.content, m.role, m.created_at, w.topic, w.id as workspace_id
+                FROM conversation_messages m
+                JOIN agent_workspaces w ON w.conversation_id = m.conversation_id
+                WHERE w.user_id = ?1
+                  AND m.role IN ('user', 'assistant')
+                  AND m.content LIKE ?2
+                ORDER BY m.created_at DESC
+                LIMIT ?3
+                "#,
+                params![user_id, search_pattern, limit],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        };
+
+        let mut results = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            results.push(WorkspaceMessageResult {
+                content: get_text(&row, 0),
+                role: get_text(&row, 1),
+                created_at: get_ts(&row, 2),
+                topic: get_text(&row, 3),
+                workspace_id: get_text(&row, 4).parse().unwrap_or_default(),
+            });
+        }
+        Ok(results)
     }
 }

@@ -19,7 +19,7 @@ use crate::tools::builtin::{
     ApplyPatchTool, CancelJobTool, CreateJobTool, DelegateToWorkspaceTool, EchoTool, HttpTool,
     JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool, ListWorkspacesTool,
     MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool,
-    SetWorkspaceTopicTool, ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool,
+    SearchWorkspaceHistoryTool, SetWorkspaceTopicTool, ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool,
     SkillSearchTool, TimeTool, ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool,
     ToolRemoveTool, ToolSearchTool, WebFetchTool, WriteFileTool,
 };
@@ -436,7 +436,8 @@ impl ToolRegistry {
             router, scheduler, db.clone(), queue,
         )));
         self.register_sync(Arc::new(ListWorkspacesTool::new(db.clone())));
-        self.register_sync(Arc::new(SetWorkspaceTopicTool::new(db, embedder)));
+        self.register_sync(Arc::new(SetWorkspaceTopicTool::new(db.clone(), embedder)));
+        self.register_sync(Arc::new(SearchWorkspaceHistoryTool::new(db)));
         tracing::info!("Registered workspace tools");
     }
 

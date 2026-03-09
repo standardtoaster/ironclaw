@@ -3,6 +3,7 @@
 pub mod collections;
 mod delegate_workspace;
 mod list_workspaces;
+mod search_workspace_history;
 mod set_workspace_topic;
 mod echo;
 pub mod extension_tools;
@@ -25,6 +26,7 @@ pub use collections::{
 };
 pub use delegate_workspace::DelegateToWorkspaceTool;
 pub use list_workspaces::ListWorkspacesTool;
+pub use search_workspace_history::SearchWorkspaceHistoryTool;
 pub use set_workspace_topic::SetWorkspaceTopicTool;
 pub use echo::EchoTool;
 pub use extension_tools::{

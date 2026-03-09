@@ -245,6 +245,16 @@ mod tests {
                 .collect())
         }
 
+        async fn search_workspace_messages(
+            &self,
+            _user_id: &str,
+            _query: &str,
+            _workspace_id: Option<Uuid>,
+            _limit: i64,
+        ) -> Result<Vec<crate::db::WorkspaceMessageResult>, DatabaseError> {
+            Ok(Vec::new())
+        }
+
         async fn touch_agent_workspace(&self, _id: Uuid) -> Result<(), DatabaseError> {
             Ok(())
         }

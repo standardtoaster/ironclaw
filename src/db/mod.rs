@@ -553,6 +553,23 @@ pub trait AgentWorkspaceStore: Send + Sync {
         user_id: &str,
         stale_days: i64,
     ) -> Result<u64, DatabaseError>;
+    async fn search_workspace_messages(
+        &self,
+        user_id: &str,
+        query: &str,
+        workspace_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<WorkspaceMessageResult>, DatabaseError>;
+}
+
+/// Result from searching across workspace conversation messages.
+#[derive(Debug, Clone)]
+pub struct WorkspaceMessageResult {
+    pub content: String,
+    pub role: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub topic: String,
+    pub workspace_id: Uuid,
 }
 
 /// Backend-agnostic database supertrait.

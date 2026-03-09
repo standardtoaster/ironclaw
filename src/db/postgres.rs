@@ -18,7 +18,7 @@ use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
     AgentWorkspace, AgentWorkspaceStore, ConversationStore, Database, JobStore, RoutineStore,
-    SandboxStore, SettingsStore, ToolFailureStore, WorkspaceStore, structured,
+    SandboxStore, SettingsStore, ToolFailureStore, WorkspaceMessageResult, WorkspaceStore, structured,
     structured::{Aggregation, CollectionSchema, Filter, Record, StructuredStore},
 };
 use crate::error::{DatabaseError, WorkspaceError};
@@ -1513,6 +1513,61 @@ impl AgentWorkspaceStore for PgBackend {
             )
             .await?;
         Ok(n)
+    }
+
+    async fn search_workspace_messages(
+        &self,
+        user_id: &str,
+        query: &str,
+        workspace_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<WorkspaceMessageResult>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let search_pattern = format!("%{query}%");
+
+        let rows = if let Some(ws_id) = workspace_id {
+            conn.query(
+                r#"
+                SELECT m.content, m.role, m.created_at, w.topic, w.id as workspace_id
+                FROM conversation_messages m
+                JOIN agent_workspaces w ON w.conversation_id = m.conversation_id
+                WHERE w.user_id = $1
+                  AND w.id = $4
+                  AND m.role IN ('user', 'assistant')
+                  AND m.content ILIKE $2
+                ORDER BY m.created_at DESC
+                LIMIT $3
+                "#,
+                &[&user_id, &search_pattern, &limit, &ws_id],
+            )
+            .await?
+        } else {
+            conn.query(
+                r#"
+                SELECT m.content, m.role, m.created_at, w.topic, w.id as workspace_id
+                FROM conversation_messages m
+                JOIN agent_workspaces w ON w.conversation_id = m.conversation_id
+                WHERE w.user_id = $1
+                  AND m.role IN ('user', 'assistant')
+                  AND m.content ILIKE $2
+                ORDER BY m.created_at DESC
+                LIMIT $3
+                "#,
+                &[&user_id, &search_pattern, &limit],
+            )
+            .await?
+        };
+
+        Ok(rows
+            .iter()
+            .map(|row| WorkspaceMessageResult {
+                content: row.get("content"),
+                role: row.get("role"),
+                created_at: row.get("created_at"),
+                topic: row.get("topic"),
+                workspace_id: row.get("workspace_id"),
+            })
+            .collect())
     }
 }
 
