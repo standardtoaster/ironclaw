@@ -260,10 +260,11 @@ impl Tool for DelegateToWorkspaceTool {
             )
             .await;
 
-        // 6. Wait for the result via the response channel
-        let result = tokio::time::timeout(Duration::from_secs(600), response_rx)
+        // 6. Wait for the result via the response channel.
+        // The tool-level execution_timeout (600s) provides the outer timeout;
+        // no need for a redundant inner timeout here.
+        let result = response_rx
             .await
-            .map_err(|_| ToolError::ExecutionFailed("workspace job timed out".to_string()))?
             .map_err(|_| {
                 ToolError::ExecutionFailed("workspace job was cancelled".to_string())
             })?
