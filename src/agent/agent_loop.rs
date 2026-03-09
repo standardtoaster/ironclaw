@@ -88,6 +88,9 @@ pub struct Agent {
     pub(super) heartbeat_config: Option<HeartbeatConfig>,
     pub(super) hygiene_config: Option<crate::config::HygieneConfig>,
     pub(super) routine_config: Option<RoutineConfig>,
+    /// Gateway state for injecting routine engine (late init).
+    pub(super) gateway_state:
+        Option<Arc<crate::channels::web::server::GatewayState>>,
 }
 
 impl Agent {
@@ -133,7 +136,17 @@ impl Agent {
             heartbeat_config,
             hygiene_config,
             routine_config,
+            gateway_state: None,
         }
+    }
+
+    /// Inject the gateway state for late-init fields (e.g., routine engine).
+    pub fn with_gateway_state(
+        mut self,
+        state: Arc<crate::channels::web::server::GatewayState>,
+    ) -> Self {
+        self.gateway_state = Some(state);
+        self
     }
 
     // Convenience accessors
@@ -470,6 +483,12 @@ impl Agent {
                     let engine_ref = Arc::clone(&engine);
                     // SAFETY: self is consumed by run(), we can smuggle the engine in
                     // via a local to use in the message loop below.
+
+                    // Inject engine into gateway state for webhook endpoint
+                    if let Some(ref gw_state) = self.gateway_state {
+                        *gw_state.routine_engine.write().await = Some(Arc::clone(&engine));
+                        tracing::debug!("Injected routine engine into gateway state");
+                    }
 
                     tracing::info!(
                         "Routines enabled: cron ticker every {}s, max {} concurrent",

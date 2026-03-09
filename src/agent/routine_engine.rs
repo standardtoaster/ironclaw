@@ -179,6 +179,95 @@ impl RoutineEngine {
         }
     }
 
+    /// Fire a webhook-triggered routine.
+    ///
+    /// Validates that the routine exists, is enabled, has a `Trigger::Webhook`,
+    /// and passes guardrail checks before executing.
+    pub async fn fire_webhook(
+        &self,
+        routine_id: Uuid,
+        user_id: &str,
+        body: Option<String>,
+    ) -> Result<Uuid, RoutineError> {
+        let routine = self
+            .store
+            .get_routine(routine_id)
+            .await
+            .map_err(|e| RoutineError::Database {
+                reason: e.to_string(),
+            })?
+            .ok_or(RoutineError::NotFound { id: routine_id })?;
+
+        if !routine.enabled {
+            return Err(RoutineError::Disabled {
+                name: routine.name.clone(),
+            });
+        }
+
+        // Verify this is a webhook trigger
+        if !matches!(routine.trigger, Trigger::Webhook { .. }) {
+            return Err(RoutineError::TriggerMismatch {
+                routine: routine.name.clone(),
+                expected: "webhook".to_string(),
+                actual: routine.trigger.type_tag().to_string(),
+            });
+        }
+
+        // Verify user ownership
+        if routine.user_id != user_id {
+            return Err(RoutineError::NotFound { id: routine_id });
+        }
+
+        if !self.check_concurrent(&routine).await {
+            return Err(RoutineError::MaxConcurrent {
+                name: routine.name.clone(),
+            });
+        }
+
+        if !self.check_cooldown(&routine) {
+            return Err(RoutineError::CooldownActive {
+                name: routine.name.clone(),
+            });
+        }
+
+        let detail = body.map(|b| truncate(&b, 500));
+        let run_id = Uuid::new_v4();
+        let run = RoutineRun {
+            id: run_id,
+            routine_id: routine.id,
+            trigger_type: "webhook".to_string(),
+            trigger_detail: detail,
+            started_at: Utc::now(),
+            completed_at: None,
+            status: RunStatus::Running,
+            result_summary: None,
+            tokens_used: None,
+            job_id: None,
+            created_at: Utc::now(),
+        };
+
+        if let Err(e) = self.store.create_routine_run(&run).await {
+            return Err(RoutineError::Database {
+                reason: format!("failed to create run record: {e}"),
+            });
+        }
+
+        let engine = EngineContext {
+            store: self.store.clone(),
+            llm: self.llm.clone(),
+            workspace: self.workspace.clone(),
+            notify_tx: self.notify_tx.clone(),
+            running_count: self.running_count.clone(),
+            scheduler: self.scheduler.clone(),
+        };
+
+        tokio::spawn(async move {
+            execute_routine(engine, routine, run).await;
+        });
+
+        Ok(run_id)
+    }
+
     /// Fire a routine manually (from tool call or CLI).
     pub async fn fire_manual(&self, routine_id: Uuid) -> Result<Uuid, RoutineError> {
         let routine = self

@@ -494,6 +494,7 @@ mod tests {
             cost_guard: None,
             startup_time: std::time::Instant::now(),
             restart_requested: std::sync::atomic::AtomicBool::new(false),
+            routine_engine: tokio::sync::RwLock::new(None),
         }
     }
 }

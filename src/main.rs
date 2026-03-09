@@ -669,7 +669,7 @@ async fn async_main() -> anyhow::Result<()> {
         cost_guard: components.cost_guard,
     };
 
-    let agent = Agent::new(
+    let mut agent = Agent::new(
         config.agent.clone(),
         deps,
         channels,
@@ -679,6 +679,9 @@ async fn async_main() -> anyhow::Result<()> {
         Some(components.context_manager),
         Some(session_manager),
     );
+    if let Some(ref gw_state) = gateway_state {
+        agent = agent.with_gateway_state(Arc::clone(gw_state));
+    }
 
     // Fill the scheduler slot now that Agent (and its Scheduler) exist.
     *scheduler_slot.write().await = Some(agent.scheduler());

@@ -95,6 +95,7 @@ impl GatewayChannel {
             cost_guard: None,
             startup_time: std::time::Instant::now(),
             restart_requested: std::sync::atomic::AtomicBool::new(false),
+            routine_engine: tokio::sync::RwLock::new(None),
         });
 
         Self {
@@ -129,6 +130,7 @@ impl GatewayChannel {
             cost_guard: self.state.cost_guard.clone(),
             startup_time: self.state.startup_time,
             restart_requested: std::sync::atomic::AtomicBool::new(false),
+            routine_engine: tokio::sync::RwLock::new(None),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
