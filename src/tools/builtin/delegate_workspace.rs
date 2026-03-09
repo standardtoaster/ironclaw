@@ -200,6 +200,8 @@ impl Tool for DelegateToWorkspaceTool {
 
         let job_metadata = serde_json::json!({
             "workspace_id": workspace.id.to_string(),
+            "workspace_topic": workspace.topic,
+            "workspace_turn_count": workspace.turn_count,
             "delegation_depth": delegation_depth + 1,
         });
 

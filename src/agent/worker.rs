@@ -135,18 +135,9 @@ impl Worker {
         // Build initial reasoning context (tool definitions refreshed each iteration in execution_loop)
         let mut reason_ctx = ReasoningContext::new().with_job(&job_ctx.description);
 
-        // Add system message
-        reason_ctx.messages.push(ChatMessage::system(format!(
-            r#"You are an autonomous agent working on a job.
-
-Job: {}
-Description: {}
-
-You have access to tools to complete this job. Plan your approach and execute tools as needed.
-You may request multiple tools at once if they can be executed in parallel.
-Report when the job is complete or if you encounter issues you cannot resolve."#,
-            job_ctx.title, job_ctx.description
-        )));
+        // Build system prompt — workspace jobs get identity docs + context
+        let system_prompt = self.build_system_prompt(&job_ctx).await;
+        reason_ctx.messages.push(ChatMessage::system(system_prompt));
 
         // Load conversation history if this job is attached to an existing conversation
         if let (Some(store), Some(conv_id)) = (self.store(), job_ctx.conversation_id) {
@@ -969,6 +960,82 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         }
 
         Ok(())
+    }
+
+    /// Build the system prompt for a job.
+    ///
+    /// Workspace jobs (those with `workspace_id` in metadata) get a richer
+    /// prompt that includes identity docs (SOUL.md, USER.md, etc.) and
+    /// workspace context (topic, turn count). Non-workspace jobs get the
+    /// default autonomous agent prompt.
+    async fn build_system_prompt(&self, job_ctx: &crate::context::JobContext) -> String {
+        let is_workspace = job_ctx.metadata.get("workspace_id").is_some();
+        if !is_workspace {
+            return format!(
+                r#"You are an autonomous agent working on a job.
+
+Job: {}
+Description: {}
+
+You have access to tools to complete this job. Plan your approach and execute tools as needed.
+You may request multiple tools at once if they can be executed in parallel.
+Report when the job is complete or if you encounter issues you cannot resolve."#,
+                job_ctx.title, job_ctx.description
+            );
+        }
+
+        // Workspace job — load identity docs from the user's workspace
+        let mut parts = Vec::new();
+
+        if let Some(store) = self.store() {
+            let ws = crate::workspace::Workspace::new_with_db(
+                &job_ctx.user_id,
+                store.clone(),
+            );
+            match ws.system_prompt().await {
+                Ok(prompt) if !prompt.is_empty() => {
+                    parts.push(prompt);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        "Could not load workspace identity for job {}: {}",
+                        self.job_id, e
+                    );
+                }
+            }
+        }
+
+        // Add workspace context
+        let workspace_topic = job_ctx
+            .metadata
+            .get("workspace_topic")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(not set)");
+        let turn_count = job_ctx
+            .metadata
+            .get("workspace_turn_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        parts.push(format!(
+            r#"---
+
+## Workspace Context
+You are in a persistent workspace focused on: {workspace_topic}
+This conversation has {turn_count} prior turns. The full conversation history
+is loaded — you can reference anything discussed previously.
+
+## Current Task
+Job: {}
+Description: {}
+
+You have access to tools to complete this task. Plan your approach and execute tools as needed.
+When you finish, provide a clear summary of what was done and any decisions made."#,
+            job_ctx.title, job_ctx.description
+        ));
+
+        parts.join("\n\n")
     }
 
     async fn execute_tool(
