@@ -138,23 +138,20 @@ impl WorkspaceQueueManager {
 
     /// Dequeue the highest-priority non-expired message from a workspace.
     ///
-    /// Expired messages (past TTL) are silently dropped.
+    /// Expired messages (past TTL) are silently dropped from any position.
     pub async fn dequeue(&self, workspace_id: Uuid) -> Option<WorkspaceMessage> {
         let queue = self.get_or_create_queue(workspace_id).await;
         let mut messages = queue.messages.lock().await;
         let now = Instant::now();
 
-        // Drain expired messages from the front, then return the first valid one.
-        while let Some(msg) = messages.front() {
+        // Drop all expired messages from any position in the queue.
+        messages.retain(|msg| {
             if let Some(ttl) = msg.ttl {
-                if msg.enqueued_at + ttl < now {
-                    // Expired — drop it (sender gets a dropped channel error).
-                    messages.pop_front();
-                    continue;
-                }
+                msg.enqueued_at + ttl >= now
+            } else {
+                true
             }
-            break;
-        }
+        });
 
         messages.pop_front()
     }
@@ -459,5 +456,193 @@ mod tests {
         assert_eq!(mgr.dequeue(ws2).await.unwrap().prompt, "ws2-msg");
         assert!(mgr.dequeue(ws1).await.is_none());
         assert!(mgr.dequeue(ws2).await.is_none());
+    }
+
+    /// Helper to create a message with a backdated enqueued_at for TTL testing.
+    fn make_expired_message(
+        prompt: &str,
+        priority: MessagePriority,
+        ttl: Duration,
+        age: Duration,
+    ) -> (WorkspaceMessage, oneshot::Receiver<Result<String, String>>) {
+        let (tx, rx) = oneshot::channel();
+        let msg = WorkspaceMessage {
+            prompt: prompt.to_string(),
+            priority,
+            response_tx: tx,
+            ttl: Some(ttl),
+            enqueued_at: Instant::now() - age,
+            metadata: None,
+        };
+        (msg, rx)
+    }
+
+    #[tokio::test]
+    async fn test_ttl_expiry_non_front_position() {
+        let mgr = WorkspaceQueueManager::new(10);
+        let ws = Uuid::new_v4();
+
+        // User message (no TTL, valid) — will be at front due to higher priority.
+        let (user_msg, _r1) = make_message("user", MessagePriority::User, None);
+        // Routine message with expired TTL — will be behind the User message.
+        let (expired_routine, _r2) = make_expired_message(
+            "expired-routine",
+            MessagePriority::Routine,
+            Duration::from_millis(0),
+            Duration::from_secs(1),
+        );
+
+        mgr.enqueue(ws, user_msg).await.unwrap();
+        mgr.enqueue(ws, expired_routine).await.unwrap();
+
+        // First dequeue gets the User message.
+        let m1 = mgr.dequeue(ws).await.unwrap();
+        assert_eq!(m1.prompt, "user");
+
+        // Second dequeue should return None — the expired Routine must be skipped.
+        assert!(mgr.dequeue(ws).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_response_channel_on_ttl_expiry() {
+        let mgr = WorkspaceQueueManager::new(10);
+        let ws = Uuid::new_v4();
+
+        // Create an expired message and hold onto its response receiver.
+        let (expired, rx) = make_expired_message(
+            "expired",
+            MessagePriority::User,
+            Duration::from_millis(0),
+            Duration::from_secs(1),
+        );
+        mgr.enqueue(ws, expired).await.unwrap();
+
+        // Dequeue skips it (returns None), dropping the response_tx.
+        assert!(mgr.dequeue(ws).await.is_none());
+
+        // The receiver should get a RecvError because the sender was dropped.
+        assert!(rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delegated_rejected_when_full() {
+        let mgr = WorkspaceQueueManager::new(2);
+        let ws = Uuid::new_v4();
+
+        let (m1, _r1) = make_message("a", MessagePriority::Routine, None);
+        let (m2, _r2) = make_message("b", MessagePriority::Routine, None);
+        mgr.enqueue(ws, m1).await.unwrap();
+        mgr.enqueue(ws, m2).await.unwrap();
+
+        // Delegated message should be rejected (only User is exempt).
+        let (delegated, _r3) = make_message("delegated", MessagePriority::Delegated, None);
+        let err = mgr.enqueue(ws, delegated).await.unwrap_err();
+        assert!(matches!(err, QueueError::QueueFull(_)));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_enqueue_dequeue() {
+        let mgr = Arc::new(WorkspaceQueueManager::new(100));
+        let ws = Uuid::new_v4();
+        let num_messages = 50;
+
+        // Spawn producers.
+        let mut handles = Vec::new();
+        for i in 0..num_messages {
+            let mgr = Arc::clone(&mgr);
+            handles.push(tokio::spawn(async move {
+                let (msg, _rx) = make_message(
+                    &format!("msg-{i}"),
+                    MessagePriority::User,
+                    None,
+                );
+                mgr.enqueue(ws, msg).await.unwrap();
+            }));
+        }
+
+        // Wait for all enqueues to finish.
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Spawn consumers that drain the queue.
+        let mut consumer_handles = Vec::new();
+        for _ in 0..num_messages {
+            let mgr = Arc::clone(&mgr);
+            consumer_handles.push(tokio::spawn(async move {
+                mgr.dequeue(ws).await
+            }));
+        }
+
+        let mut dequeued = Vec::new();
+        for h in consumer_handles {
+            if let Some(msg) = h.await.unwrap() {
+                dequeued.push(msg.prompt);
+            }
+        }
+
+        // All messages should have been dequeued exactly once.
+        assert_eq!(dequeued.len(), num_messages);
+
+        // Queue should now be empty.
+        assert!(mgr.dequeue(ws).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_queue_empty_after_all_expired() {
+        let mgr = WorkspaceQueueManager::new(10);
+        let ws = Uuid::new_v4();
+
+        for i in 0..3 {
+            let (msg, _rx) = make_expired_message(
+                &format!("expired-{i}"),
+                MessagePriority::User,
+                Duration::from_millis(0),
+                Duration::from_secs(1),
+            );
+            mgr.enqueue(ws, msg).await.unwrap();
+        }
+
+        // All messages are expired — dequeue should return None.
+        assert!(mgr.dequeue(ws).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mixed_ttl_and_no_ttl() {
+        let mgr = WorkspaceQueueManager::new(10);
+        let ws = Uuid::new_v4();
+
+        // Expired User message (TTL=0, enqueued 1s ago).
+        let (expired, _r1) = make_expired_message(
+            "expired-user",
+            MessagePriority::User,
+            Duration::from_millis(0),
+            Duration::from_secs(1),
+        );
+        // No-TTL Delegated message (never expires).
+        let (no_ttl, _r2) = make_message("no-ttl-delegated", MessagePriority::Delegated, None);
+        // Valid TTL Routine message (TTL=1h, enqueued just now).
+        let (tx, _r3) = oneshot::channel();
+        let valid_ttl = WorkspaceMessage {
+            prompt: "valid-ttl-routine".to_string(),
+            priority: MessagePriority::Routine,
+            response_tx: tx,
+            ttl: Some(Duration::from_secs(3600)),
+            enqueued_at: Instant::now(),
+            metadata: None,
+        };
+
+        mgr.enqueue(ws, expired).await.unwrap();
+        mgr.enqueue(ws, no_ttl).await.unwrap();
+        mgr.enqueue(ws, valid_ttl).await.unwrap();
+
+        // Expired User is dropped. Remaining in priority order: Delegated, then Routine.
+        let m1 = mgr.dequeue(ws).await.unwrap();
+        assert_eq!(m1.prompt, "no-ttl-delegated");
+
+        let m2 = mgr.dequeue(ws).await.unwrap();
+        assert_eq!(m2.prompt, "valid-ttl-routine");
+
+        assert!(mgr.dequeue(ws).await.is_none());
     }
 }
