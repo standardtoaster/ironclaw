@@ -779,8 +779,15 @@ impl Agent {
             // Store successfully extracted document text in workspace for indexing
             self.store_extracted_documents(&message).await;
 
+            // Check if the caller requested response suppression (passive ingestion).
+            let suppress = message
+                .metadata
+                .get("suppress_response")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
             match self.handle_message(&message).await {
-                Ok(Some(response)) if !response.is_empty() => {
+                Ok(Some(response)) if !response.is_empty() && !suppress => {
                     // Hook: BeforeOutbound — allow hooks to modify or suppress outbound
                     let event = crate::hooks::HookEvent::Outbound {
                         user_id: message.user_id.clone(),
@@ -821,6 +828,13 @@ impl Agent {
                             }
                         }
                     }
+                }
+                Ok(Some(response)) if suppress && !response.is_empty() => {
+                    tracing::debug!(
+                        user = %message.user_id,
+                        response_len = response.len(),
+                        "suppress_response=true, skipping outbound response"
+                    );
                 }
                 Ok(Some(empty)) => {
                     // Empty response, nothing to send (e.g. approval handled via send_status)

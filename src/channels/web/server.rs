@@ -1200,9 +1200,16 @@ async fn chat_send_handler(
         msg = msg.with_timezone(tz);
     }
 
+    let mut meta = serde_json::Map::new();
     if let Some(ref thread_id) = req.thread_id {
         msg = msg.with_thread(thread_id);
-        msg = msg.with_metadata(serde_json::json!({"thread_id": thread_id}));
+        meta.insert("thread_id".into(), serde_json::json!(thread_id));
+    }
+    if req.suppress_response {
+        meta.insert("suppress_response".into(), serde_json::json!(true));
+    }
+    if !meta.is_empty() {
+        msg = msg.with_metadata(serde_json::Value::Object(meta));
     }
 
     // Convert uploaded images to IncomingAttachments

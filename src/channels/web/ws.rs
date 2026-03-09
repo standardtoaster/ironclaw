@@ -161,6 +161,7 @@ async fn handle_client_message(
             thread_id,
             timezone,
             images,
+            suppress_response,
         } => {
             let mut incoming = IncomingMessage::new("gateway", user_id, &content);
             if let Some(ref tz) = timezone {
@@ -168,6 +169,10 @@ async fn handle_client_message(
             }
             if let Some(ref tid) = thread_id {
                 incoming = incoming.with_thread(tid);
+            }
+            if suppress_response {
+                incoming =
+                    incoming.with_metadata(serde_json::json!({"suppress_response": true}));
             }
 
             // Convert uploaded images to IncomingAttachments
@@ -372,6 +377,7 @@ mod tests {
                 thread_id: Some("t1".to_string()),
                 timezone: None,
                 images: Vec::new(),
+                suppress_response: false,
             },
             &state,
             "user1",
@@ -398,6 +404,7 @@ mod tests {
                 thread_id: None,
                 timezone: None,
                 images: Vec::new(),
+                suppress_response: false,
             },
             &state,
             "user1",
