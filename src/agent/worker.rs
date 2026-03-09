@@ -148,6 +148,40 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             job_ctx.title, job_ctx.description
         )));
 
+        // Load conversation history if this job is attached to an existing conversation
+        if let (Some(store), Some(conv_id)) = (self.store(), job_ctx.conversation_id) {
+            match store.list_conversation_messages(conv_id).await {
+                Ok(messages) => {
+                    let mut loaded = 0usize;
+                    for msg in &messages {
+                        match msg.role.as_str() {
+                            "user" => {
+                                reason_ctx.messages.push(ChatMessage::user(&msg.content));
+                                loaded += 1;
+                            }
+                            "assistant" => {
+                                reason_ctx.messages.push(ChatMessage::assistant(&msg.content));
+                                loaded += 1;
+                            }
+                            _ => {} // skip tool_calls metadata rows
+                        }
+                    }
+                    if loaded > 0 {
+                        tracing::info!(
+                            "Loaded {} prior messages for job {} from conversation {}",
+                            loaded, self.job_id, conv_id
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load conversation history for job {}: {}",
+                        self.job_id, e
+                    );
+                }
+            }
+        }
+
         // Main execution loop with timeout
         let result = tokio::time::timeout(self.timeout(), async {
             self.execution_loop(&mut rx, &reasoning, &mut reason_ctx)
@@ -321,6 +355,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                         // "not done", or "unfinished". Only the LLM's own response
                         // (not tool output) can trigger this.
                         if crate::util::llm_signals_completion(&response) {
+                            self.persist_response_to_conversation(&response).await;
                             self.mark_completed().await?;
                             return Ok(());
                         }
@@ -920,6 +955,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         reason_ctx.messages.push(ChatMessage::assistant(&response));
 
         if crate::util::llm_signals_completion(&response) {
+            self.persist_response_to_conversation(&response).await;
             self.mark_completed().await?;
         } else {
             // Job not complete, could re-plan or fall back to direct selection
@@ -941,6 +977,26 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         params: &serde_json::Value,
     ) -> Result<String, Error> {
         Self::execute_tool_inner(&self.deps, self.job_id, tool_name, params).await
+    }
+
+    /// Persist the last assistant message to the conversation in the DB.
+    ///
+    /// When a workspace job finishes, `await_job` reads the conversation for
+    /// the last assistant message. Without this, the caller gets the fallback
+    /// "Job completed successfully." text.
+    async fn persist_response_to_conversation(&self, response: &str) {
+        let conv_id = match self.context_manager().get_context(self.job_id).await {
+            Ok(ctx) => ctx.conversation_id,
+            Err(_) => None,
+        };
+        if let (Some(store), Some(conv_id)) = (self.store(), conv_id)
+            && let Err(e) = store.add_conversation_message(conv_id, "assistant", response).await
+        {
+            tracing::warn!(
+                "Failed to persist assistant response for job {}: {}",
+                self.job_id, e
+            );
+        }
     }
 
     async fn mark_completed(&self) -> Result<(), Error> {
