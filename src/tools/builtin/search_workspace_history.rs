@@ -8,15 +8,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::context::JobContext;
-use crate::db::AgentWorkspaceStore;
+use crate::db::Database;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
 
 pub struct SearchWorkspaceHistoryTool {
-    db: Arc<dyn AgentWorkspaceStore>,
+    db: Arc<dyn Database>,
 }
 
 impl SearchWorkspaceHistoryTool {
-    pub fn new(db: Arc<dyn AgentWorkspaceStore>) -> Self {
+    pub fn new(db: Arc<dyn Database>) -> Self {
         Self { db }
     }
 }
