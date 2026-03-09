@@ -533,6 +533,10 @@ pub trait AgentWorkspaceStore: Send + Sync {
         &self,
         id: Uuid,
     ) -> Result<Option<AgentWorkspace>, DatabaseError>;
+    async fn get_agent_workspace_by_conversation(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<Option<AgentWorkspace>, DatabaseError>;
     async fn list_agent_workspaces(
         &self,
         user_id: &str,

@@ -1416,6 +1416,24 @@ impl AgentWorkspaceStore for PgBackend {
         Ok(rows.first().map(pg_row_to_agent_workspace))
     }
 
+    async fn get_agent_workspace_by_conversation(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<Option<AgentWorkspace>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, user_id, topic, conversation_id, status,
+                       last_accessed, turn_count, created_at
+                FROM agent_workspaces WHERE conversation_id = $1
+                "#,
+                &[&conversation_id],
+            )
+            .await?;
+        Ok(rows.first().map(pg_row_to_agent_workspace))
+    }
+
     async fn list_agent_workspaces(
         &self,
         user_id: &str,

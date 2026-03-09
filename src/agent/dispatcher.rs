@@ -62,6 +62,38 @@ impl Agent {
             None
         };
 
+        // Check if this thread belongs to a workspace and inject context
+        let workspace_context = if let Some(ref store) = self.deps.store {
+            match store.get_agent_workspace_by_conversation(thread_id).await {
+                Ok(Some(ws)) => {
+                    tracing::info!(
+                        "Workspace context: thread {} belongs to workspace {} (topic: {})",
+                        thread_id, ws.id, ws.topic
+                    );
+                    let mut ctx = String::new();
+                    ctx.push_str("\n\n## Workspace Context\n");
+                    if !ws.topic.is_empty() {
+                        ctx.push_str(&format!("**Topic:** {}\n", ws.topic));
+                    }
+                    ctx.push_str(&format!("**Turn count:** {}\n", ws.turn_count));
+                    ctx.push_str(&format!("**Workspace ID:** {}\n", ws.id));
+                    ctx.push_str(
+                        "\nYou are continuing a workspace conversation. \
+                         Stay focused on the topic above. If the user's message \
+                         seems unrelated, acknowledge the topic shift.\n",
+                    );
+                    Some(ctx)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!("Failed to check workspace for thread {}: {}", thread_id, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Select and prepare active skills (if skills system is enabled)
         let active_skills = self.select_active_skills(&message.content);
 
@@ -116,7 +148,14 @@ impl Agent {
         }
 
         if let Some(prompt) = system_prompt {
+            let prompt = if let Some(ref ws_ctx) = workspace_context {
+                format!("{prompt}{ws_ctx}")
+            } else {
+                prompt
+            };
             reasoning = reasoning.with_system_prompt(prompt);
+        } else if let Some(ref ws_ctx) = workspace_context {
+            reasoning = reasoning.with_system_prompt(ws_ctx.clone());
         }
         if let Some(ctx) = skill_context {
             reasoning = reasoning.with_skill_context(ctx);

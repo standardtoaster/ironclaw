@@ -885,6 +885,14 @@ mod tests {
             Ok(guard.iter().find(|ws| ws.id == id).cloned())
         }
 
+        async fn get_agent_workspace_by_conversation(
+            &self,
+            conversation_id: Uuid,
+        ) -> Result<Option<AgentWorkspace>, DatabaseError> {
+            let guard = self.workspaces.lock().unwrap();
+            Ok(guard.iter().find(|ws| ws.conversation_id == conversation_id).cloned())
+        }
+
         async fn list_agent_workspaces(
             &self,
             _user_id: &str,

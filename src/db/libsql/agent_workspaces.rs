@@ -134,6 +134,32 @@ impl AgentWorkspaceStore for LibSqlBackend {
         }
     }
 
+    async fn get_agent_workspace_by_conversation(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<Option<AgentWorkspace>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT {} FROM agent_workspaces WHERE conversation_id = ?1",
+                    AGENT_WORKSPACE_COLUMNS
+                ),
+                params![conversation_id.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            Some(row) => Ok(Some(row_to_agent_workspace(&row))),
+            None => Ok(None),
+        }
+    }
+
     async fn list_agent_workspaces(
         &self,
         user_id: &str,
