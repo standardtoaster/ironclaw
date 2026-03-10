@@ -2119,14 +2119,11 @@ mod tests {
                 skills_config: SkillsConfig::default(),
                 hooks: Arc::new(HookRegistry::new()),
                 cost_guard: Arc::new(CostGuard::new(CostGuardConfig::default())),
-<<<<<<< HEAD
                 sse_tx: None,
                 http_interceptor: None,
                 transcription: None,
                 document_extraction: None,
-=======
                 workspace_router: None,
->>>>>>> feat/workspaces
             };
 
             Agent::new(
