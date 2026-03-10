@@ -41,6 +41,9 @@ impl SubmissionParser {
         if lower == "/suggest" {
             return Submission::Suggest;
         }
+        if lower == "/organize" {
+            return Submission::Organize;
+        }
         if lower == "/thread new" || lower == "/new" {
             return Submission::NewThread;
         }
@@ -259,6 +262,9 @@ pub enum Submission {
 
     /// Suggest next steps based on the current thread.
     Suggest,
+
+    /// Trigger the workspace organizer to classify and create workspaces.
+    Organize,
 
     /// Check job status. No job_id shows all jobs; with job_id shows a specific job.
     JobStatus {
@@ -532,6 +538,12 @@ mod tests {
     fn test_parser_suggest() {
         let submission = SubmissionParser::parse("/suggest");
         assert!(matches!(submission, Submission::Suggest));
+    }
+
+    #[test]
+    fn test_parser_organize() {
+        let submission = SubmissionParser::parse("/organize");
+        assert!(matches!(submission, Submission::Organize));
     }
 
     #[test]

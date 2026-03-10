@@ -364,6 +364,60 @@ impl Agent {
         }
     }
 
+    /// Trigger the workspace organizer to classify recent messages and create/update workspaces.
+    pub(super) async fn process_organize(
+        &self,
+        user_id: &str,
+    ) -> Result<SubmissionResult, Error> {
+        let Some(ref resolver) = self.deps.thread_resolver else {
+            return Ok(SubmissionResult::error(
+                "No thread resolver configured. Workspace auto-organization is not available.",
+            ));
+        };
+
+        match resolver.organize(user_id).await {
+            Ok(result) => {
+                let mut parts = Vec::new();
+                if !result.created.is_empty() {
+                    parts.push(format!(
+                        "Created {} workspace(s): {}",
+                        result.created.len(),
+                        result
+                            .created
+                            .iter()
+                            .map(|w| w.topic.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if !result.updated.is_empty() {
+                    parts.push(format!(
+                        "Updated {} workspace(s): {}",
+                        result.updated.len(),
+                        result
+                            .updated
+                            .iter()
+                            .map(|w| w.topic.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if parts.is_empty() {
+                    parts.push("No new workspaces needed.".to_string());
+                }
+                parts.push(format!(
+                    "Analyzed {} message(s).",
+                    result.messages_analyzed
+                ));
+                Ok(SubmissionResult::response(parts.join("\n")))
+            }
+            Err(e) => Ok(SubmissionResult::error(format!(
+                "Organize failed: {}",
+                e
+            ))),
+        }
+    }
+
     /// Summarize the current thread's conversation.
     pub(super) async fn process_summarize(
         &self,
