@@ -81,6 +81,9 @@ pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
     /// Tracks which names were registered as built-in (protected from shadowing).
     builtin_names: RwLock<std::collections::HashSet<String>>,
+    /// Tools discovered/loaded during this session via `discover_tools`.
+    /// These are sent to the LLM alongside core tools.
+    discovered_tools: RwLock<std::collections::HashSet<String>>,
     /// Shared credential registry populated by WASM tools, consumed by HTTP tool.
     credential_registry: Option<Arc<SharedCredentialRegistry>>,
     /// Secrets store for credential injection (shared with HTTP tool).
@@ -97,6 +100,7 @@ impl ToolRegistry {
         Self {
             tools: RwLock::new(HashMap::new()),
             builtin_names: RwLock::new(std::collections::HashSet::new()),
+            discovered_tools: RwLock::new(std::collections::HashSet::new()),
             credential_registry: None,
             secrets_store: None,
             rate_limiter: RateLimiter::new(),
@@ -476,6 +480,58 @@ impl ToolRegistry {
         if let Some(tool) = self.message_tool.read().await.as_ref() {
             tool.set_context(channel, target).await;
         }
+    }
+
+    /// Mark a tool as discovered (loaded for this session).
+    pub async fn mark_discovered(&self, name: &str) {
+        self.discovered_tools.write().await.insert(name.to_string());
+    }
+
+    /// Check if a tool has been discovered this session.
+    pub async fn is_discovered(&self, name: &str) -> bool {
+        self.discovered_tools.read().await.contains(name)
+    }
+
+    /// Get all discovered tool names.
+    pub async fn discovered_tool_names(&self) -> Vec<String> {
+        self.discovered_tools.read().await.iter().cloned().collect()
+    }
+
+    /// Search registered tools by keyword match on name and description.
+    /// Returns (name, description) pairs for matching tools.
+    pub async fn search_tools(&self, query: &str) -> Vec<(String, String)> {
+        let query_lower = query.to_lowercase();
+        let tools = self.tools.read().await;
+        tools
+            .values()
+            .filter(|tool| {
+                tool.name().to_lowercase().contains(&query_lower)
+                    || tool.description().to_lowercase().contains(&query_lower)
+            })
+            .map(|tool| (tool.name().to_string(), tool.description().to_string()))
+            .collect()
+    }
+
+    /// Get tool definitions filtered to core + discovered tools only.
+    /// If `core_names` is empty, returns ALL tools (backward compatible).
+    pub async fn core_tool_definitions(&self, core_names: &[String]) -> Vec<ToolDefinition> {
+        if core_names.is_empty() {
+            return self.tool_definitions().await;
+        }
+        let discovered = self.discovered_tools.read().await;
+        let tools = self.tools.read().await;
+        tools
+            .values()
+            .filter(|tool| {
+                core_names.iter().any(|c| c == tool.name())
+                    || discovered.contains(tool.name())
+            })
+            .map(|tool| ToolDefinition {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters: tool.parameters_schema(),
+            })
+            .collect()
     }
 
     /// Register image generation and editing tools.
@@ -922,5 +978,49 @@ mod tests {
         registry.retain_only(&[]).await;
         let after = registry.list().await.len();
         assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn test_discovered_tools_tracking() {
+        let registry = ToolRegistry::new();
+        assert!(!registry.is_discovered("foo").await);
+        registry.mark_discovered("foo").await;
+        assert!(registry.is_discovered("foo").await);
+        let names = registry.discovered_tool_names().await;
+        assert_eq!(names, vec!["foo".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_matches_name_and_description() {
+        let registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool)).await;
+        // "echo" matches the tool name
+        let results = registry.search_tools("echo").await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "echo");
+        // no match
+        let results = registry.search_tools("nonexistent").await;
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_core_tool_definitions_filters_correctly() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        // With empty core_names, returns all tools (backward compatible)
+        let all = registry.core_tool_definitions(&[]).await;
+        assert!(!all.is_empty());
+        // With specific core_names, returns only those + discovered
+        let core = vec!["echo".to_string()];
+        let filtered = registry.core_tool_definitions(&core).await;
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "echo");
+        // Discover "time", now it should also appear
+        registry.mark_discovered("time").await;
+        let filtered = registry.core_tool_definitions(&core).await;
+        assert_eq!(filtered.len(), 2);
+        let names: Vec<&str> = filtered.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"echo"));
+        assert!(names.contains(&"time"));
     }
 }
