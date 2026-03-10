@@ -183,12 +183,21 @@ impl Agent {
 
         // Build system prompts once for this turn. Two variants: with tools
         // (normal iterations) and without (force_text final iteration).
-        let initial_tool_defs = self.tools().tool_definitions().await;
+        // When core_tools is configured, only core + discovered tools are sent.
+        let core_tools = &self.deps.core_tools;
+        let initial_tool_defs = self.tools().core_tool_definitions(core_tools).await;
         let initial_tool_defs = if !active_skills.is_empty() {
             crate::skills::attenuate_tools(&initial_tool_defs, &active_skills).tools
         } else {
             initial_tool_defs
         };
+
+        // Inject capability manifest so the LLM knows about discoverable tools.
+        let manifest = self.tools().capability_manifest(core_tools).await;
+        if !manifest.is_empty() {
+            reasoning = reasoning.with_skill_context(manifest);
+        }
+
         let cached_prompt = reasoning.build_system_prompt_with_tools(&initial_tool_defs);
         let cached_prompt_no_tools = reasoning.build_system_prompt_with_tools(&[]);
 
@@ -249,8 +258,9 @@ impl Agent {
 
             let force_text = iteration >= force_text_at;
 
-            // Refresh tool definitions each iteration so newly built tools become visible
-            let tool_defs = self.tools().tool_definitions().await;
+            // Refresh tool definitions each iteration so newly built/discovered tools become visible.
+            // When core_tools is configured, only core + discovered tools are sent.
+            let tool_defs = self.tools().core_tool_definitions(core_tools).await;
 
             // Apply visibility tier filtering: hide on-demand tool groups unless
             // a relevant skill activates them via keyword scan.
@@ -1256,6 +1266,7 @@ mod tests {
             transcription: None,
             document_extraction: None,
             workspace_router: None,
+            core_tools: Vec::new(),
         };
 
         Agent::new(
@@ -2006,6 +2017,7 @@ mod tests {
             transcription: None,
             document_extraction: None,
             workspace_router: None,
+            core_tools: Vec::new(),
         };
 
         Agent::new(
@@ -2124,6 +2136,7 @@ mod tests {
                 transcription: None,
                 document_extraction: None,
                 workspace_router: None,
+                core_tools: Vec::new(),
             };
 
             Agent::new(

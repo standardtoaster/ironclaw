@@ -83,6 +83,10 @@ pub struct AgentDeps {
     pub document_extraction: Option<Arc<crate::document_extraction::DocumentExtractionMiddleware>>,
     /// Workspace router for automatic topic-based context switching.
     pub workspace_router: Option<Arc<crate::agent::workspace_router::WorkspaceRouter>>,
+    /// Tool names that are always included in LLM context.
+    /// When non-empty, only core + discovered tools are sent to the LLM.
+    /// Empty = backward compatible (all tools sent).
+    pub core_tools: Vec<String>,
 }
 
 /// The main agent that coordinates all components.

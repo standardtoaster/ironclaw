@@ -2,6 +2,7 @@
 
 pub mod collections;
 mod delegate_workspace;
+mod discover_tools;
 mod list_workspaces;
 mod search_workspace_history;
 mod set_workspace_topic;
@@ -27,6 +28,7 @@ pub use collections::{
     generate_collection_tools,
 };
 pub use delegate_workspace::DelegateToWorkspaceTool;
+pub use discover_tools::DiscoverToolsTool;
 pub use list_workspaces::ListWorkspacesTool;
 pub use search_workspace_history::SearchWorkspaceHistoryTool;
 pub use set_workspace_topic::SetWorkspaceTopicTool;

@@ -763,6 +763,7 @@ async fn async_main() -> anyhow::Result<()> {
             ironclaw::document_extraction::DocumentExtractionMiddleware::new(),
         )),
         workspace_router: workspace_router_for_agent,
+        core_tools: config.core_tools.clone(),
     };
 
     let mut agent = Agent::new(

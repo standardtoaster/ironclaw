@@ -622,6 +622,7 @@ impl TestRigBuilder {
             },
             transcription: None,
             document_extraction: None,
+            core_tools: Vec::new(),
         };
 
         // 7. Create TestChannel and ChannelManager.

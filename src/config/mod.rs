@@ -88,6 +88,10 @@ pub struct Config {
     pub skills: SkillsConfig,
     pub transcription: TranscriptionConfig,
     pub observability: crate::observability::ObservabilityConfig,
+    /// Tool names to always include in LLM context (comma-separated via `CORE_TOOLS`).
+    /// All other registered tools are discoverable but not sent unless loaded.
+    /// If empty/unset, ALL tools are sent (backward compatible).
+    pub core_tools: Vec<String>,
 }
 
 impl Config {
@@ -160,6 +164,7 @@ impl Config {
             },
             transcription: TranscriptionConfig::default(),
             observability: crate::observability::ObservabilityConfig::default(),
+            core_tools: Vec::new(),
         }
     }
 
@@ -313,6 +318,11 @@ impl Config {
             observability: crate::observability::ObservabilityConfig {
                 backend: std::env::var("OBSERVABILITY_BACKEND").unwrap_or_else(|_| "none".into()),
             },
+            core_tools: std::env::var("CORE_TOOLS")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
+                .unwrap_or_default(),
         })
     }
 }
