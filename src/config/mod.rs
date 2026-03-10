@@ -40,7 +40,7 @@ pub use self::database::{DatabaseBackend, DatabaseConfig, SslMode, default_libsq
 pub use self::embeddings::EmbeddingsConfig;
 pub use self::heartbeat::HeartbeatConfig;
 pub use self::hygiene::HygieneConfig;
-pub use self::llm::default_session_path;
+pub use self::llm::{LlmBackend, default_session_path};
 pub use self::routines::RoutineConfig;
 pub use self::safety::SafetyConfig;
 pub use self::sandbox::{ClaudeCodeConfig, SandboxModeConfig};

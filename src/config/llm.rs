@@ -10,6 +10,58 @@ use crate::llm::registry::{ProviderProtocol, ProviderRegistry};
 use crate::llm::session::SessionConfig;
 use crate::settings::Settings;
 
+/// Which LLM backend to use. Configurable per-user via `GATEWAY_USER_TOKENS`.
+///
+/// Users can override with `LLM_BACKEND` env var to use their own API keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LlmBackend {
+    /// NEAR AI proxy (default) -- session or API key auth
+    #[default]
+    NearAi,
+    /// Direct OpenAI API
+    OpenAi,
+    /// Direct Anthropic API
+    Anthropic,
+    /// Local Ollama instance
+    Ollama,
+    /// Any OpenAI-compatible endpoint (e.g. vLLM, LiteLLM, Together)
+    OpenAiCompatible,
+    /// Tinfoil private inference
+    Tinfoil,
+}
+
+impl std::str::FromStr for LlmBackend {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "nearai" | "near_ai" | "near" => Ok(Self::NearAi),
+            "openai" | "open_ai" => Ok(Self::OpenAi),
+            "anthropic" | "claude" => Ok(Self::Anthropic),
+            "ollama" => Ok(Self::Ollama),
+            "openai_compatible" | "openai-compatible" | "compatible" => Ok(Self::OpenAiCompatible),
+            "tinfoil" => Ok(Self::Tinfoil),
+            _ => Err(format!(
+                "invalid LLM backend '{}', expected one of: nearai, openai, anthropic, ollama, openai_compatible, tinfoil",
+                s
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for LlmBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NearAi => write!(f, "nearai"),
+            Self::OpenAi => write!(f, "openai"),
+            Self::Anthropic => write!(f, "anthropic"),
+            Self::Ollama => write!(f, "ollama"),
+            Self::OpenAiCompatible => write!(f, "openai_compatible"),
+            Self::Tinfoil => write!(f, "tinfoil"),
+        }
+    }
+}
+
 impl LlmConfig {
     /// Create a test-friendly config without reading env vars.
     #[cfg(feature = "libsql")]

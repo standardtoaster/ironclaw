@@ -532,9 +532,13 @@ pub async fn build_provider_chain(
 /// This builds a minimal provider (no retry, failover, smart routing, or cache)
 /// for per-user overrides. The user config specifies the backend, model, and
 /// optional API key / base URL.
+/// Default base URL for Tinfoil private inference.
+const TINFOIL_BASE_URL: &str = "https://inference.tinfoil.sh/v1";
+
 pub fn create_provider_from_user_config(
     user_config: &crate::config::UserLlmConfig,
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    use crate::config::LlmBackend;
     use secrecy::ExposeSecret;
 
     match user_config.backend {

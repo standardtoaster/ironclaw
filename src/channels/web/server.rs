@@ -762,8 +762,8 @@ async fn oauth_callback_handler(
     }
 
     // Broadcast SSE event to notify the web UI
-    if let Some(ref sender) = flow.sse_sender {
-        let _ = sender.send(SseEvent::AuthCompleted {
+    if let Some(ref sse) = flow.sse_sender {
+        sse.broadcast(SseEvent::AuthCompleted {
             extension_name: flow.extension_name,
             success,
             message,
@@ -1357,10 +1357,8 @@ async fn chat_threads_handler(
                 threads,
                 active_thread: sess.active_thread,
             }));
-        }
-        Err(e) => {
-            tracing::error!(user_id = %user.user_id, error = %e, "DB error listing threads; falling back to in-memory");
-        }
+        } else {
+            tracing::error!(user_id = %user.user_id, "DB error listing threads; falling back to in-memory");
         }
     }
 
@@ -3192,7 +3190,8 @@ mod tests {
                 .get("test_nonce")
                 .is_none()
         );
-=======
+    }
+
     #[test]
     fn test_is_local_origin_localhost() {
         assert!(is_local_origin("http://localhost:3001"));
@@ -3223,6 +3222,5 @@ mod tests {
     fn test_is_local_origin_rejects_garbage() {
         assert!(!is_local_origin("not-a-url"));
         assert!(!is_local_origin(""));
->>>>>>> feat/per-user-llm-provider
     }
 }

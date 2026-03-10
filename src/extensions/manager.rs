@@ -2104,7 +2104,7 @@ impl ExtensionManager {
                 scopes: merged_scopes,
                 user_id: self.user_id.clone(),
                 secrets: Arc::clone(&self.secrets),
-                sse_sender: self.sse_sender.read().await.clone(),
+                sse_sender: self.sse_manager.read().await.clone(),
                 gateway_token: self.gateway_token.clone(),
                 created_at: std::time::Instant::now(),
             };
@@ -2147,7 +2147,7 @@ impl ExtensionManager {
             let validation_endpoint = auth.validation_endpoint.clone();
             let user_id = self.user_id.clone();
             let secrets = Arc::clone(&self.secrets);
-            let sse_sender = self.sse_sender.read().await.clone();
+            let sse_sender = self.sse_manager.read().await.clone();
             let ext_name = name.to_string();
 
             let task_handle = tokio::spawn(async move {
@@ -2226,8 +2226,8 @@ impl ExtensionManager {
                     }
                 }
 
-                if let Some(ref sender) = sse_sender {
-                    let _ = sender.send(crate::channels::web::types::SseEvent::AuthCompleted {
+                if let Some(ref sse) = sse_sender {
+                    sse.broadcast(crate::channels::web::types::SseEvent::AuthCompleted {
                         extension_name: ext_name,
                         success,
                         message,

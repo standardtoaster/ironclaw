@@ -141,11 +141,12 @@ impl GatewayChannel {
             user_tokens,
             skill_registry: None,
             skill_catalog: None,
+            scheduler: None,
             chat_rate_limiter: server::PerUserRateLimiter::new(30, 60),
             registry_entries: Vec::new(),
             cost_guard: None,
+            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
-            restart_requested: std::sync::atomic::AtomicBool::new(false),
         });
 
         Self {
