@@ -331,7 +331,17 @@ impl near::agent::host::Host for StoreData {
             .unwrap_or(10 * 1024 * 1024);
 
         // Resolve hostname and reject private/internal IPs to prevent DNS rebinding.
-        reject_private_ip(&url)?;
+        // Skip this check if the tool's capabilities explicitly allow private IPs
+        // (e.g., for tools that communicate with local services).
+        let allow_private = self
+            .host_state
+            .capabilities()
+            .http
+            .as_ref()
+            .is_some_and(|h| h.allow_private_ips);
+        if !allow_private {
+            reject_private_ip(&url)?;
+        }
 
         // Make HTTP request using a dedicated single-threaded runtime.
         // We're inside spawn_blocking, so we can't rely on the main runtime's
@@ -700,11 +710,21 @@ impl WasmToolWrapper {
         // Get logs from host state
         let logs = store.data_mut().host_state.take_logs();
 
-        // Check for tool-level error — on failure, call the WASM module's
-        // description() and schema() exports so the LLM can retry with the
-        // correct parameters without us having to include the (large) schema
+        // Check for tool-level error — on failure, emit logs and call the WASM
+        // module's description() and schema() exports so the LLM can retry with
+        // the correct parameters without us having to include the (large) schema
         // in every request's tools array.
         if let Some(err) = response.error {
+            // Emit logs before returning error so tool debugging info is visible
+            for log in &logs {
+                match log.level {
+                    LogLevel::Trace => tracing::trace!(target: "wasm_tool", "{}", log.message),
+                    LogLevel::Debug => tracing::debug!(target: "wasm_tool", "{}", log.message),
+                    LogLevel::Info => tracing::info!(target: "wasm_tool", "{}", log.message),
+                    LogLevel::Warn => tracing::warn!(target: "wasm_tool", "{}", log.message),
+                    LogLevel::Error => tracing::error!(target: "wasm_tool", "{}", log.message),
+                }
+            }
             let hint = build_tool_hint(tool_iface, &mut store);
             return Err(WasmError::ToolReturnedError { message: err, hint });
         }

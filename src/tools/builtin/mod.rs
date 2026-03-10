@@ -1,6 +1,11 @@
 //! Built-in tools that come with the agent.
 
 pub mod collections;
+mod delegate_workspace;
+mod list_workspaces;
+mod search_workspace_history;
+mod set_workspace_topic;
+mod workspace_summary;
 mod echo;
 pub mod extension_tools;
 mod file;
@@ -21,6 +26,11 @@ pub use collections::{
     CollectionDropTool, CollectionListTool, CollectionRegisterTool, CollectionsAlterTool,
     generate_collection_tools,
 };
+pub use delegate_workspace::DelegateToWorkspaceTool;
+pub use list_workspaces::ListWorkspacesTool;
+pub use search_workspace_history::SearchWorkspaceHistoryTool;
+pub use set_workspace_topic::SetWorkspaceTopicTool;
+pub use workspace_summary::WorkspaceSummaryTool;
 pub use echo::EchoTool;
 pub use extension_tools::{
     ExtensionInfoTool, ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool,

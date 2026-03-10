@@ -45,6 +45,8 @@ pub struct RigAdapter<M: CompletionModel> {
     /// Parameter names that this provider does not support (e.g., `"temperature"`).
     /// These are stripped from requests before sending to avoid 400 errors.
     unsupported_params: HashSet<String>,
+    /// Extra params injected into every rig-core request (e.g. Ollama `num_ctx`).
+    additional_params: Option<JsonValue>,
 }
 
 impl<M: CompletionModel> RigAdapter<M> {
@@ -60,7 +62,14 @@ impl<M: CompletionModel> RigAdapter<M> {
             output_cost,
             cache_retention: CacheRetention::None,
             unsupported_params: HashSet::new(),
+            additional_params: None,
         }
+    }
+
+    /// Set extra params to inject into every request (e.g. Ollama `num_ctx`).
+    pub fn with_additional_params(mut self, params: JsonValue) -> Self {
+        self.additional_params = Some(params);
+        self
     }
 
     /// Set Anthropic prompt cache retention policy.
@@ -124,7 +133,16 @@ impl<M: CompletionModel> RigAdapter<M> {
         }
         if self.unsupported_params.contains("max_tokens") {
             req.max_tokens = None;
+=======
+            additional_params: None,
+>>>>>>> feat/workspaces
         }
+    }
+
+    /// Set additional params to inject into every request.
+    pub fn with_additional_params(mut self, params: JsonValue) -> Self {
+        self.additional_params = Some(params);
+        self
     }
 }
 
@@ -517,6 +535,7 @@ fn build_rig_request(
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     cache_retention: CacheRetention,
+    additional_params: Option<JsonValue>,
 ) -> Result<RigRequest, LlmError> {
     // rig-core requires at least one message in chat_history
     if history.is_empty() {
@@ -528,8 +547,8 @@ fn build_rig_request(
         reason: format!("Failed to build chat history: {}", e),
     })?;
 
-    // Inject top-level cache_control for Anthropic automatic prompt caching.
-    let additional_params = match cache_retention {
+    // Merge cache_control (from CacheRetention) and caller-supplied additional_params.
+    let cache_params = match cache_retention {
         CacheRetention::None => None,
         CacheRetention::Short => Some(serde_json::json!({
             "cache_control": {"type": "ephemeral"}
@@ -537,6 +556,19 @@ fn build_rig_request(
         CacheRetention::Long => Some(serde_json::json!({
             "cache_control": {"type": "ephemeral", "ttl": "1h"}
         })),
+    };
+    let additional_params = match (cache_params, additional_params) {
+        (Some(mut cache), Some(extra)) => {
+            // Merge extra params into cache params object
+            if let (Some(c), Some(e)) = (cache.as_object_mut(), extra.as_object()) {
+                for (k, v) in e {
+                    c.insert(k.clone(), v.clone());
+                }
+            }
+            Some(cache)
+        }
+        (Some(p), None) | (None, Some(p)) => Some(p),
+        (None, None) => None,
     };
 
     Ok(RigRequest {
@@ -609,6 +641,7 @@ where
             request.temperature,
             request.max_tokens,
             self.cache_retention,
+            self.additional_params.clone(),
         )?;
 
         let response =
@@ -677,6 +710,7 @@ where
             request.temperature,
             request.max_tokens,
             self.cache_retention,
+            self.additional_params.clone(),
         )?;
 
         let response =

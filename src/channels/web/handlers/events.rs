@@ -9,6 +9,7 @@ use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
 
 /// Request body for the event ingest endpoint.
@@ -40,6 +41,7 @@ pub struct EventIngestResponse {
 /// system field for provenance tracking.
 pub async fn events_ingest_handler(
     State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
     Json(req): Json<EventIngestRequest>,
 ) -> impl IntoResponse {
     let db = match &state.store {
@@ -87,14 +89,14 @@ pub async fn events_ingest_handler(
     let data_for_event = data.clone();
 
     match db
-        .insert_record(&state.default_user_id, &req.collection, data)
+        .insert_record(&user.user_id, &req.collection, data)
         .await
     {
         Ok(id) => {
             // Fire collection write triggers
             if let Some(tx) = &state.collection_write_tx {
                 let _ = tx.send(crate::agent::collection_events::CollectionWriteEvent {
-                    user_id: state.default_user_id.clone(),
+                    user_id: user.user_id.clone(),
                     collection: req.collection.clone(),
                     record_id: id,
                     data: data_for_event,

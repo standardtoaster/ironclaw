@@ -81,6 +81,8 @@ pub struct AgentDeps {
     pub transcription: Option<Arc<crate::transcription::TranscriptionMiddleware>>,
     /// Document text extraction middleware for PDF, DOCX, PPTX, etc.
     pub document_extraction: Option<Arc<crate::document_extraction::DocumentExtractionMiddleware>>,
+    /// Workspace router for automatic topic-based context switching.
+    pub workspace_router: Option<Arc<crate::agent::workspace_router::WorkspaceRouter>>,
 }
 
 /// The main agent that coordinates all components.
@@ -823,18 +825,49 @@ impl Agent {
             }
         }
 
+        // Workspace routing: if no explicit thread_id, try to route to a
+        // matching workspace conversation. This implements automatic topic
+        // context switching — the user just talks, and the right workspace
+        // loads based on embedding similarity.
+        let mut routed_thread_id = message.thread_id.clone();
+        if routed_thread_id.is_none()
+            && let Some(ref router) = self.deps.workspace_router
+            && let Submission::UserInput { ref content } = submission
+        {
+            match router.route(&message.user_id, content).await {
+                Ok(Some(ws)) => {
+                    tracing::info!(
+                        "Workspace routing: matched workspace {} (topic: {})",
+                        ws.id, ws.topic
+                    );
+                    routed_thread_id = Some(ws.conversation_id.to_string());
+                    // Touch workspace (update last_accessed, increment turn_count)
+                    if let Some(ref store) = self.deps.store {
+                        let _ = store.touch_agent_workspace(ws.id).await;
+                    }
+                }
+                Ok(None) => {
+                    tracing::debug!("Workspace routing: no match, using default thread");
+                }
+                Err(e) => {
+                    tracing::warn!("Workspace routing failed: {}", e);
+                }
+            }
+        }
+
         // Hydrate thread from DB if it's a historical thread not in memory
-        if let Some(ref external_thread_id) = message.thread_id {
+        let effective_thread_id = routed_thread_id.as_ref().or(message.thread_id.as_ref());
+        if let Some(external_thread_id) = effective_thread_id {
             self.maybe_hydrate_thread(message, external_thread_id).await;
         }
 
-        // Resolve session and thread
+        // Resolve session and thread — use routed thread_id if workspace routing matched
         let (session, thread_id) = self
             .session_manager
             .resolve_thread(
                 &message.user_id,
                 &message.channel,
-                message.thread_id.as_deref(),
+                routed_thread_id.as_deref().or(message.thread_id.as_deref()),
             )
             .await;
 

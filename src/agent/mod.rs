@@ -32,6 +32,8 @@ pub mod task;
 mod thread_ops;
 pub mod undo;
 pub mod worker;
+pub mod workspace_queue;
+pub mod workspace_router;
 
 pub(crate) use agent_loop::truncate_for_preview;
 pub use agent_loop::{Agent, AgentDeps};

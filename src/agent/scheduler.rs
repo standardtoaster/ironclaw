@@ -62,6 +62,9 @@ pub struct Scheduler {
     jobs: Arc<RwLock<HashMap<Uuid, ScheduledJob>>>,
     /// Running sub-tasks (tool executions, background tasks).
     subtasks: Arc<RwLock<HashMap<Uuid, ScheduledSubtask>>>,
+    /// Waiters for job completion. When a job's worker handle finishes,
+    /// all registered oneshot senders are fired.
+    completion_waiters: Arc<RwLock<HashMap<Uuid, Vec<oneshot::Sender<()>>>>>,
 }
 
 impl Scheduler {
@@ -87,6 +90,7 @@ impl Scheduler {
             http_interceptor: None,
             jobs: Arc::new(RwLock::new(HashMap::new())),
             subtasks: Arc::new(RwLock::new(HashMap::new())),
+            completion_waiters: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -182,6 +186,161 @@ impl Scheduler {
         Ok(job_id)
     }
 
+    /// Create, persist, and schedule a job attached to an existing conversation.
+    ///
+    /// Like `dispatch_job`, but instead of creating a new conversation the job
+    /// references an existing `conversation_id`. The `prompt` is appended as a
+    /// new user message to that conversation before the worker starts, so the
+    /// worker will see the full history when it hydrates the thread.
+    ///
+    /// Returns the new job ID.
+    pub async fn dispatch_job_to_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: Uuid,
+        title: &str,
+        prompt: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<Uuid, JobError> {
+        // 1. Create job context linked to the existing conversation
+        let job_id = self
+            .context_manager
+            .create_job_for_conversation(user_id, conversation_id, title, prompt)
+            .await?;
+
+        // 2. Apply metadata if provided
+        if let Some(meta) = metadata {
+            self.context_manager
+                .update_context(job_id, |ctx| {
+                    ctx.metadata = meta;
+                })
+                .await?;
+        }
+
+        // 3. Append the prompt as a user message to the existing conversation
+        if let Some(ref store) = self.store {
+            store
+                .add_conversation_message(conversation_id, "user", prompt)
+                .await
+                .map_err(|e| JobError::Failed {
+                    id: job_id,
+                    reason: format!("failed to append message to conversation: {e}"),
+                })?;
+        }
+
+        // 4. Persist job to DB before scheduling so FK references are valid
+        if let Some(ref store) = self.store {
+            let ctx = self.context_manager.get_context(job_id).await?;
+            store.save_job(&ctx).await.map_err(|e| JobError::Failed {
+                id: job_id,
+                reason: format!("failed to persist job: {e}"),
+            })?;
+        }
+
+        // 5. Schedule the worker
+        self.schedule(job_id).await?;
+        Ok(job_id)
+    }
+
+    /// Block until a dispatched job completes and return its final response text.
+    ///
+    /// Registers a completion waiter for the given job, then blocks until either
+    /// the worker finishes or the timeout elapses. On completion, reads the job
+    /// context to determine success/failure and extracts the last assistant
+    /// message from the conversation as the response text.
+    pub async fn await_job(
+        &self,
+        job_id: Uuid,
+        timeout: Duration,
+    ) -> Result<String, JobError> {
+        // Register a waiter unconditionally, then check if the job is already
+        // gone. This closes the race where the cleanup task fires between
+        // checking `jobs` and registering the waiter -- if that happens the
+        // waiter would never be notified and we'd hang until timeout.
+        let (tx, rx) = oneshot::channel();
+        self.completion_waiters
+            .write()
+            .await
+            .entry(job_id)
+            .or_default()
+            .push(tx);
+
+        // Re-check: if the job is no longer in `jobs`, the cleanup task
+        // already fired (and already notified all waiters that were registered
+        // at that point). Our waiter might or might not have been notified
+        // depending on timing, so just skip straight to reading the result.
+        let already_done = !self.jobs.read().await.contains_key(&job_id);
+
+        if !already_done {
+            // Wait for completion (with timeout)
+            tokio::time::timeout(timeout, rx)
+                .await
+                .map_err(|_| JobError::Stuck {
+                    id: job_id,
+                    duration: timeout,
+                })?
+                .map_err(|_| JobError::Failed {
+                    id: job_id,
+                    reason: "Job completion channel dropped unexpectedly".to_string(),
+                })?;
+        }
+
+        // Read final job state
+        let job_ctx = self.context_manager.get_context(job_id).await?;
+
+        match job_ctx.state {
+            JobState::Completed => {}
+            JobState::Failed => {
+                let reason = job_ctx
+                    .transitions
+                    .last()
+                    .and_then(|t| t.reason.clone())
+                    .unwrap_or_else(|| "unknown failure".to_string());
+                return Err(JobError::Failed {
+                    id: job_id,
+                    reason,
+                });
+            }
+            JobState::Stuck => {
+                return Err(JobError::Stuck {
+                    id: job_id,
+                    duration: Duration::from_secs(0),
+                });
+            }
+            JobState::Cancelled => {
+                return Err(JobError::Failed {
+                    id: job_id,
+                    reason: "Job was cancelled".to_string(),
+                });
+            }
+            other => {
+                return Err(JobError::Failed {
+                    id: job_id,
+                    reason: format!("Job ended in unexpected state: {other}"),
+                });
+            }
+        }
+
+        // Extract the last assistant message from the conversation
+        if let (Some(store), Some(conversation_id)) = (&self.store, job_ctx.conversation_id) {
+            let messages = store
+                .list_conversation_messages(conversation_id)
+                .await
+                .map_err(|e| JobError::Failed {
+                    id: job_id,
+                    reason: format!("Failed to read conversation messages: {e}"),
+                })?;
+
+            // Find the last assistant message
+            if let Some(msg) = messages.iter().rev().find(|m| m.role == "assistant") {
+                return Ok(msg.content.clone());
+            }
+        }
+
+        // Fallback: no conversation or no assistant messages found
+        Ok("Job completed successfully.".to_string())
+    }
+
     /// Schedule a job for execution.
     pub async fn schedule(&self, job_id: Uuid) -> Result<(), JobError> {
         self.schedule_with_context(job_id, None).await
@@ -259,6 +418,7 @@ impl Scheduler {
 
         // Cleanup task for this job to avoid capacity leaks
         let jobs = Arc::clone(&self.jobs);
+        let completion_waiters = Arc::clone(&self.completion_waiters);
         tokio::spawn(async move {
             loop {
                 let finished = {
@@ -271,6 +431,12 @@ impl Scheduler {
 
                 if finished {
                     jobs.write().await.remove(&job_id);
+                    // Notify any waiters that the job has finished
+                    if let Some(waiters) = completion_waiters.write().await.remove(&job_id) {
+                        for tx in waiters {
+                            let _ = tx.send(());
+                        }
+                    }
                     break;
                 }
 
@@ -682,19 +848,563 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SafetyConfig;
-    use crate::safety::SafetyLayer;
-    use crate::tools::{ApprovalRequirement, Tool, ToolError, ToolOutput};
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    #[test]
-    fn test_scheduler_creation() {
-        // Would need to mock dependencies for proper testing
+    use async_trait::async_trait;
+    use rust_decimal::Decimal;
+    use tokio::sync::oneshot;
+
+    use crate::config::AgentConfig;
+    use crate::config::SafetyConfig;
+    use crate::context::ContextManager;
+    use crate::error::{JobError, LlmError};
+    use crate::hooks::HookRegistry;
+    use crate::llm::{
+        CompletionRequest, CompletionResponse, LlmProvider,
+        ToolCompletionRequest, ToolCompletionResponse,
+    };
+    use crate::safety::SafetyLayer;
+    use crate::tools::{ApprovalRequirement, Tool, ToolError, ToolOutput, ToolRegistry};
+
+    /// Stub LLM provider that always returns an error. Tests that exercise
+    /// `await_job` / waiter mechanics never reach the LLM, so this is fine.
+    struct StubLlm;
+
+    #[async_trait]
+    impl LlmProvider for StubLlm {
+        fn model_name(&self) -> &str {
+            "stub"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(&self, _req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+            Err(LlmError::RequestFailed {
+                provider: "stub".to_string(),
+                reason: "stub provider".to_string(),
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _req: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, LlmError> {
+            Err(LlmError::RequestFailed {
+                provider: "stub".to_string(),
+                reason: "stub provider".to_string(),
+            })
+        }
+    }
+
+    /// Build a test `AgentConfig` with sensible defaults.
+    fn test_agent_config() -> AgentConfig {
+        AgentConfig {
+            name: "test".to_string(),
+            max_parallel_jobs: 10,
+            job_timeout: Duration::from_secs(30),
+            stuck_threshold: Duration::from_secs(60),
+            repair_check_interval: Duration::from_secs(60),
+            max_repair_attempts: 3,
+            use_planning: false,
+            session_idle_timeout: Duration::from_secs(600),
+            allow_local_tools: false,
+            max_cost_per_day_cents: None,
+            max_actions_per_hour: None,
+            max_tool_iterations: 50,
+            auto_approve_tools: false,
+        }
+    }
+
+    /// Build a minimal `Scheduler` suitable for testing waiter/await mechanics.
+    /// The LLM is a stub so worker-driven jobs will fail, but direct
+    /// manipulation of `jobs` and `completion_waiters` works.
+    fn test_scheduler() -> Scheduler {
+        let ctx_mgr = Arc::new(ContextManager::new(10));
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        }));
+        Scheduler::new(
+            test_agent_config(),
+            ctx_mgr,
+            Arc::new(StubLlm),
+            safety,
+            Arc::new(ToolRegistry::new()),
+            None,
+            Arc::new(HookRegistry::new()),
+        )
+    }
+
+    // ---------------------------------------------------------------
+    // Waiter mechanism: register, notify, receive
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_waiter_notified_on_job_removal() {
+        // Simulates the cleanup task: insert a fake job, register a waiter,
+        // remove the job and fire waiters, verify the waiter receives the signal.
+        let scheduler = test_scheduler();
+        let job_id = Uuid::new_v4();
+
+        // Insert a fake entry into `jobs` so the scheduler thinks it's running.
+        let (dummy_tx, _dummy_rx) = mpsc::channel(1);
+        let handle = tokio::spawn(async {});
+        scheduler
+            .jobs
+            .write()
+            .await
+            .insert(job_id, ScheduledJob { handle, tx: dummy_tx });
+
+        // Register a waiter.
+        let (tx, rx) = oneshot::channel();
+        scheduler
+            .completion_waiters
+            .write()
+            .await
+            .entry(job_id)
+            .or_default()
+            .push(tx);
+
+        // Simulate cleanup: remove from jobs, notify waiters.
+        scheduler.jobs.write().await.remove(&job_id);
+        if let Some(waiters) = scheduler.completion_waiters.write().await.remove(&job_id) {
+            for w in waiters {
+                let _ = w.send(());
+            }
+        }
+
+        // The waiter should have been notified.
+        let result = tokio::time::timeout(Duration::from_millis(100), rx).await;
+        assert!(result.is_ok(), "waiter should have been notified");
+        assert!(result.unwrap().is_ok(), "oneshot should receive ()");
     }
 
     #[tokio::test]
-    async fn test_spawn_batch_empty() {
-        // This test would need mock dependencies.
-        // For now just verify the empty case doesn't panic.
+    async fn test_multiple_waiters_all_notified() {
+        let scheduler = test_scheduler();
+        let job_id = Uuid::new_v4();
+
+        // Insert a fake job.
+        let (dummy_tx, _dummy_rx) = mpsc::channel(1);
+        let handle = tokio::spawn(async {});
+        scheduler
+            .jobs
+            .write()
+            .await
+            .insert(job_id, ScheduledJob { handle, tx: dummy_tx });
+
+        // Register 5 waiters.
+        let mut receivers = Vec::new();
+        for _ in 0..5 {
+            let (tx, rx) = oneshot::channel();
+            scheduler
+                .completion_waiters
+                .write()
+                .await
+                .entry(job_id)
+                .or_default()
+                .push(tx);
+            receivers.push(rx);
+        }
+
+        // Notify all.
+        if let Some(waiters) = scheduler.completion_waiters.write().await.remove(&job_id) {
+            for w in waiters {
+                let _ = w.send(());
+            }
+        }
+
+        for (i, rx) in receivers.into_iter().enumerate() {
+            let result = tokio::time::timeout(Duration::from_millis(100), rx).await;
+            assert!(result.is_ok(), "waiter {i} should have been notified");
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // await_job: already-done fast path (the race condition fix)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_await_job_already_done_returns_immediately() {
+        // The key race fix: if a job is already gone from `jobs` by the time
+        // we check, `await_job` should skip waiting and go straight to reading
+        // the context. We create a completed job in ContextManager (but do NOT
+        // insert it into `jobs`) so the fast path fires.
+        let scheduler = test_scheduler();
+
+        let job_id = scheduler
+            .context_manager
+            .create_job_for_user("test-user", "Already done", "desc")
+            .await
+            .unwrap();
+
+        // Transition to InProgress then Completed so state machine is happy.
+        scheduler
+            .context_manager
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(
+                    crate::context::JobState::InProgress,
+                    Some("started".to_string()),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        scheduler
+            .context_manager
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(
+                    crate::context::JobState::Completed,
+                    Some("done".to_string()),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Job is NOT in `scheduler.jobs` -- simulates cleanup already ran.
+        // `await_job` should return the fallback message (no DB, so no
+        // conversation messages).
+        let result = scheduler
+            .await_job(job_id, Duration::from_millis(100))
+            .await;
+        assert!(result.is_ok(), "should succeed: {result:?}");
+        assert_eq!(result.unwrap(), "Job completed successfully.");
+    }
+
+    // ---------------------------------------------------------------
+    // await_job: timeout
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_await_job_timeout() {
+        // Insert a fake job that never finishes — await_job should hit timeout.
+        let scheduler = test_scheduler();
+
+        let job_id = scheduler
+            .context_manager
+            .create_job_for_user("test-user", "Stuck job", "desc")
+            .await
+            .unwrap();
+
+        // Insert a fake running job (a future that sleeps forever).
+        let (dummy_tx, _dummy_rx) = mpsc::channel(1);
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+        scheduler
+            .jobs
+            .write()
+            .await
+            .insert(job_id, ScheduledJob { handle, tx: dummy_tx });
+
+        let result = scheduler
+            .await_job(job_id, Duration::from_millis(50))
+            .await;
+
+        assert!(result.is_err(), "should timeout");
+        match result.unwrap_err() {
+            JobError::Stuck { id, .. } => assert_eq!(id, job_id),
+            other => panic!("expected Stuck error, got: {other}"),
+        }
+
+        // Clean up the spawned task.
+        if let Some(job) = scheduler.jobs.write().await.remove(&job_id) {
+            job.handle.abort();
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // await_job: failed / stuck / cancelled states
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_await_job_failed_state() {
+        let scheduler = test_scheduler();
+
+        let job_id = scheduler
+            .context_manager
+            .create_job_for_user("test-user", "Failing job", "desc")
+            .await
+            .unwrap();
+
+        // Transition: Pending -> InProgress -> Failed
+        scheduler
+            .context_manager
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(crate::context::JobState::InProgress, None)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler
+            .context_manager
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(
+                    crate::context::JobState::Failed,
+                    Some("LLM refused".to_string()),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Job is not in `jobs` (already cleaned up).
+        let result = scheduler
+            .await_job(job_id, Duration::from_millis(100))
+            .await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            JobError::Failed { id, reason } => {
+                assert_eq!(id, job_id);
+                assert!(reason.contains("LLM refused"), "reason: {reason}");
+            }
+            other => panic!("expected Failed, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_await_job_cancelled_state() {
+        let scheduler = test_scheduler();
+
+        let job_id = scheduler
+            .context_manager
+            .create_job_for_user("test-user", "Cancelled job", "desc")
+            .await
+            .unwrap();
+
+        // Transition: Pending -> InProgress -> Cancelled
+        scheduler
+            .context_manager
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(crate::context::JobState::InProgress, None)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler
+            .context_manager
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(
+                    crate::context::JobState::Cancelled,
+                    Some("user cancelled".to_string()),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = scheduler
+            .await_job(job_id, Duration::from_millis(100))
+            .await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            JobError::Failed { reason, .. } => {
+                assert!(reason.contains("cancelled"), "reason: {reason}");
+            }
+            other => panic!("expected Failed (cancelled), got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_await_job_stuck_state() {
+        let scheduler = test_scheduler();
+
+        let job_id = scheduler
+            .context_manager
+            .create_job_for_user("test-user", "Stuck job", "desc")
+            .await
+            .unwrap();
+
+        // Transition: Pending -> InProgress -> Stuck
+        scheduler
+            .context_manager
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(crate::context::JobState::InProgress, None)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler
+            .context_manager
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(crate::context::JobState::Stuck, None)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = scheduler
+            .await_job(job_id, Duration::from_millis(100))
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), JobError::Stuck { .. }));
+    }
+
+    // ---------------------------------------------------------------
+    // Race condition: waiter registered just as cleanup fires
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_await_job_race_cleanup_fires_between_register_and_check() {
+        // Reproduce the race scenario that was fixed:
+        // 1. Job exists in `jobs` when await_job starts
+        // 2. Between registering the waiter and checking `already_done`,
+        //    the cleanup fires (removes from `jobs`, notifies existing waiters)
+        // 3. Our waiter WAS registered before cleanup, so it gets notified
+        //
+        // We simulate this by:
+        // - Inserting a job that finishes almost instantly
+        // - Calling await_job which registers the waiter
+        // - The cleanup loop (spawned by `schedule`) would fire, but here we
+        //   simulate it manually to control timing.
+        let scheduler = test_scheduler();
+
+        let job_id = scheduler
+            .context_manager
+            .create_job_for_user("test-user", "Race test", "desc")
+            .await
+            .unwrap();
+
+        // Transition to Completed so await_job can read the final state.
+        scheduler
+            .context_manager
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(crate::context::JobState::InProgress, None)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler
+            .context_manager
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(crate::context::JobState::Completed, None)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Insert a fake job that is already finished (handle completes immediately).
+        let (dummy_tx, _dummy_rx) = mpsc::channel(1);
+        let handle = tokio::spawn(async {}); // finishes right away
+        // Let the handle finish.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(handle.is_finished());
+
+        scheduler
+            .jobs
+            .write()
+            .await
+            .insert(job_id, ScheduledJob { handle, tx: dummy_tx });
+
+        // Spawn a task that simulates cleanup after a small delay.
+        let jobs = Arc::clone(&scheduler.jobs);
+        let waiters = Arc::clone(&scheduler.completion_waiters);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            jobs.write().await.remove(&job_id);
+            if let Some(ws) = waiters.write().await.remove(&job_id) {
+                for w in ws {
+                    let _ = w.send(());
+                }
+            }
+        });
+
+        // `await_job` registers a waiter, then the cleanup fires, notifying it.
+        let result = scheduler
+            .await_job(job_id, Duration::from_secs(2))
+            .await;
+        assert!(result.is_ok(), "should succeed via waiter notification: {result:?}");
+    }
+
+    // ---------------------------------------------------------------
+    // await_job for nonexistent job
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_await_job_nonexistent_job() {
+        let scheduler = test_scheduler();
+        let fake_id = Uuid::new_v4();
+
+        // Job doesn't exist in `jobs` (already_done path), but also not in
+        // ContextManager → should return NotFound.
+        let result = scheduler
+            .await_job(fake_id, Duration::from_millis(100))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), JobError::NotFound { .. }),
+            "expected NotFound for nonexistent job"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // dispatch_job creates a running job
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_dispatch_job_creates_running_job() {
+        let scheduler = test_scheduler();
+
+        let job_id = scheduler
+            .dispatch_job("test-user", "Test job", "description", None)
+            .await
+            .unwrap();
+
+        // The job should be tracked as running (at least briefly, before the
+        // stub LLM makes the worker fail and cleanup removes it).
+        // Check the context was created.
+        let ctx = scheduler.context_manager.get_context(job_id).await.unwrap();
+        assert_eq!(ctx.title, "Test job");
+        assert_eq!(ctx.user_id, "test-user");
+    }
+
+    // ---------------------------------------------------------------
+    // dispatch_job_to_conversation sets conversation_id
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_dispatch_job_to_conversation_sets_conversation_id() {
+        let scheduler = test_scheduler();
+        let conversation_id = Uuid::new_v4();
+
+        // No DB, so `add_conversation_message` is skipped (store is None).
+        let job_id = scheduler
+            .dispatch_job_to_conversation(
+                "test-user",
+                conversation_id,
+                "Conv job",
+                "hello",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let ctx = scheduler.context_manager.get_context(job_id).await.unwrap();
+        assert_eq!(ctx.conversation_id, Some(conversation_id));
+        assert_eq!(ctx.title, "Conv job");
+    }
+
+    // ---------------------------------------------------------------
+    // dispatch_job with metadata
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_dispatch_job_with_metadata() {
+        let scheduler = test_scheduler();
+        let meta = serde_json::json!({"max_iterations": 5});
+
+        let job_id = scheduler
+            .dispatch_job("test-user", "Meta job", "desc", Some(meta.clone()))
+            .await
+            .unwrap();
+
+        let ctx = scheduler.context_manager.get_context(job_id).await.unwrap();
+        assert_eq!(ctx.metadata["max_iterations"], 5);
     }
 
     /// A tool that returns `UnlessAutoApproved`.

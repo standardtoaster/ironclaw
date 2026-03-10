@@ -65,6 +65,36 @@ impl ContextManager {
         Ok(job_id)
     }
 
+    /// Create a new job context for a specific user, attached to an existing conversation.
+    ///
+    /// Unlike `create_job_for_user`, this sets `conversation_id` on the new
+    /// `JobContext` so the worker can hydrate history from that conversation.
+    pub async fn create_job_for_conversation(
+        &self,
+        user_id: impl Into<String>,
+        conversation_id: Uuid,
+        title: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Result<Uuid, JobError> {
+        let mut contexts = self.contexts.write().await;
+        let active_count = contexts.values().filter(|c| c.state.is_active()).count();
+
+        if active_count >= self.max_jobs {
+            return Err(JobError::MaxJobsExceeded { max: self.max_jobs });
+        }
+
+        let mut context = JobContext::with_user(user_id, title, description);
+        context.conversation_id = Some(conversation_id);
+        let job_id = context.job_id;
+        contexts.insert(job_id, context);
+        drop(contexts);
+
+        let memory = Memory::new(job_id);
+        self.memories.write().await.insert(job_id, memory);
+
+        Ok(job_id)
+    }
+
     /// Get a job context by ID.
     pub async fn get_context(&self, job_id: Uuid) -> Result<JobContext, JobError> {
         self.contexts

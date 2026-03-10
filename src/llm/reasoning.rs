@@ -636,7 +636,7 @@ Respond in JSON format:
         if !effective_tools.is_empty() {
             let mut request = ToolCompletionRequest::new(messages, effective_tools)
                 .with_max_tokens(4096)
-                .with_temperature(0.7)
+                .with_temperature(0.2)
                 .with_tool_choice("auto");
             request.metadata = context.metadata.clone();
 
@@ -705,7 +705,7 @@ Respond in JSON format:
             // No tools, use simple completion
             let mut request = CompletionRequest::new(messages)
                 .with_max_tokens(4096)
-                .with_temperature(0.7);
+                .with_temperature(0.2);
             request.metadata = context.metadata.clone();
 
             let response = self.llm.complete(request).await?;
@@ -1259,6 +1259,7 @@ fn is_inside_code(pos: usize, regions: &[CodeRegion]) -> bool {
 /// - `<tool_call>{"name":"x","arguments":{}}</tool_call>` (JSON)
 /// - `<|tool_call|>...<|/tool_call|>` (pipe-delimited variant)
 /// - `<function_call>...</function_call>` (function_call variant)
+/// - Bare JSON: `{"name":"tool_name", "field": "value"}` (no tags, small model quirk)
 ///
 /// Only returns calls whose name matches an available tool.
 fn recover_tool_calls_from_content(
@@ -1363,7 +1364,68 @@ fn recover_tool_calls_from_content(
         }
     }
 
+    // Small models sometimes output a bare JSON object as the entire response
+    // content, with the tool name in a "name" or "function" field and the
+    // arguments mixed at the top level or in an "arguments"/"args" sub-object.
+    // Example: {"name": "tasks_add", "task_name": "Buy milk", "priority": "high"}
+    if calls.is_empty()
+        && let Some(call) = recover_bare_json_tool_call(content, &tool_names)
+    {
+        tracing::debug!(
+            tool = %call.name,
+            "Recovered bare JSON tool call from content"
+        );
+        calls.push(call);
+    }
+
     calls
+}
+
+/// Try to recover a tool call from bare JSON in content (no XML tags).
+///
+/// Matches when the entire content (trimmed) is a single JSON object with a
+/// `name` or `function` field whose value matches an available tool. Arguments
+/// are extracted from `arguments`/`args` sub-object or from the remaining
+/// top-level fields.
+fn recover_bare_json_tool_call(
+    content: &str,
+    tool_names: &std::collections::HashSet<&str>,
+) -> Option<ToolCall> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let obj = parsed.as_object()?;
+
+    // Extract tool name from "name" or "function" field.
+    let tool_name = obj
+        .get("name")
+        .or_else(|| obj.get("function"))
+        .and_then(|v| v.as_str())?;
+    if !tool_names.contains(tool_name) {
+        return None;
+    }
+
+    // Extract arguments: prefer "arguments"/"args" sub-object, fall back to
+    // all remaining top-level fields.
+    let arguments = if let Some(inner) = obj.get("arguments").or_else(|| obj.get("args")) {
+        inner.clone()
+    } else {
+        let mut args = serde_json::Map::new();
+        for (k, v) in obj {
+            if k != "name" && k != "function" {
+                args.insert(k.clone(), v.clone());
+            }
+        }
+        serde_json::Value::Object(args)
+    };
+
+    Some(ToolCall {
+        id: "recovered_json_0".to_string(),
+        name: tool_name.to_string(),
+        arguments,
+    })
 }
 
 /// `<tool_call>tool_list</tool_call>` or `<|tool_call|>` in the content field

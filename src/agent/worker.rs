@@ -217,18 +217,43 @@ impl Worker {
         // Build initial reasoning context (tool definitions refreshed each iteration in execution_loop)
         let mut reason_ctx = ReasoningContext::new().with_job(&job_ctx.description);
 
-        // Add system message
-        reason_ctx.messages.push(ChatMessage::system(format!(
-            r#"You are an autonomous agent working on a job.
+        // Build system prompt — workspace jobs get identity docs + context
+        let system_prompt = self.build_system_prompt(&job_ctx).await;
+        reason_ctx.messages.push(ChatMessage::system(system_prompt));
 
-Job: {}
-Description: {}
-
-You have access to tools to complete this job. Plan your approach and execute tools as needed.
-You may request multiple tools at once if they can be executed in parallel.
-Report when the job is complete or if you encounter issues you cannot resolve."#,
-            job_ctx.title, job_ctx.description
-        )));
+        // Load conversation history if this job is attached to an existing conversation
+        if let (Some(store), Some(conv_id)) = (self.store(), job_ctx.conversation_id) {
+            match store.list_conversation_messages(conv_id).await {
+                Ok(messages) => {
+                    let mut loaded = 0usize;
+                    for msg in &messages {
+                        match msg.role.as_str() {
+                            "user" => {
+                                reason_ctx.messages.push(ChatMessage::user(&msg.content));
+                                loaded += 1;
+                            }
+                            "assistant" => {
+                                reason_ctx.messages.push(ChatMessage::assistant(&msg.content));
+                                loaded += 1;
+                            }
+                            _ => {} // skip tool_calls metadata rows
+                        }
+                    }
+                    if loaded > 0 {
+                        tracing::info!(
+                            "Loaded {} prior messages for job {} from conversation {}",
+                            loaded, self.job_id, conv_id
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load conversation history for job {}: {}",
+                        self.job_id, e
+                    );
+                }
+            }
+        }
 
         // Main execution loop with timeout
         let result = tokio::time::timeout(self.timeout(), async {
@@ -490,6 +515,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                         // "not done", or "unfinished". Only the LLM's own response
                         // (not tool output) can trigger this.
                         if crate::util::llm_signals_completion(&response) {
+                            self.persist_response_to_conversation(&response).await;
                             self.mark_completed().await?;
                             return Ok(());
                         }
@@ -712,6 +738,26 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         tool_name: &str,
         params: &serde_json::Value,
     ) -> Result<String, Error> {
+        // Small models sometimes double-wrap params in an OpenAI-style envelope:
+        //   {"function": "tool_name", "arguments": {"actual": "params"}}
+        //   {"function": "tool_name", "args": {"actual": "params"}}
+        // Detect and unwrap when `function` matches the tool being called.
+        let params = if let Some(obj) = params.as_object()
+            && obj
+                .get("function")
+                .and_then(|v| v.as_str())
+                .is_some_and(|f| f == tool_name)
+            && let Some(inner) = obj.get("arguments").or_else(|| obj.get("args"))
+        {
+            tracing::debug!(
+                tool = %tool_name,
+                "Unwrapping double-wrapped arguments envelope from LLM"
+            );
+            inner
+        } else {
+            params
+        };
+
         let tool =
             deps.tools
                 .get(tool_name)
@@ -1156,6 +1202,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         reason_ctx.messages.push(ChatMessage::assistant(&response));
 
         if crate::util::llm_signals_completion(&response) {
+            self.persist_response_to_conversation(&response).await;
             self.mark_completed().await?;
         } else {
             // Job not complete — return Ok without marking terminal so the
@@ -1175,12 +1222,108 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         Ok(())
     }
 
+    /// Build the system prompt for a job.
+    ///
+    /// Workspace jobs (those with `workspace_id` in metadata) get a richer
+    /// prompt that includes identity docs (SOUL.md, USER.md, etc.) and
+    /// workspace context (topic, turn count). Non-workspace jobs get the
+    /// default autonomous agent prompt.
+    async fn build_system_prompt(&self, job_ctx: &crate::context::JobContext) -> String {
+        let is_workspace = job_ctx.metadata.get("workspace_id").is_some();
+        if !is_workspace {
+            return format!(
+                r#"You are an autonomous agent working on a job.
+
+Job: {}
+Description: {}
+
+You have access to tools to complete this job. Plan your approach and execute tools as needed.
+You may request multiple tools at once if they can be executed in parallel.
+Report when the job is complete or if you encounter issues you cannot resolve."#,
+                job_ctx.title, job_ctx.description
+            );
+        }
+
+        // Workspace job — load identity docs from the user's workspace
+        let mut parts = Vec::new();
+
+        if let Some(store) = self.store() {
+            let ws = crate::workspace::Workspace::new_with_db(
+                &job_ctx.user_id,
+                store.clone(),
+            );
+            match ws.system_prompt().await {
+                Ok(prompt) if !prompt.is_empty() => {
+                    parts.push(prompt);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        "Could not load workspace identity for job {}: {}",
+                        self.job_id, e
+                    );
+                }
+            }
+        }
+
+        // Add workspace context
+        let workspace_topic = job_ctx
+            .metadata
+            .get("workspace_topic")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(not set)");
+        let turn_count = job_ctx
+            .metadata
+            .get("workspace_turn_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        parts.push(format!(
+            r#"---
+
+## Workspace Context
+You are in a persistent workspace focused on: {workspace_topic}
+This conversation has {turn_count} prior turns. The full conversation history
+is loaded — you can reference anything discussed previously.
+
+## Current Task
+Job: {}
+Description: {}
+
+You have access to tools to complete this task. Plan your approach and execute tools as needed.
+When you finish, provide a clear summary of what was done and any decisions made."#,
+            job_ctx.title, job_ctx.description
+        ));
+
+        parts.join("\n\n")
+    }
+
     async fn execute_tool(
         &self,
         tool_name: &str,
         params: &serde_json::Value,
     ) -> Result<String, Error> {
         Self::execute_tool_inner(&self.deps, self.job_id, tool_name, params).await
+    }
+
+    /// Persist the last assistant message to the conversation in the DB.
+    ///
+    /// When a workspace job finishes, `await_job` reads the conversation for
+    /// the last assistant message. Without this, the caller gets the fallback
+    /// "Job completed successfully." text.
+    async fn persist_response_to_conversation(&self, response: &str) {
+        let conv_id = match self.context_manager().get_context(self.job_id).await {
+            Ok(ctx) => ctx.conversation_id,
+            Err(_) => None,
+        };
+        if let (Some(store), Some(conv_id)) = (self.store(), conv_id)
+            && let Err(e) = store.add_conversation_message(conv_id, "assistant", response).await
+        {
+            tracing::warn!(
+                "Failed to persist assistant response for job {}: {}",
+                self.job_id, e
+            );
+        }
     }
 
     async fn mark_completed(&self) -> Result<(), Error> {

@@ -586,6 +586,27 @@ CREATE TRIGGER IF NOT EXISTS update_structured_records_updated_at
     AFTER UPDATE ON structured_records FOR EACH ROW
     BEGIN UPDATE structured_records SET updated_at = datetime('now') WHERE id = OLD.id; END;
 
+-- ==================== Agent Workspaces ====================
+
+CREATE TABLE IF NOT EXISTS agent_workspaces (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    topic TEXT NOT NULL DEFAULT '',
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'active',
+    last_accessed TEXT NOT NULL DEFAULT (datetime('now')),
+    turn_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_workspaces_user_id ON agent_workspaces(user_id);
+CREATE INDEX IF NOT EXISTS idx_agent_workspaces_user_status ON agent_workspaces(user_id, status);
+
+CREATE TRIGGER IF NOT EXISTS update_agent_workspaces_updated_at
+    AFTER UPDATE ON agent_workspaces FOR EACH ROW
+    BEGIN UPDATE agent_workspaces SET updated_at = datetime('now') WHERE id = OLD.id; END;
+
 -- ==================== Seed data ====================
 
 -- Pre-populate leak detection patterns (matches PostgreSQL V2 migration).
