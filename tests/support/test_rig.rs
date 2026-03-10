@@ -575,6 +575,7 @@ impl TestRigBuilder {
                     Arc::clone(ws),
                     notify_tx,
                     None,
+                    None,
                 ));
                 components
                     .tools
@@ -622,6 +623,7 @@ impl TestRigBuilder {
             },
             transcription: None,
             document_extraction: None,
+            workspace_router: None,
             core_tools: Vec::new(),
         };
 
@@ -658,6 +660,7 @@ impl TestRigBuilder {
             routine_config,
             Some(Arc::clone(&components.context_manager)),
             None, // session_manager
+            None, // collection_write_tx
         );
 
         // Match main.rs: fill the scheduler slot once Agent::new has created it.

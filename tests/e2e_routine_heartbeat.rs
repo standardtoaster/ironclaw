@@ -64,6 +64,7 @@ mod tests {
                 cooldown: Duration::from_secs(0),
                 max_concurrent: 5,
                 dedup_window: None,
+                max_execution_time: None,
             },
             notify: NotifyConfig::default(),
             last_run_at: None,
@@ -109,6 +110,7 @@ mod tests {
             llm,
             ws,
             notify_tx,
+            None,
             None,
         ));
 
@@ -176,6 +178,7 @@ mod tests {
             llm,
             ws,
             notify_tx,
+            None,
             None,
         ));
 
@@ -264,6 +267,7 @@ mod tests {
             llm,
             ws,
             notify_tx,
+            None,
             None,
         ));
 

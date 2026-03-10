@@ -222,4 +222,3 @@ fn web_fetch_has_explicit_visibility_group() {
         "web_fetch should be explicitly assigned to Utility group"
     );
 }
->>>>>>> feat/tool-visibility-tiers
