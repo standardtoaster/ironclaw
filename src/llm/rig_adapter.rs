@@ -1120,6 +1120,7 @@ mod tests {
             None,
             None,
             CacheRetention::Short,
+            None,
         )
         .unwrap();
 
@@ -1143,6 +1144,7 @@ mod tests {
             None,
             None,
             CacheRetention::Long,
+            None,
         )
         .unwrap();
 
@@ -1163,6 +1165,7 @@ mod tests {
             None,
             None,
             CacheRetention::None,
+            None,
         )
         .unwrap();
 

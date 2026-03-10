@@ -419,6 +419,27 @@ mod tests {
         ) -> Result<bool, DatabaseError> {
             unimplemented!()
         }
+        async fn list_conversations_all_channels(
+            &self,
+            _user_id: &str,
+            _limit: i64,
+        ) -> Result<Vec<ConversationSummary>, DatabaseError> {
+            Ok(vec![])
+        }
+        async fn get_or_create_routine_conversation(
+            &self,
+            _routine_id: Uuid,
+            _routine_name: &str,
+            _user_id: &str,
+        ) -> Result<Uuid, DatabaseError> {
+            Ok(Uuid::new_v4())
+        }
+        async fn get_or_create_heartbeat_conversation(
+            &self,
+            _user_id: &str,
+        ) -> Result<Uuid, DatabaseError> {
+            Ok(Uuid::new_v4())
+        }
     }
 
     // -- JobStore (all stubs) --
@@ -450,6 +471,12 @@ mod tests {
         }
         async fn agent_job_summary(&self) -> Result<AgentJobSummary, DatabaseError> {
             unimplemented!()
+        }
+        async fn get_agent_job_failure_reason(
+            &self,
+            _id: Uuid,
+        ) -> Result<Option<String>, DatabaseError> {
+            Ok(None)
         }
         async fn save_action(
             &self,

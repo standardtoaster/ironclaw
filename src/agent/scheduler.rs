@@ -915,6 +915,7 @@ mod tests {
             max_actions_per_hour: None,
             max_tool_iterations: 50,
             auto_approve_tools: false,
+            default_timezone: "UTC".to_string(),
         }
     }
 
