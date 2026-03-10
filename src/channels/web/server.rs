@@ -2374,7 +2374,7 @@ async fn routines_trigger_handler(
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
 
     let run_id = engine
-        .fire_manual(routine_id, Some(&state.default_user_id))
+        .fire_manual(routine_id, Some(&user.user_id))
         .await
         .map_err(|e| {
             let status = match &e {
@@ -2615,7 +2615,7 @@ async fn webhook_fire_handler(
     });
 
     match engine
-        .fire_webhook(routine_id, &state.user_id, payload_str)
+        .fire_webhook(routine_id, &state.default_user_id, payload_str)
         .await
     {
         Ok(run_id) => Ok(Json(serde_json::json!({

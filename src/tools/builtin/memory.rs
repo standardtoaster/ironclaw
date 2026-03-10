@@ -176,7 +176,7 @@ impl Tool for MemoryWriteTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        ctx: &JobContext,
+        _ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 

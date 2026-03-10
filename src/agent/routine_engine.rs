@@ -374,6 +374,9 @@ impl RoutineEngine {
             notify_tx: self.notify_tx.clone(),
             running_count: self.running_count.clone(),
             scheduler: self.scheduler.clone(),
+            tool_registry: self.tool_registry.clone(),
+            gateway_port: self.gateway_port,
+            user_token: self.gateway_auth_token.clone(),
         };
 
         tokio::spawn(async move {
