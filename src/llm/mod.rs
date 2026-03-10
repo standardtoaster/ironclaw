@@ -343,7 +343,7 @@ fn create_ollama_from_registry(
 ///
 /// Builds a minimal `LlmConfig` for the tier's backend and delegates to `create_llm_provider`.
 /// Only supports backends that don't require session auth (Ollama, OpenAI-compatible, OpenAI, Anthropic).
-fn create_tier_provider(
+async fn create_tier_provider(
     tier: &TierConfig,
     session: Arc<SessionManager>,
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
@@ -388,7 +388,7 @@ fn create_tier_provider(
             request_timeout_secs: 120,
             routing_tiers: Vec::new(),
         };
-        return create_llm_provider(&config, session);
+        return create_llm_provider(&config, session).await;
     }
 
     // All other backends use the registry provider path.
@@ -429,7 +429,7 @@ fn create_tier_provider(
         routing_tiers: Vec::new(),
     };
 
-    create_llm_provider(&config, session)
+    create_llm_provider(&config, session).await
 }
 
 /// Create a cheap/fast LLM provider for lightweight tasks (heartbeat, routing, evaluation).
@@ -511,7 +511,7 @@ pub async fn build_provider_chain(
         // N-tier routing from LLM_ROUTING_TIERS config
         let mut tier_providers: Vec<Arc<dyn LlmProvider>> = Vec::new();
         for tier in &config.routing_tiers {
-            let provider = create_tier_provider(tier, session.clone())?;
+            let provider = create_tier_provider(tier, session.clone()).await?;
             let provider: Arc<dyn LlmProvider> = if retry_config.max_retries > 0 {
                 Arc::new(RetryProvider::new(provider, retry_config.clone()))
             } else {

@@ -356,12 +356,14 @@ static RE_DOMAIN_DEFAULT: LazyLock<Regex> =
 // ---------------------------------------------------------------------------
 
 /// A compiled pattern override entry.
+#[allow(dead_code)]
 struct PatternOverride {
     regex: Regex,
     tier: Tier,
 }
 
 /// Default pattern overrides, compiled once.
+#[allow(dead_code)]
 static DEFAULT_OVERRIDES: LazyLock<Vec<PatternOverride>> = LazyLock::new(|| {
     vec![
         // Flash tier: greetings and acknowledgments
@@ -894,8 +896,10 @@ pub struct SmartRoutingProvider {
     /// Pluggable classifier that picks a starting tier.
     classifier: Arc<dyn MessageClassifier>,
     config: SmartRoutingConfig,
+    #[allow(dead_code)]
     scorer_config: ScorerConfig,
     /// Pre-compiled domain regex (built once at construction time).
+    #[allow(dead_code)]
     domain_regex: Regex,
     stats: SmartRoutingStats,
 }
@@ -969,6 +973,7 @@ impl SmartRoutingProvider {
     /// Classify the complexity of a request based on its last user message.
     ///
     /// Priority: explicit tier hints > pattern overrides > 13-dimension scorer.
+    #[allow(dead_code)]
     fn classify(&self, request: &CompletionRequest) -> TaskComplexity {
         let last_user_msg = request
             .messages
@@ -1323,7 +1328,7 @@ impl LlmProvider for SmartRoutingProvider {
     }
 
     fn effective_model_name(&self, requested_model: Option<&str>) -> String {
-        self.primary.effective_model_name(requested_model)
+        self.primary().effective_model_name(requested_model)
     }
 
     fn active_model_name(&self) -> String {
