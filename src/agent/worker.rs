@@ -310,6 +310,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         let mut consecutive_tool_intent_nudges: u32 = 0;
 
         // Initial tool definitions for planning (will be refreshed in loop)
+        // TODO: Apply core_tool_definitions() filtering here once workers support core_tools
         reason_ctx.available_tools = self.tools().tool_definitions().await;
 
         // Generate plan if planning is enabled
@@ -422,6 +423,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             }
 
             // Refresh tool definitions so newly built tools become visible
+            // TODO: Apply core_tool_definitions() filtering here once workers support core_tools
             reason_ctx.available_tools = self.tools().tool_definitions().await;
 
             // Select next tool(s) to use, with rate-limit retry.

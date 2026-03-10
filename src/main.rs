@@ -702,6 +702,7 @@ async fn async_main() -> anyhow::Result<()> {
         document_extraction: Some(Arc::new(
             ironclaw::document_extraction::DocumentExtractionMiddleware::new(),
         )),
+        core_tools: config.core_tools.clone(),
     };
 
     let mut agent = Agent::new(

@@ -81,6 +81,10 @@ pub struct AgentDeps {
     pub transcription: Option<Arc<crate::transcription::TranscriptionMiddleware>>,
     /// Document text extraction middleware for PDF, DOCX, PPTX, etc.
     pub document_extraction: Option<Arc<crate::document_extraction::DocumentExtractionMiddleware>>,
+    /// Tool names that are always included in LLM context.
+    /// When non-empty, only core + discovered tools are sent to the LLM.
+    /// Empty = backward compatible (all tools sent).
+    pub core_tools: Vec<String>,
 }
 
 /// The main agent that coordinates all components.

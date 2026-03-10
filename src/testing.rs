@@ -453,6 +453,7 @@ impl TestHarnessBuilder {
             http_interceptor: None,
             transcription: None,
             document_extraction: None,
+            core_tools: Vec::new(),
         };
 
         TestHarness {
