@@ -54,7 +54,11 @@ pub use response_cache::{CachedProvider, ResponseCacheConfig};
 pub use retry::{RetryConfig, RetryProvider};
 pub use rig_adapter::RigAdapter;
 pub use session::{SessionConfig, SessionManager, create_session_manager};
-pub use smart_routing::{SmartRoutingConfig, SmartRoutingProvider, TaskComplexity};
+pub use smart_routing::{
+    CascadeConfig, DefaultClassifier, MessageClassifier, RoutingOperation, SkillAwareClassifier,
+    SkillRoutingHint, SmartRoutingConfig, SmartRoutingProvider, SmartRoutingSnapshot,
+    TaskComplexity, META_ROUTING_OPERATION, META_ROUTING_SKILL_HINTS,
+};
 
 use std::sync::Arc;
 
@@ -63,6 +67,8 @@ use secrecy::ExposeSecret;
 
 // LlmConfig, NearAiConfig, RegistryProviderConfig, and LlmError are
 // re-exported via `pub use` above from config and error submodules.
+
+use crate::config::{LlmBackend, TierConfig};
 
 /// Create an LLM provider based on configuration.
 ///
@@ -333,6 +339,99 @@ fn create_ollama_from_registry(
     Ok(Arc::new(adapter))
 }
 
+/// Create an LLM provider from a `TierConfig` (N-tier routing).
+///
+/// Builds a minimal `LlmConfig` for the tier's backend and delegates to `create_llm_provider`.
+/// Only supports backends that don't require session auth (Ollama, OpenAI-compatible, OpenAI, Anthropic).
+fn create_tier_provider(
+    tier: &TierConfig,
+    session: Arc<SessionManager>,
+) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    let backend_str = tier.backend.to_string();
+
+    // Look up the provider's protocol and defaults from the registry.
+    let registry = crate::llm::registry::ProviderRegistry::load();
+    let def = registry.find(&backend_str);
+
+    // Determine protocol from the registry, falling back to sensible defaults.
+    let protocol = def
+        .map(|d| d.protocol)
+        .unwrap_or(crate::llm::registry::ProviderProtocol::OpenAiCompletions);
+
+    let default_base_url = def.and_then(|d| d.default_base_url.clone()).unwrap_or_default();
+
+    // Build a minimal LlmConfig for this tier.
+    if tier.backend == LlmBackend::NearAi {
+        // NearAi tier uses session auth via the NearAiConfig path.
+        let nearai = NearAiConfig {
+            model: tier.model.clone(),
+            cheap_model: None,
+            base_url: tier.base_url.clone().unwrap_or_default(),
+            api_key: tier.api_key.clone(),
+            fallback_model: None,
+            max_retries: 0,
+            circuit_breaker_threshold: None,
+            circuit_breaker_recovery_secs: 30,
+            response_cache_enabled: false,
+            response_cache_ttl_secs: 3600,
+            response_cache_max_entries: 1000,
+            failover_cooldown_secs: 300,
+            failover_cooldown_threshold: 3,
+            smart_routing_cascade: false,
+        };
+        let config = LlmConfig {
+            backend: "nearai".to_string(),
+            session: SessionConfig::default(),
+            nearai,
+            provider: None,
+            bedrock: None,
+            request_timeout_secs: 120,
+            routing_tiers: Vec::new(),
+        };
+        return create_llm_provider(&config, session);
+    }
+
+    // All other backends use the registry provider path.
+    let reg_config = RegistryProviderConfig {
+        protocol,
+        provider_id: backend_str.clone(),
+        api_key: tier.api_key.clone(),
+        base_url: tier.base_url.clone().unwrap_or(default_base_url),
+        model: tier.model.clone(),
+        extra_headers: Vec::new(),
+        oauth_token: None,
+        cache_retention: CacheRetention::default(),
+        unsupported_params: def.map(|d| d.unsupported_params.clone()).unwrap_or_default(),
+    };
+
+    let config = LlmConfig {
+        backend: backend_str,
+        session: SessionConfig::default(),
+        nearai: NearAiConfig {
+            model: String::new(),
+            cheap_model: None,
+            base_url: String::new(),
+            api_key: None,
+            fallback_model: None,
+            max_retries: 0,
+            circuit_breaker_threshold: None,
+            circuit_breaker_recovery_secs: 30,
+            response_cache_enabled: false,
+            response_cache_ttl_secs: 3600,
+            response_cache_max_entries: 1000,
+            failover_cooldown_secs: 300,
+            failover_cooldown_threshold: 3,
+            smart_routing_cascade: false,
+        },
+        provider: Some(reg_config),
+        bedrock: None,
+        request_timeout_secs: 120,
+        routing_tiers: Vec::new(),
+    };
+
+    create_llm_provider(&config, session)
+}
+
 /// Create a cheap/fast LLM provider for lightweight tasks (heartbeat, routing, evaluation).
 ///
 /// Uses `NEARAI_CHEAP_MODEL` if set, otherwise falls back to the main provider.
@@ -407,8 +506,39 @@ pub async fn build_provider_chain(
         llm
     };
 
-    // 2. Smart routing (cheap/primary split)
-    let llm: Arc<dyn LlmProvider> = if let Some(ref cheap_model) = config.nearai.cheap_model {
+    // 2. Smart routing
+    let llm: Arc<dyn LlmProvider> = if !config.routing_tiers.is_empty() {
+        // N-tier routing from LLM_ROUTING_TIERS config
+        let mut tier_providers: Vec<Arc<dyn LlmProvider>> = Vec::new();
+        for tier in &config.routing_tiers {
+            let provider = create_tier_provider(tier, session.clone())?;
+            let provider: Arc<dyn LlmProvider> = if retry_config.max_retries > 0 {
+                Arc::new(RetryProvider::new(provider, retry_config.clone()))
+            } else {
+                provider
+            };
+            tracing::info!(
+                tier = %tier.name,
+                backend = %tier.backend,
+                model = %tier.model,
+                "Routing tier initialized"
+            );
+            tier_providers.push(provider);
+        }
+        tracing::info!(
+            num_tiers = tier_providers.len(),
+            "N-tier smart routing enabled"
+        );
+        Arc::new(SmartRoutingProvider::tiered(
+            tier_providers,
+            Arc::new(SkillAwareClassifier),
+            SmartRoutingConfig {
+                cascade_enabled: config.nearai.smart_routing_cascade,
+                ..SmartRoutingConfig::default()
+            },
+        ))
+    } else if let Some(ref cheap_model) = config.nearai.cheap_model {
+        // Backward-compatible 2-tier routing from NEARAI_CHEAP_MODEL
         let mut cheap_config = config.nearai.clone();
         cheap_config.model = cheap_model.clone();
         let cheap = create_llm_provider_with_config(
@@ -424,7 +554,7 @@ pub async fn build_provider_chain(
         tracing::info!(
             primary = %llm.model_name(),
             cheap = %cheap.model_name(),
-            "Smart routing enabled"
+            "Smart routing enabled (2-tier)"
         );
         Arc::new(SmartRoutingProvider::new(
             llm,
@@ -722,6 +852,7 @@ mod tests {
             provider: None,
             bedrock: None,
             request_timeout_secs: 120,
+            routing_tiers: Vec::new(),
         }
     }
 

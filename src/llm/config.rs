@@ -129,6 +129,9 @@ pub struct LlmConfig {
     /// Default: 120. Increase for local LLMs (Ollama, vLLM, LM Studio) that
     /// need more time for prompt evaluation on consumer hardware.
     pub request_timeout_secs: u64,
+    /// N-tier routing tiers (populated when `LLM_ROUTING_TIERS` is set).
+    /// Ordered cheapest-first. Empty vec means N-tier routing is not configured.
+    pub routing_tiers: Vec<crate::config::TierConfig>,
 }
 
 /// NEAR AI configuration.

@@ -10,6 +10,24 @@ use crate::llm::registry::{ProviderProtocol, ProviderRegistry};
 use crate::llm::session::SessionConfig;
 use crate::settings::Settings;
 
+/// Per-tier configuration for N-tier model routing.
+///
+/// Each tier represents a backend+model combination ordered by cost (cheapest first).
+/// Parsed from `LLM_ROUTING_TIERS` + per-tier env vars.
+#[derive(Debug, Clone)]
+pub struct TierConfig {
+    /// Tier name (e.g., "local", "standard", "premium").
+    pub name: String,
+    /// Which backend to use for this tier.
+    pub backend: LlmBackend,
+    /// Model identifier.
+    pub model: String,
+    /// Optional base URL override.
+    pub base_url: Option<String>,
+    /// Optional API key.
+    pub api_key: Option<SecretString>,
+}
+
 /// Which LLM backend to use. Configurable per-user via `GATEWAY_USER_TOKENS`.
 ///
 /// Users can override with `LLM_BACKEND` env var to use their own API keys.
@@ -91,6 +109,7 @@ impl LlmConfig {
             provider: None,
             bedrock: None,
             request_timeout_secs: 120,
+            routing_tiers: Vec::new(),
         }
     }
 
@@ -221,6 +240,9 @@ impl LlmConfig {
 
         let request_timeout_secs = parse_optional_env("LLM_REQUEST_TIMEOUT_SECS", 120)?;
 
+        // N-tier routing: LLM_ROUTING_TIERS=local,standard,premium
+        let routing_tiers = parse_routing_tiers()?;
+
         Ok(Self {
             backend: if is_nearai {
                 "nearai".to_string()
@@ -236,6 +258,7 @@ impl LlmConfig {
             provider,
             bedrock,
             request_timeout_secs,
+            routing_tiers,
         })
     }
 
@@ -396,6 +419,66 @@ impl LlmConfig {
             unsupported_params,
         })
     }
+}
+
+/// Parse N-tier routing config from env vars.
+///
+/// Format:
+/// ```text
+/// LLM_ROUTING_TIERS=local,standard,premium
+/// LLM_TIER_LOCAL_BACKEND=ollama
+/// LLM_TIER_LOCAL_MODEL=llama3.1:8b
+/// LLM_TIER_STANDARD_BACKEND=openai_compatible
+/// LLM_TIER_STANDARD_MODEL=openai/gpt-4o-mini
+/// LLM_TIER_STANDARD_BASE_URL=https://openrouter.ai/api/v1
+/// LLM_TIER_STANDARD_API_KEY=sk-or-...
+/// ```
+fn parse_routing_tiers() -> Result<Vec<TierConfig>, ConfigError> {
+    let Some(tiers_str) = optional_env("LLM_ROUTING_TIERS")? else {
+        return Ok(Vec::new());
+    };
+
+    let tier_names: Vec<&str> = tiers_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if tier_names.len() < 2 {
+        return Err(ConfigError::InvalidValue {
+            key: "LLM_ROUTING_TIERS".to_string(),
+            message: "at least 2 tiers are required for N-tier routing".to_string(),
+        });
+    }
+
+    let mut tiers = Vec::with_capacity(tier_names.len());
+    for name in tier_names {
+        let prefix = format!("LLM_TIER_{}", name.to_uppercase());
+
+        let backend_key = format!("{prefix}_BACKEND");
+        let backend_str = optional_env(&backend_key)?.ok_or_else(|| ConfigError::MissingRequired {
+            key: backend_key.clone(),
+            hint: format!("Each tier in LLM_ROUTING_TIERS needs {prefix}_BACKEND"),
+        })?;
+        let backend: LlmBackend = backend_str.parse().map_err(|e| ConfigError::InvalidValue {
+            key: backend_key,
+            message: e,
+        })?;
+
+        let model_key = format!("{prefix}_MODEL");
+        let model = optional_env(&model_key)?.ok_or_else(|| ConfigError::MissingRequired {
+            key: model_key,
+            hint: format!("Each tier in LLM_ROUTING_TIERS needs {prefix}_MODEL"),
+        })?;
+
+        let base_url = optional_env(&format!("{prefix}_BASE_URL"))?;
+        let api_key = optional_env(&format!("{prefix}_API_KEY"))?.map(SecretString::from);
+
+        tiers.push(TierConfig {
+            name: name.to_string(),
+            backend,
+            model,
+            base_url,
+            api_key,
+        });
+    }
+
+    Ok(tiers)
 }
 
 /// Parse `LLM_EXTRA_HEADERS` value into a list of (key, value) pairs.
@@ -559,6 +642,115 @@ mod tests {
                 ("X-Title".to_string(), "MyApp".to_string()),
             ]
         );
+    }
+
+    /// Clear all routing tier env vars.
+    fn clear_routing_tier_env() {
+        // SAFETY: Only called under ENV_MUTEX in tests.
+        unsafe {
+            std::env::remove_var("LLM_ROUTING_TIERS");
+            for name in ["LOCAL", "STANDARD", "PREMIUM"] {
+                std::env::remove_var(format!("LLM_TIER_{name}_BACKEND"));
+                std::env::remove_var(format!("LLM_TIER_{name}_MODEL"));
+                std::env::remove_var(format!("LLM_TIER_{name}_BASE_URL"));
+                std::env::remove_var(format!("LLM_TIER_{name}_API_KEY"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_routing_tiers_not_set_returns_empty() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_routing_tier_env();
+
+        let tiers = parse_routing_tiers().expect("should succeed");
+        assert!(tiers.is_empty());
+    }
+
+    #[test]
+    fn test_routing_tiers_single_tier_rejected() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_routing_tier_env();
+        unsafe {
+            std::env::set_var("LLM_ROUTING_TIERS", "local");
+            std::env::set_var("LLM_TIER_LOCAL_BACKEND", "ollama");
+            std::env::set_var("LLM_TIER_LOCAL_MODEL", "llama3.1:8b");
+        }
+
+        let result = parse_routing_tiers();
+        assert!(result.is_err());
+
+        clear_routing_tier_env();
+    }
+
+    #[test]
+    fn test_routing_tiers_two_tiers_parsed() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_routing_tier_env();
+        unsafe {
+            std::env::set_var("LLM_ROUTING_TIERS", "local,standard");
+            std::env::set_var("LLM_TIER_LOCAL_BACKEND", "ollama");
+            std::env::set_var("LLM_TIER_LOCAL_MODEL", "llama3.1:8b");
+            std::env::set_var("LLM_TIER_STANDARD_BACKEND", "openai_compatible");
+            std::env::set_var("LLM_TIER_STANDARD_MODEL", "openai/gpt-4o-mini");
+            std::env::set_var("LLM_TIER_STANDARD_BASE_URL", "https://openrouter.ai/api/v1");
+            std::env::set_var("LLM_TIER_STANDARD_API_KEY", "sk-or-test");
+        }
+
+        let tiers = parse_routing_tiers().expect("should succeed");
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0].name, "local");
+        assert_eq!(tiers[0].backend, LlmBackend::Ollama);
+        assert_eq!(tiers[0].model, "llama3.1:8b");
+        assert!(tiers[0].api_key.is_none());
+        assert_eq!(tiers[1].name, "standard");
+        assert_eq!(tiers[1].backend, LlmBackend::OpenAiCompatible);
+        assert_eq!(tiers[1].model, "openai/gpt-4o-mini");
+        assert!(tiers[1].api_key.is_some());
+
+        clear_routing_tier_env();
+    }
+
+    #[test]
+    fn test_routing_tiers_missing_backend_errors() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_routing_tier_env();
+        unsafe {
+            std::env::set_var("LLM_ROUTING_TIERS", "local,standard");
+            std::env::set_var("LLM_TIER_LOCAL_BACKEND", "ollama");
+            std::env::set_var("LLM_TIER_LOCAL_MODEL", "llama3.1:8b");
+            // Missing STANDARD backend/model
+        }
+
+        let result = parse_routing_tiers();
+        assert!(result.is_err());
+
+        clear_routing_tier_env();
+    }
+
+    #[test]
+    fn test_routing_tiers_three_tiers_parsed() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_routing_tier_env();
+        unsafe {
+            std::env::set_var("LLM_ROUTING_TIERS", "local, standard, premium");
+            std::env::set_var("LLM_TIER_LOCAL_BACKEND", "ollama");
+            std::env::set_var("LLM_TIER_LOCAL_MODEL", "llama3.1:8b");
+            std::env::set_var("LLM_TIER_STANDARD_BACKEND", "openai_compatible");
+            std::env::set_var("LLM_TIER_STANDARD_MODEL", "openai/gpt-4o-mini");
+            std::env::set_var("LLM_TIER_STANDARD_BASE_URL", "https://openrouter.ai/api/v1");
+            std::env::set_var("LLM_TIER_PREMIUM_BACKEND", "openai_compatible");
+            std::env::set_var("LLM_TIER_PREMIUM_MODEL", "anthropic/claude-sonnet-4");
+            std::env::set_var("LLM_TIER_PREMIUM_BASE_URL", "https://openrouter.ai/api/v1");
+        }
+
+        let tiers = parse_routing_tiers().expect("should succeed");
+        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers[0].name, "local");
+        assert_eq!(tiers[1].name, "standard");
+        assert_eq!(tiers[2].name, "premium");
+
+        clear_routing_tier_env();
     }
 
     /// Clear all ollama-related env vars.
