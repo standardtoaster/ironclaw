@@ -483,6 +483,79 @@ impl ToolRegistry {
         }
     }
 
+    /// Generate a capability manifest — a lightweight text summary of all
+    /// registered tools grouped by category. For injection into the system
+    /// prompt so the LLM knows what's discoverable.
+    pub async fn capability_manifest(&self, core_names: &[String]) -> String {
+        if core_names.is_empty() {
+            return String::new(); // No manifest needed when all tools are sent
+        }
+
+        let tools = self.tools.read().await;
+        let discovered = self.discovered_tools.read().await;
+
+        // Collect non-core, non-discovered tools (the discoverable ones)
+        let mut discoverable: Vec<(&str, &str)> = tools
+            .values()
+            .filter(|t| {
+                !core_names.iter().any(|c| c == t.name())
+                    && !discovered.contains(t.name())
+            })
+            .map(|t| (t.name(), t.description()))
+            .collect();
+        discoverable.sort_by_key(|(name, _)| *name);
+
+        if discoverable.is_empty() {
+            return String::new();
+        }
+
+        // Group by prefix (e.g., "grocery_items_add" → "grocery_items")
+        // Tools without a collection prefix go under "other"
+        let mut groups: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+
+        for (name, desc) in &discoverable {
+            let parts: Vec<&str> = name.splitn(3, '_').collect();
+            let group = if parts.len() >= 3 {
+                format!("{}_{}", parts[0], parts[1])
+            } else {
+                "other".to_string()
+            };
+
+            // Safe truncation for description (char-safe, not byte-based)
+            let short_desc: String = desc.chars().take(80).collect();
+            let short_desc = if desc.chars().count() > 80 {
+                format!("{short_desc}...")
+            } else {
+                short_desc
+            };
+            groups
+                .entry(group)
+                .or_default()
+                .push(format!("{name}: {short_desc}"));
+        }
+
+        let mut manifest = String::from(
+            "Discoverable tools (use discover_tools to load):\n",
+        );
+        for (group, tools_in_group) in &groups {
+            if tools_in_group.len() > 3 {
+                // Collection-style group — summarize
+                let first_name = tools_in_group[0].split(':').next().unwrap_or("");
+                manifest.push_str(&format!(
+                    "  {group}: {} tools (e.g., {first_name}, ...)\n",
+                    tools_in_group.len(),
+                ));
+            } else {
+                for tool_line in tools_in_group {
+                    manifest.push_str(&format!("  {tool_line}\n"));
+                }
+            }
+        }
+
+        manifest
+    }
+
     /// Register the discover_tools meta-tool. Must be called after
     /// the registry is wrapped in Arc.
     pub async fn register_discover_tools(self: &Arc<Self>) {
@@ -809,7 +882,7 @@ impl std::fmt::Debug for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::registry::EchoTool;
+    use crate::tools::registry::{EchoTool, TimeTool};
 
     #[tokio::test]
     async fn test_register_and_get() {
@@ -1018,6 +1091,50 @@ mod tests {
         // no match
         let results = registry.search_tools("nonexistent").await;
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_capability_manifest_empty_when_no_core() {
+        let registry = ToolRegistry::new();
+        let manifest = registry.capability_manifest(&[]).await;
+        assert!(manifest.is_empty(), "No manifest when core_tools is empty");
+    }
+
+    #[tokio::test]
+    async fn test_capability_manifest_lists_non_core_tools() {
+        let registry = ToolRegistry::new();
+        // Register some tools
+        registry.register_sync(Arc::new(EchoTool));
+        registry.register_sync(Arc::new(TimeTool));
+
+        let core = vec!["time".to_string()];
+        let manifest = registry.capability_manifest(&core).await;
+        // echo is not core, so it should be in the manifest
+        assert!(
+            manifest.contains("echo"),
+            "Non-core tool should be in manifest"
+        );
+        // time is core, so it should NOT be in the manifest
+        assert!(
+            !manifest.contains("time:"),
+            "Core tool should not be in manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_capability_manifest_excludes_discovered() {
+        let registry = ToolRegistry::new();
+        registry.register_sync(Arc::new(EchoTool));
+        registry.register_sync(Arc::new(TimeTool));
+
+        let core = vec!["time".to_string()];
+        // Mark echo as discovered — it should NOT appear in manifest
+        registry.mark_discovered("echo").await;
+        let manifest = registry.capability_manifest(&core).await;
+        assert!(
+            !manifest.contains("echo"),
+            "Discovered tool should not be in manifest"
+        );
     }
 
     #[tokio::test]
