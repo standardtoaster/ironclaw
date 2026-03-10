@@ -74,6 +74,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "image_generate",
     "image_edit",
     "image_analyze",
+    "discover_tools",
 ];
 
 /// Registry of available tools.
@@ -480,6 +481,22 @@ impl ToolRegistry {
         if let Some(tool) = self.message_tool.read().await.as_ref() {
             tool.set_context(channel, target).await;
         }
+    }
+
+    /// Register the discover_tools meta-tool. Must be called after
+    /// the registry is wrapped in Arc.
+    pub async fn register_discover_tools(self: &Arc<Self>) {
+        use crate::tools::builtin::DiscoverToolsTool;
+        let tool = DiscoverToolsTool::new(Arc::clone(self));
+        let name = "discover_tools".to_string();
+        self.tools
+            .write()
+            .await
+            .insert(name.clone(), Arc::new(tool) as Arc<dyn Tool>);
+        if let Ok(mut builtins) = self.builtin_names.try_write() {
+            builtins.insert(name);
+        }
+        tracing::info!("Registered discover_tools meta-tool");
     }
 
     /// Mark a tool as discovered (loaded for this session).
