@@ -113,7 +113,6 @@ impl LlmConfig {
         }
     }
 
-impl LlmConfig {
     /// Resolve a model name from env var → settings.selected_model → hardcoded default.
     fn resolve_model(
         env_var: &str,

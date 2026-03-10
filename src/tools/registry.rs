@@ -21,7 +21,7 @@ use crate::tools::builtin::{
     MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, SearchWorkspaceHistoryTool,
     SetWorkspaceTopicTool, ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool,
     SkillSearchTool, TimeTool, ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool,
-    ToolRemoveTool, ToolSearchTool, ToolUpgradeTool, WebFetchTool, WorkspaceSummaryTool,
+    ToolRemoveTool, ToolSearchTool, ToolUpgradeTool, WorkspaceSummaryTool,
     WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;

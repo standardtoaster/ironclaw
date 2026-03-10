@@ -133,16 +133,7 @@ impl<M: CompletionModel> RigAdapter<M> {
         }
         if self.unsupported_params.contains("max_tokens") {
             req.max_tokens = None;
-=======
-            additional_params: None,
->>>>>>> feat/workspaces
         }
-    }
-
-    /// Set additional params to inject into every request.
-    pub fn with_additional_params(mut self, params: JsonValue) -> Self {
-        self.additional_params = Some(params);
-        self
     }
 }
 
