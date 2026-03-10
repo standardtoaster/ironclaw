@@ -57,6 +57,9 @@ impl Agent {
         }
 
         // Load history from DB (may be empty for a newly created thread).
+        // Cap to the last N messages for context window efficiency.
+        const MAX_HYDRATION_MESSAGES: usize = 20;
+
         let mut chat_messages: Vec<ChatMessage> = Vec::new();
         let msg_count;
 
@@ -65,8 +68,27 @@ impl Agent {
                 .list_conversation_messages(thread_uuid)
                 .await
                 .unwrap_or_default();
-            msg_count = db_messages.len();
-            chat_messages = rebuild_chat_messages_from_db(&db_messages);
+            let total_count = db_messages.len();
+            msg_count = total_count;
+
+            let db_messages_for_rebuild = if total_count > MAX_HYDRATION_MESSAGES {
+                db_messages[total_count - MAX_HYDRATION_MESSAGES..].to_vec()
+            } else {
+                db_messages
+            };
+            chat_messages = rebuild_chat_messages_from_db(&db_messages_for_rebuild);
+
+            if total_count > MAX_HYDRATION_MESSAGES {
+                let truncated = total_count - MAX_HYDRATION_MESSAGES;
+                chat_messages.insert(
+                    0,
+                    ChatMessage::system(format!(
+                        "[This workspace has {} earlier messages not shown. \
+                         Use search_workspace_history to find specific details.]",
+                        truncated
+                    )),
+                );
+            }
         } else {
             msg_count = 0;
         }

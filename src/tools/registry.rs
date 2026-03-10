@@ -15,7 +15,8 @@ use crate::skills::catalog::SkillCatalog;
 use crate::skills::registry::SkillRegistry;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
 use crate::tools::builtin::{
-    ApplyPatchTool, CancelJobTool, CreateJobTool, DelegateToWorkspaceTool, EchoTool,
+    ApplyPatchTool, CancelJobTool, CreateJobTool, CreateWorkspaceTool,
+    DelegateToWorkspaceTool, EchoTool,
     ExtensionInfoTool, HttpTool, JobEventsTool, JobPromptTool, JobStatusTool, JsonTool,
     ListDirTool, ListJobsTool, ListWorkspacesTool, MemoryReadTool, MemorySearchTool,
     MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, SearchWorkspaceHistoryTool,
@@ -80,6 +81,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "collections_list",
     "collections_register",
     "collections_drop",
+    "create_workspace",
     "delegate_to_workspace",
     "discover_tools",
     "list_workspaces",
@@ -479,6 +481,9 @@ impl ToolRegistry {
         embedder: Arc<dyn crate::workspace::EmbeddingProvider>,
         queue: Arc<crate::agent::workspace_queue::WorkspaceQueueManager>,
     ) {
+        self.register_sync(Arc::new(CreateWorkspaceTool::new(
+            Arc::clone(&router), db.clone(),
+        )));
         self.register_sync(Arc::new(DelegateToWorkspaceTool::new(
             router, scheduler, db.clone(), queue,
         )));

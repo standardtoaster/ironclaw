@@ -179,6 +179,7 @@ impl SseManager {
                     SseEvent::Heartbeat => "heartbeat",
                     SseEvent::ImageGenerated { .. } => "image_generated",
                     SseEvent::ExtensionStatus { .. } => "extension_status",
+                    SseEvent::WorkspaceRouted { .. } => "workspace_routed",
                 };
                 Ok(Event::default().event(event_type).data(data))
             });

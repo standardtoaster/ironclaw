@@ -54,11 +54,11 @@ impl Tool for DelegateToWorkspaceTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a task or question to a persistent workspace. Use this for complex, \
-         domain-specific, or multi-step work that benefits from dedicated context and \
-         conversation history. Simple factual questions should be answered directly \
-         without delegation. The workspace retains memory across calls, so follow-up \
-         tasks on the same topic will automatically resume in the same workspace."
+        "Delegate a task to a workspace sub-agent for autonomous execution. Use this \
+         only for complex, multi-step work that needs a dedicated worker (e.g. long \
+         research tasks, code generation). For simply creating a new topic workspace, \
+         use create_workspace instead. The workspace retains memory across calls, so \
+         follow-up tasks on the same topic will automatically resume in the same workspace."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

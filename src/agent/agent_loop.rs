@@ -73,8 +73,8 @@ pub struct AgentDeps {
     pub hooks: Arc<HookRegistry>,
     /// Cost enforcement guardrails (daily budget, hourly rate limits).
     pub cost_guard: Arc<crate::agent::cost_guard::CostGuard>,
-    /// SSE broadcast sender for live job event streaming to the web gateway.
-    pub sse_tx: Option<tokio::sync::broadcast::Sender<crate::channels::web::types::SseEvent>>,
+    /// SSE broadcast manager for live job event streaming to the web gateway.
+    pub sse_tx: Option<Arc<crate::channels::web::sse::SseManager>>,
     /// HTTP interceptor for trace recording/replay.
     pub http_interceptor: Option<Arc<dyn crate::llm::recording::HttpInterceptor>>,
     /// Audio transcription middleware for voice messages.
@@ -144,8 +144,11 @@ impl Agent {
             deps.store.clone(),
             deps.hooks.clone(),
         );
-        if let Some(ref tx) = deps.sse_tx {
-            scheduler.set_sse_sender(tx.clone());
+        if let Some(ref sse) = deps.sse_tx {
+            scheduler.set_sse_sender(Arc::clone(sse));
+        }
+        if !deps.core_tools.is_empty() {
+            scheduler.set_core_tools(deps.core_tools.clone());
         }
         if let Some(ref interceptor) = deps.http_interceptor {
             scheduler.set_http_interceptor(Arc::clone(interceptor));
@@ -196,6 +199,47 @@ impl Agent {
 
     pub(super) fn store(&self) -> Option<&Arc<dyn Database>> {
         self.deps.store.as_ref()
+    }
+
+    /// Get or create the default "general" workspace for a user.
+    ///
+    /// Returns the existing workspace if one with topic "general" already exists,
+    /// otherwise creates a new one with an embedding for general conversation.
+    async fn get_or_create_default_workspace(
+        &self,
+        user_id: &str,
+        router: &crate::agent::workspace_router::WorkspaceRouter,
+        store: &Arc<dyn Database>,
+    ) -> Result<Option<crate::db::AgentWorkspace>, Error> {
+        // Check for existing default workspace
+        let workspaces = store.list_agent_workspaces(user_id, Some("active")).await?;
+        if let Some(existing) = workspaces.iter().find(|ws| ws.topic == "general") {
+            return Ok(Some(existing.clone()));
+        }
+
+        // Create new default workspace
+        let conversation_id = store
+            .create_conversation("workspace", user_id, None)
+            .await?;
+        let ws = store
+            .create_agent_workspace(user_id, conversation_id)
+            .await?;
+
+        let embedding = router
+            .embed("general conversation and miscellaneous topics")
+            .await
+            .map_err(|e| {
+                crate::error::DatabaseError::Query(format!("embed failed: {e}"))
+            })?;
+        store
+            .update_agent_workspace_topic(ws.id, "general", &embedding)
+            .await?;
+
+        tracing::info!(workspace_id = %ws.id, "Created default 'general' workspace");
+
+        // Re-fetch the workspace to get the updated topic
+        let workspaces = store.list_agent_workspaces(user_id, Some("active")).await?;
+        Ok(workspaces.into_iter().find(|w| w.id == ws.id))
     }
 
     pub(super) fn llm(&self) -> &Arc<dyn LlmProvider> {
@@ -610,7 +654,7 @@ impl Agent {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            match self.handle_message(&message).await {
+            match self.handle_message(&mut message).await {
                 Ok(Some(response)) if !response.is_empty() && !suppress => {
                     // Hook: BeforeOutbound — allow hooks to modify or suppress outbound
                     let event = crate::hooks::HookEvent::Outbound {
@@ -782,7 +826,7 @@ impl Agent {
         }
     }
 
-    async fn handle_message(&self, message: &IncomingMessage) -> Result<Option<String>, Error> {
+    async fn handle_message(&self, message: &mut IncomingMessage) -> Result<Option<String>, Error> {
         // Set message tool context for this turn (current channel and target)
         // For Signal, use signal_target from metadata (group:ID or phone number),
         // otherwise fall back to user_id
@@ -839,19 +883,67 @@ impl Agent {
             && let Submission::UserInput { ref content } = submission
         {
             match router.route(&message.user_id, content).await {
-                Ok(Some(ws)) => {
+                Ok(Some(ws)) if ws.topic != "general" => {
                     tracing::info!(
                         "Workspace routing: matched workspace {} (topic: {})",
                         ws.id, ws.topic
                     );
                     routed_thread_id = Some(ws.conversation_id.to_string());
+                    // Broadcast workspace_routed SSE event
+                    if let Some(ref sse) = self.deps.sse_tx {
+                        sse.broadcast_for_user(&message.user_id, crate::channels::web::types::SseEvent::WorkspaceRouted {
+                            workspace_id: ws.id.to_string(),
+                            topic: ws.topic.clone(),
+                            is_new: false,
+                            thread_id: Some(ws.conversation_id.to_string()),
+                        });
+                    }
                     // Touch workspace (update last_accessed, increment turn_count)
                     if let Some(ref store) = self.deps.store {
                         let _ = store.touch_agent_workspace(ws.id).await;
                     }
                 }
-                Ok(None) => {
-                    tracing::debug!("Workspace routing: no match, using default thread");
+                Ok(Some(_)) | Ok(None) => {
+                    // Try to get or create a default "general" workspace
+                    if let Some(ref store) = self.deps.store {
+                        match self
+                            .get_or_create_default_workspace(
+                                &message.user_id,
+                                router,
+                                store,
+                            )
+                            .await
+                        {
+                            Ok(Some(ws)) => {
+                                tracing::info!(
+                                    "Workspace routing: using default workspace {} (topic: {})",
+                                    ws.id, ws.topic
+                                );
+                                routed_thread_id = Some(ws.conversation_id.to_string());
+                                if let Some(ref sse) = self.deps.sse_tx {
+                                    sse.broadcast_for_user(
+                                        &message.user_id,
+                                        crate::channels::web::types::SseEvent::WorkspaceRouted {
+                                            workspace_id: ws.id.to_string(),
+                                            topic: ws.topic.clone(),
+                                            is_new: false,
+                                            thread_id: Some(ws.conversation_id.to_string()),
+                                        },
+                                    );
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::info!(
+                                    "Workspace routing: no default workspace, using ephemeral thread"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to get/create default workspace: {}", e);
+                            }
+                        }
+                    } else {
+                        tracing::info!("Workspace routing: no match, using default thread");
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Workspace routing failed: {}", e);
@@ -874,6 +966,14 @@ impl Agent {
                 routed_thread_id.as_deref().or(message.thread_id.as_deref()),
             )
             .await;
+
+        // Propagate the resolved thread_id back to the message so the gateway
+        // can tag SSE responses with the correct thread. Without this, messages
+        // arriving without an explicit thread_id would produce responses that
+        // the gateway drops ("no thread_id — skipping").
+        if message.thread_id.is_none() {
+            message.thread_id = routed_thread_id.or_else(|| Some(thread_id.to_string()));
+        }
 
         // Auth mode interception: if the thread is awaiting a token, route
         // the message directly to the credential store. Nothing touches

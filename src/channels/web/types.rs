@@ -247,6 +247,16 @@ pub enum SseEvent {
         thread_id: Option<String>,
     },
 
+    /// Workspace routing decision — emitted when a message is routed to a workspace.
+    #[serde(rename = "workspace_routed")]
+    WorkspaceRouted {
+        workspace_id: String,
+        topic: String,
+        is_new: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+    },
+
     /// Extension activation status change (WASM channels).
     #[serde(rename = "extension_status")]
     ExtensionStatus {
@@ -730,6 +740,7 @@ impl WsServerMessage {
             SseEvent::JobStatus { .. } => "job_status",
             SseEvent::JobResult { .. } => "job_result",
             SseEvent::ImageGenerated { .. } => "image_generated",
+            SseEvent::WorkspaceRouted { .. } => "workspace_routed",
             SseEvent::ExtensionStatus { .. } => "extension_status",
         };
         let data = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);

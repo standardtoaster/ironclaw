@@ -1,6 +1,7 @@
 //! Built-in tools that come with the agent.
 
 pub mod collections;
+mod create_workspace;
 mod delegate_workspace;
 mod discover_tools;
 mod list_workspaces;
@@ -27,6 +28,7 @@ pub use collections::{
     CollectionDropTool, CollectionListTool, CollectionRegisterTool, CollectionsAlterTool,
     generate_collection_tools,
 };
+pub use create_workspace::CreateWorkspaceTool;
 pub use delegate_workspace::DelegateToWorkspaceTool;
 pub use discover_tools::DiscoverToolsTool;
 pub use list_workspaces::ListWorkspacesTool;

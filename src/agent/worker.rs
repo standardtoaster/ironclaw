@@ -36,14 +36,17 @@ pub struct WorkerDeps {
     pub hooks: Arc<HookRegistry>,
     pub timeout: Duration,
     pub use_planning: bool,
-    /// SSE broadcast sender for live job event streaming to the web gateway.
-    pub sse_tx: Option<tokio::sync::broadcast::Sender<SseEvent>>,
+    /// SSE broadcast manager for live job event streaming to the web gateway.
+    pub sse_tx: Option<Arc<crate::channels::web::sse::SseManager>>,
     /// Approval context for tool execution. When `None`, all non-`Never` tools are
     /// blocked (legacy behavior). When `Some`, the context determines which tools
     /// are pre-approved for autonomous execution.
     pub approval_context: Option<ApprovalContext>,
     /// HTTP interceptor for trace recording/replay (propagated to JobContext).
     pub http_interceptor: Option<Arc<dyn crate::llm::recording::HttpInterceptor>>,
+    /// Core tool names for filtering (same as AgentDeps.core_tools).
+    /// When non-empty, workers use core_tool_definitions() instead of all tools.
+    pub core_tools: Vec<String>,
 }
 
 /// Worker that executes a single job.
@@ -125,7 +128,7 @@ impl Worker {
         }
 
         // Broadcast SSE for live web UI updates
-        if let Some(ref tx) = self.deps.sse_tx {
+        if let Some(ref sse) = self.deps.sse_tx {
             let job_id_str = job_id.to_string();
             let event = match event_type {
                 "message" => Some(SseEvent::JobMessage {
@@ -189,7 +192,7 @@ impl Worker {
                 _ => None,
             };
             if let Some(event) = event {
-                let _ = tx.send(event);
+                sse.broadcast(event);
             }
         }
     }
@@ -335,8 +338,13 @@ impl Worker {
         let mut consecutive_tool_intent_nudges: u32 = 0;
 
         // Initial tool definitions for planning (will be refreshed in loop)
-        // TODO: Apply core_tool_definitions() filtering here once workers support core_tools
-        reason_ctx.available_tools = self.tools().tool_definitions().await;
+        reason_ctx.available_tools = self.tools().core_tool_definitions(&self.deps.core_tools).await;
+        tracing::info!(
+            job_id = %self.job_id,
+            tool_count = reason_ctx.available_tools.len(),
+            core_tools_configured = self.deps.core_tools.len(),
+            "Worker tool definitions loaded"
+        );
 
         // Generate plan if planning is enabled
         let plan = if self.use_planning() {
@@ -759,6 +767,21 @@ impl Worker {
         } else {
             params
         };
+
+        // Reject tool calls for tools not in the core_tools list (if configured).
+        // Small models sometimes hallucinate tool names that exist in the registry
+        // but weren't included in the LLM context.
+        if !deps.core_tools.is_empty() && !deps.core_tools.iter().any(|t| t == tool_name) {
+            tracing::warn!(
+                tool = %tool_name,
+                job_id = %job_id,
+                "Worker rejected hallucinated tool call (not in core_tools)"
+            );
+            return Err(crate::error::ToolError::NotFound {
+                name: tool_name.to_string(),
+            }
+            .into());
+        }
 
         let tool =
             deps.tools
@@ -1514,6 +1537,7 @@ mod tests {
             sse_tx: None,
             approval_context: None,
             http_interceptor: None,
+            core_tools: Vec::new(),
         };
 
         Worker::new(job_id, deps)
@@ -1713,6 +1737,77 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_core_tools_rejects_hallucinated_tool() {
+        // When core_tools is configured, the worker should reject tool calls
+        // for tools that exist in the registry but aren't in the core list.
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(SlowTool {
+                tool_name: "allowed_tool".into(),
+                delay: Duration::from_millis(1),
+            }),
+            Arc::new(SlowTool {
+                tool_name: "disallowed_tool".into(),
+                delay: Duration::from_millis(1),
+            }),
+        ];
+
+        let registry = ToolRegistry::new();
+        for t in &tools {
+            registry.register(Arc::clone(t)).await;
+        }
+
+        let cm = Arc::new(crate::context::ContextManager::new(5));
+        let job_id = cm.create_job("test", "test job").await.unwrap();
+
+        let deps = WorkerDeps {
+            context_manager: cm,
+            llm: Arc::new(StubLlm),
+            safety: Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 100_000,
+                injection_check_enabled: false,
+            })),
+            tools: Arc::new(registry),
+            store: None,
+            hooks: Arc::new(crate::hooks::HookRegistry::new()),
+            timeout: Duration::from_secs(30),
+            use_planning: false,
+            sse_tx: None,
+            approval_context: None,
+            http_interceptor: None,
+            core_tools: vec!["allowed_tool".to_string()],
+        };
+
+        let worker = Worker::new(job_id, deps);
+
+        // Allowed tool should succeed
+        let results = worker
+            .execute_tools_parallel(&[ToolSelection {
+                tool_name: "allowed_tool".into(),
+                parameters: serde_json::json!({}),
+                reasoning: String::new(),
+                alternatives: vec![],
+                tool_call_id: "call_ok".into(),
+            }])
+            .await;
+        assert!(results[0].result.is_ok(), "allowed tool should succeed");
+
+        // Disallowed tool should fail even though it exists in the registry
+        let results = worker
+            .execute_tools_parallel(&[ToolSelection {
+                tool_name: "disallowed_tool".into(),
+                parameters: serde_json::json!({}),
+                reasoning: String::new(),
+                alternatives: vec![],
+                tool_call_id: "call_bad".into(),
+            }])
+            .await;
+        assert!(
+            results[0].result.is_err(),
+            "tool not in core_tools should be rejected"
+        );
+    }
+
     /// Verify that calling mark_completed on an already-Completed job returns
     /// an error (Completed → Completed is an invalid state transition).
     #[tokio::test]
@@ -1776,6 +1871,7 @@ mod tests {
             sse_tx: None,
             approval_context,
             http_interceptor: None,
+            core_tools: Vec::new(),
         };
 
         Worker::new(job_id, deps)

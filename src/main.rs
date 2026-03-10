@@ -721,9 +721,9 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Wire SSE sender into extension manager for broadcasting status events.
     if let Some(ref ext_mgr) = components.extension_manager
-        && let Some(sse) = sse_manager
+        && let Some(ref sse) = sse_manager
     {
-        ext_mgr.set_sse_sender(sse).await;
+        ext_mgr.set_sse_sender(Arc::clone(sse)).await;
     }
 
     // Snapshot memory for trace recording before the agent starts
@@ -753,7 +753,7 @@ async fn async_main() -> anyhow::Result<()> {
         skills_config: config.skills.clone(),
         hooks: components.hooks,
         cost_guard: components.cost_guard,
-        sse_tx: None,
+        sse_tx: sse_manager.clone(),
         http_interceptor,
         transcription: config
             .transcription

@@ -10,7 +10,6 @@ use uuid::Uuid;
 
 use crate::agent::task::{Task, TaskContext, TaskOutput};
 use crate::agent::worker::{Worker, WorkerDeps};
-use crate::channels::web::types::SseEvent;
 use crate::config::AgentConfig;
 use crate::context::{ContextManager, JobContext, JobState};
 use crate::db::Database;
@@ -54,10 +53,12 @@ pub struct Scheduler {
     tools: Arc<ToolRegistry>,
     store: Option<Arc<dyn Database>>,
     hooks: Arc<HookRegistry>,
-    /// SSE broadcast sender for live job event streaming.
-    sse_tx: Option<tokio::sync::broadcast::Sender<SseEvent>>,
+    /// SSE broadcast manager for live job event streaming.
+    sse_tx: Option<Arc<crate::channels::web::sse::SseManager>>,
     /// HTTP interceptor for trace recording/replay (propagated to workers).
     http_interceptor: Option<Arc<dyn crate::llm::recording::HttpInterceptor>>,
+    /// Core tool names for worker filtering.
+    core_tools: Vec<String>,
     /// Running jobs (main LLM-driven jobs).
     jobs: Arc<RwLock<HashMap<Uuid, ScheduledJob>>>,
     /// Running sub-tasks (tool executions, background tasks).
@@ -88,15 +89,21 @@ impl Scheduler {
             hooks,
             sse_tx: None,
             http_interceptor: None,
+            core_tools: Vec::new(),
             jobs: Arc::new(RwLock::new(HashMap::new())),
             subtasks: Arc::new(RwLock::new(HashMap::new())),
             completion_waiters: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Set the SSE broadcast sender for live job event streaming.
-    pub fn set_sse_sender(&mut self, tx: tokio::sync::broadcast::Sender<SseEvent>) {
-        self.sse_tx = Some(tx);
+    /// Set the SSE broadcast manager for live job event streaming.
+    pub fn set_sse_sender(&mut self, sse: Arc<crate::channels::web::sse::SseManager>) {
+        self.sse_tx = Some(sse);
+    }
+
+    /// Set core tool names for worker filtering.
+    pub fn set_core_tools(&mut self, tools: Vec<String>) {
+        self.core_tools = tools;
     }
 
     /// Set the HTTP interceptor for trace recording/replay.
@@ -397,6 +404,7 @@ impl Scheduler {
                 sse_tx: self.sse_tx.clone(),
                 approval_context,
                 http_interceptor: self.http_interceptor.clone(),
+                core_tools: self.core_tools.clone(),
             };
             let worker = Worker::new(job_id, deps);
 
