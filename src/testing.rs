@@ -454,6 +454,7 @@ impl TestHarnessBuilder {
             transcription: None,
             document_extraction: None,
             workspace_router: None,
+            thread_resolver: None,
             core_tools: Vec::new(),
         };
 

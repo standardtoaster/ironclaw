@@ -73,8 +73,17 @@ impl Agent {
             None
         };
 
-        // Check if this thread belongs to a workspace and inject context
-        let workspace_context = if let Some(ref store) = self.deps.store {
+        // Inject context for this thread. Priority:
+        // 1. Resolver context (from ThreadResolver, set during routing)
+        // 2. DB workspace context (legacy, for threads belonging to a workspace)
+        let workspace_context = if let Some(ctx) = message
+            .metadata
+            .get("__resolver_context")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+        {
+            Some(ctx)
+        } else if let Some(ref store) = self.deps.store {
             match store.get_agent_workspace_by_conversation(thread_id).await {
                 Ok(Some(ws)) => {
                     tracing::info!(
@@ -1266,6 +1275,7 @@ mod tests {
             transcription: None,
             document_extraction: None,
             workspace_router: None,
+            thread_resolver: None,
             core_tools: Vec::new(),
         };
 
@@ -2017,6 +2027,7 @@ mod tests {
             transcription: None,
             document_extraction: None,
             workspace_router: None,
+            thread_resolver: None,
             core_tools: Vec::new(),
         };
 
@@ -2136,6 +2147,7 @@ mod tests {
                 transcription: None,
                 document_extraction: None,
                 workspace_router: None,
+                thread_resolver: None,
                 core_tools: Vec::new(),
             };
 

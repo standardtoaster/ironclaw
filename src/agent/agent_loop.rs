@@ -29,6 +29,8 @@ use crate::llm::LlmProvider;
 use crate::safety::SafetyLayer;
 use crate::skills::SkillRegistry;
 use crate::tools::ToolRegistry;
+use uuid::Uuid;
+
 use crate::workspace::Workspace;
 
 /// Collapse a tool output string into a single-line preview for display.
@@ -83,6 +85,9 @@ pub struct AgentDeps {
     pub document_extraction: Option<Arc<crate::document_extraction::DocumentExtractionMiddleware>>,
     /// Workspace router for automatic topic-based context switching.
     pub workspace_router: Option<Arc<crate::agent::workspace_router::WorkspaceRouter>>,
+    /// Pluggable thread resolver for message-to-thread routing and context injection.
+    /// When set, takes priority over `workspace_router` for routing decisions.
+    pub thread_resolver: Option<Arc<dyn crate::agent::thread_resolver::ThreadResolver>>,
     /// Tool names that are always included in LLM context.
     /// When non-empty, only core + discovered tools are sent to the LLM.
     /// Empty = backward compatible (all tools sent).
@@ -873,82 +878,125 @@ impl Agent {
             }
         }
 
-        // Workspace routing: if no explicit thread_id, try to route to a
-        // matching workspace conversation. This implements automatic topic
-        // context switching — the user just talks, and the right workspace
-        // loads based on embedding similarity.
+        // Thread routing: if no explicit thread_id, resolve which thread to use.
+        // Priority: thread_resolver (pluggable) > workspace_router (legacy).
         let mut routed_thread_id = message.thread_id.clone();
+        let mut resolver_context: Option<String> = None;
         if routed_thread_id.is_none()
-            && let Some(ref router) = self.deps.workspace_router
             && let Submission::UserInput { ref content } = submission
         {
-            match router.route(&message.user_id, content).await {
-                Ok(Some(ws)) if ws.topic != "general" => {
-                    tracing::info!(
-                        "Workspace routing: matched workspace {} (topic: {})",
-                        ws.id, ws.topic
-                    );
-                    routed_thread_id = Some(ws.conversation_id.to_string());
-                    // Broadcast workspace_routed SSE event
-                    if let Some(ref sse) = self.deps.sse_tx {
-                        sse.broadcast_for_user(&message.user_id, crate::channels::web::types::SseEvent::WorkspaceRouted {
-                            workspace_id: ws.id.to_string(),
-                            topic: ws.topic.clone(),
-                            is_new: false,
-                            thread_id: Some(ws.conversation_id.to_string()),
-                        });
+            if let Some(ref resolver) = self.deps.thread_resolver {
+                // Use the pluggable thread resolver
+                let default_thread_id = Uuid::new_v4(); // placeholder; resolver may ignore it
+                match resolver
+                    .resolve(&message.user_id, content, default_thread_id)
+                    .await
+                {
+                    Ok(resolution) => {
+                        if let Some(tid) = resolution.thread_id {
+                            tracing::info!(
+                                "ThreadResolver: routed to thread {}",
+                                tid
+                            );
+                            routed_thread_id = Some(tid.to_string());
+                        }
+                        resolver_context = resolution.context;
+                        // Broadcast routing metadata via SSE
+                        if !resolution.metadata.is_empty()
+                            && let Some(ref sse) = self.deps.sse_tx
+                            && let (Some(ws_id), Some(topic)) = (
+                                resolution.metadata.get("workspace_id"),
+                                resolution.metadata.get("topic"),
+                            )
+                        {
+                            sse.broadcast_for_user(
+                                &message.user_id,
+                                crate::channels::web::types::SseEvent::WorkspaceRouted {
+                                    workspace_id: ws_id.clone(),
+                                    topic: topic.clone(),
+                                    is_new: resolution.metadata.get("is_new")
+                                        .is_some_and(|v| v == "true"),
+                                    thread_id: routed_thread_id.clone(),
+                                },
+                            );
+                        }
                     }
-                    // Touch workspace (update last_accessed, increment turn_count)
-                    if let Some(ref store) = self.deps.store {
-                        let _ = store.touch_agent_workspace(ws.id).await;
+                    Err(e) => {
+                        tracing::warn!("ThreadResolver failed: {}, falling back", e);
                     }
                 }
-                Ok(Some(_)) | Ok(None) => {
-                    // Try to get or create a default "general" workspace
-                    if let Some(ref store) = self.deps.store {
-                        match self
-                            .get_or_create_default_workspace(
-                                &message.user_id,
-                                router,
-                                store,
-                            )
-                            .await
-                        {
-                            Ok(Some(ws)) => {
-                                tracing::info!(
-                                    "Workspace routing: using default workspace {} (topic: {})",
-                                    ws.id, ws.topic
-                                );
-                                routed_thread_id = Some(ws.conversation_id.to_string());
-                                if let Some(ref sse) = self.deps.sse_tx {
-                                    sse.broadcast_for_user(
-                                        &message.user_id,
-                                        crate::channels::web::types::SseEvent::WorkspaceRouted {
-                                            workspace_id: ws.id.to_string(),
-                                            topic: ws.topic.clone(),
-                                            is_new: false,
-                                            thread_id: Some(ws.conversation_id.to_string()),
-                                        },
+            } else if let Some(ref router) = self.deps.workspace_router {
+                // Legacy workspace router fallback
+                match router.route(&message.user_id, content).await {
+                    Ok(Some(ws)) if ws.topic != "general" => {
+                        tracing::info!(
+                            "Workspace routing: matched workspace {} (topic: {})",
+                            ws.id, ws.topic
+                        );
+                        routed_thread_id = Some(ws.conversation_id.to_string());
+                        if let Some(ref sse) = self.deps.sse_tx {
+                            sse.broadcast_for_user(&message.user_id, crate::channels::web::types::SseEvent::WorkspaceRouted {
+                                workspace_id: ws.id.to_string(),
+                                topic: ws.topic.clone(),
+                                is_new: false,
+                                thread_id: Some(ws.conversation_id.to_string()),
+                            });
+                        }
+                        if let Some(ref store) = self.deps.store {
+                            let _ = store.touch_agent_workspace(ws.id).await;
+                        }
+                    }
+                    Ok(Some(_)) | Ok(None) => {
+                        if let Some(ref store) = self.deps.store {
+                            match self
+                                .get_or_create_default_workspace(
+                                    &message.user_id,
+                                    router,
+                                    store,
+                                )
+                                .await
+                            {
+                                Ok(Some(ws)) => {
+                                    tracing::info!(
+                                        "Workspace routing: default workspace {} (topic: {})",
+                                        ws.id, ws.topic
+                                    );
+                                    routed_thread_id = Some(ws.conversation_id.to_string());
+                                    if let Some(ref sse) = self.deps.sse_tx {
+                                        sse.broadcast_for_user(
+                                            &message.user_id,
+                                            crate::channels::web::types::SseEvent::WorkspaceRouted {
+                                                workspace_id: ws.id.to_string(),
+                                                topic: ws.topic.clone(),
+                                                is_new: false,
+                                                thread_id: Some(ws.conversation_id.to_string()),
+                                            },
+                                        );
+                                    }
+                                }
+                                Ok(None) => {
+                                    tracing::info!(
+                                        "Workspace routing: no default workspace, using ephemeral thread"
                                     );
                                 }
-                            }
-                            Ok(None) => {
-                                tracing::info!(
-                                    "Workspace routing: no default workspace, using ephemeral thread"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to get/create default workspace: {}", e);
+                                Err(e) => {
+                                    tracing::warn!("Failed to get/create default workspace: {}", e);
+                                }
                             }
                         }
-                    } else {
-                        tracing::info!("Workspace routing: no match, using default thread");
+                    }
+                    Err(e) => {
+                        tracing::warn!("Workspace routing failed: {}", e);
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Workspace routing failed: {}", e);
-                }
             }
+        }
+
+        // Inject resolver context into message metadata so the dispatcher can use it
+        if let Some(ref ctx) = resolver_context
+            && let Some(obj) = message.metadata.as_object_mut()
+        {
+            obj.insert("__resolver_context".to_string(), serde_json::json!(ctx));
         }
 
         // Hydrate thread from DB if it's a historical thread not in memory
@@ -1069,6 +1117,14 @@ impl Agent {
                     .await
             }
         };
+
+        // Notify the resolver that a message was processed in this thread.
+        // This allows stickiness tracking and other post-routing bookkeeping.
+        if let Some(ref resolver) = self.deps.thread_resolver
+            && result.is_ok()
+        {
+            resolver.notify_routed(&message.user_id, thread_id).await;
+        }
 
         // Convert SubmissionResult to response string
         match result? {

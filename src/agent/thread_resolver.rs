@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 /// Result of resolving which thread a message should be processed in.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ThreadResolution {
     /// Which conversation thread to process the message in.
     /// If `None`, use the session's default thread (no redirect).
@@ -26,16 +26,6 @@ pub struct ThreadResolution {
 
     /// Routing metadata for SSE events and logging.
     pub metadata: HashMap<String, String>,
-}
-
-impl Default for ThreadResolution {
-    fn default() -> Self {
-        Self {
-            thread_id: None,
-            context: None,
-            metadata: HashMap::new(),
-        }
-    }
 }
 
 /// Information about a workspace created or updated by the organizer.
