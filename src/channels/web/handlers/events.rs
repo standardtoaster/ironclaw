@@ -87,14 +87,14 @@ pub async fn events_ingest_handler(
     let data_for_event = data.clone();
 
     match db
-        .insert_record(&state.user_id, &req.collection, data)
+        .insert_record(&state.default_user_id, &req.collection, data)
         .await
     {
         Ok(id) => {
             // Fire collection write triggers
             if let Some(tx) = &state.collection_write_tx {
                 let _ = tx.send(crate::agent::collection_events::CollectionWriteEvent {
-                    user_id: state.user_id.clone(),
+                    user_id: state.default_user_id.clone(),
                     collection: req.collection.clone(),
                     record_id: id,
                     data: data_for_event,

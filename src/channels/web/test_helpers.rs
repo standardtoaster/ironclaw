@@ -90,6 +90,8 @@ impl TestGatewayBuilder {
             cost_guard: None,
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
+            restart_requested: std::sync::atomic::AtomicBool::new(false),
+            collection_write_tx: None,
         })
     }
 
