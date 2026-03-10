@@ -213,6 +213,11 @@ impl Agent {
             // Refresh tool definitions each iteration so newly built tools become visible
             let tool_defs = self.tools().tool_definitions().await;
 
+            // Apply visibility tier filtering: hide on-demand tool groups unless
+            // a relevant skill activates them via keyword scan.
+            let tool_defs =
+                crate::skills::filter_tools_by_visibility(&tool_defs, &active_skills);
+
             // Apply trust-based tool attenuation if skills are active.
             let tool_defs = if !active_skills.is_empty() {
                 let result = crate::skills::attenuate_tools(&tool_defs, &active_skills);

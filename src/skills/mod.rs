@@ -21,7 +21,7 @@ pub mod parser;
 pub mod registry;
 pub mod selector;
 
-pub use attenuation::{AttenuationResult, attenuate_tools};
+pub use attenuation::{AttenuationResult, attenuate_tools, filter_tools_by_visibility};
 pub use registry::SkillRegistry;
 pub use selector::prefilter_skills;
 
