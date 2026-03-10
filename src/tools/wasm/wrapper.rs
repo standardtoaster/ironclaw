@@ -19,6 +19,7 @@ use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 use crate::context::JobContext;
 use crate::safety::LeakDetector;
 use crate::secrets::SecretsStore;
+use crate::tools::registry::ToolRegistry;
 use crate::tools::tool::{Tool, ToolError, ToolOutput};
 use crate::tools::wasm::capabilities::Capabilities;
 use crate::tools::wasm::credential_injector::{
@@ -99,6 +100,13 @@ struct StoreData {
     /// Dedicated tokio runtime for HTTP requests, lazily initialized.
     /// Reused across multiple `http_request` calls within one execution.
     http_runtime: Option<tokio::runtime::Runtime>,
+    /// Handle to the main async runtime for tool-invoke bridging.
+    /// Used with `block_on` from inside `spawn_blocking` to call async tool methods.
+    async_handle: Option<tokio::runtime::Handle>,
+    /// Tool registry for tool-invoke host function.
+    tool_registry: Option<Arc<ToolRegistry>>,
+    /// User ID for tool-invoke job context.
+    tool_invoke_user_id: String,
 }
 
 impl StoreData {
@@ -107,6 +115,9 @@ impl StoreData {
         capabilities: Capabilities,
         credentials: HashMap<String, String>,
         host_credentials: Vec<ResolvedHostCredential>,
+        async_handle: Option<tokio::runtime::Handle>,
+        tool_registry: Option<Arc<ToolRegistry>>,
+        tool_invoke_user_id: String,
     ) -> Self {
         // Minimal WASI context: no filesystem, no env vars (security)
         let wasi = WasiCtxBuilder::new().build();
@@ -119,6 +130,9 @@ impl StoreData {
             credentials,
             host_credentials,
             http_runtime: None,
+            async_handle,
+            tool_registry,
+            tool_invoke_user_id,
         }
     }
 
@@ -427,14 +441,49 @@ impl near::agent::host::Host for StoreData {
         result.map_err(|e| self.redact_credentials(&e))
     }
 
-    fn tool_invoke(&mut self, alias: String, _params_json: String) -> Result<String, String> {
+    fn tool_invoke(&mut self, alias: String, params_json: String) -> Result<String, String> {
         // Validate capability and resolve alias
-        let _real_name = self.host_state.check_tool_invoke_allowed(&alias)?;
+        let real_name = self.host_state.check_tool_invoke_allowed(&alias)?;
         self.host_state.record_tool_invoke()?;
 
-        // Tool invocation requires async context and access to the tool registry,
-        // which aren't available inside a synchronous WASM callback.
-        Err("Tool invocation from WASM tools is not yet supported".to_string())
+        let registry = self
+            .tool_registry
+            .as_ref()
+            .ok_or("tool-invoke not available: no tool registry")?;
+        let handle = self
+            .async_handle
+            .as_ref()
+            .ok_or("tool-invoke not available: no async runtime handle")?;
+
+        let params: serde_json::Value = serde_json::from_str(&params_json)
+            .map_err(|e| format!("Invalid params JSON: {e}"))?;
+
+        // Look up the tool (async, bridged via handle.block_on from spawn_blocking)
+        let tool = handle
+            .block_on(registry.get(&real_name))
+            .ok_or_else(|| format!("Tool '{}' not found in registry", real_name))?;
+
+        // Create a minimal job context for the tool invocation
+        let job_ctx = JobContext::with_user(
+            &self.tool_invoke_user_id,
+            format!("wasm-invoke:{}", alias),
+            "Tool invoked from WASM module",
+        );
+
+        // Execute the tool (async, bridged via handle.block_on)
+        let result = handle.block_on(tool.execute(params, &job_ctx));
+
+        match result {
+            Ok(output) => {
+                // Return the tool output as JSON string
+                serde_json::to_string(&output.result)
+                    .map_err(|e| format!("Failed to serialize tool output: {e}"))
+            }
+            Err(e) => {
+                // Redact credentials from error messages
+                Err(self.redact_credentials(&format!("Tool error: {e}")))
+            }
+        }
     }
 
     fn secret_exists(&mut self, name: String) -> bool {
@@ -464,6 +513,8 @@ pub struct WasmToolWrapper {
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
     /// OAuth refresh configuration for auto-refreshing expired tokens.
     oauth_refresh: Option<OAuthRefreshConfig>,
+    /// Tool registry for tool-invoke host function (allows WASM tools to call other tools).
+    tool_registry: Option<Arc<ToolRegistry>>,
 }
 
 impl WasmToolWrapper {
@@ -482,7 +533,17 @@ impl WasmToolWrapper {
             credentials: HashMap::new(),
             secrets_store: None,
             oauth_refresh: None,
+            tool_registry: None,
         }
+    }
+
+    /// Set the tool registry for tool-invoke host function.
+    ///
+    /// When set, WASM tools can call other tools via the `tool-invoke`
+    /// host function using aliases declared in their capabilities.
+    pub fn with_tool_registry(mut self, registry: Arc<ToolRegistry>) -> Self {
+        self.tool_registry = Some(registry);
+        self
     }
 
     /// Override the tool description.
@@ -550,6 +611,9 @@ impl WasmToolWrapper {
         params: serde_json::Value,
         context_json: Option<String>,
         host_credentials: Vec<ResolvedHostCredential>,
+        async_handle: Option<tokio::runtime::Handle>,
+        tool_registry: Option<Arc<ToolRegistry>>,
+        user_id: String,
     ) -> Result<(String, Vec<crate::tools::wasm::host::LogEntry>), WasmError> {
         let engine = self.runtime.engine();
         let limits = &self.prepared.limits;
@@ -560,6 +624,9 @@ impl WasmToolWrapper {
             self.capabilities.clone(),
             self.credentials.clone(),
             host_credentials,
+            async_handle,
+            tool_registry,
+            user_id,
         );
         let mut store = Store::new(engine, store_data);
 
@@ -740,6 +807,14 @@ impl Tool for WasmToolWrapper {
         let description = self.description.clone();
         let schema = self.schema.clone();
         let credentials = self.credentials.clone();
+        let tool_registry = self.tool_registry.clone();
+
+        // Capture the async runtime handle BEFORE entering spawn_blocking.
+        // Inside spawn_blocking, tool_invoke uses handle.block_on() to call
+        // async tool methods — this is safe because block_on runs the async
+        // work on the main runtime's worker threads, not the blocking thread.
+        let async_handle = tokio::runtime::Handle::current();
+        let user_id = ctx.user_id.clone();
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
@@ -752,10 +827,18 @@ impl Tool for WasmToolWrapper {
                 credentials,
                 secrets_store: None, // Not needed in blocking task
                 oauth_refresh: None, // Already used above for pre-refresh
+                tool_registry: None, // Passed directly to execute_sync instead
             };
 
             tokio::task::spawn_blocking(move || {
-                wrapper.execute_sync(params, context_json, host_credentials)
+                wrapper.execute_sync(
+                    params,
+                    context_json,
+                    host_credentials,
+                    Some(async_handle),
+                    tool_registry,
+                    user_id,
+                )
             })
             .await
             .map_err(|e| WasmError::ExecutionPanicked(e.to_string()))?
@@ -1292,6 +1375,9 @@ mod tests {
             Capabilities::default(),
             HashMap::new(),
             host_credentials,
+            None,
+            None,
+            String::new(),
         );
 
         // Should inject for matching host
@@ -1331,6 +1417,9 @@ mod tests {
             Capabilities::default(),
             HashMap::new(),
             host_credentials,
+            None,
+            None,
+            String::new(),
         );
 
         let mut headers = HashMap::new();
@@ -1357,6 +1446,9 @@ mod tests {
             Capabilities::default(),
             HashMap::new(),
             host_credentials,
+            None,
+            None,
+            String::new(),
         );
 
         let text = "Error: request to https://api.example.com?key=super-secret-token failed";

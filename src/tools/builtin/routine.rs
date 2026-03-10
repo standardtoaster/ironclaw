@@ -88,8 +88,17 @@ impl Tool for RoutineCreateTool {
                 },
                 "action_type": {
                     "type": "string",
-                    "enum": ["lightweight", "full_job"],
-                    "description": "Execution mode: 'lightweight' (single LLM call, default) or 'full_job' (multi-turn with tools)"
+                    "enum": ["lightweight", "full_job", "script"],
+                    "description": "Execution mode: 'lightweight' (single LLM call, default), 'full_job' (multi-turn with tools), or 'script' (run a script)"
+                },
+                "language": {
+                    "type": "string",
+                    "enum": ["python", "bash"],
+                    "description": "Script language (required when action_type is 'script')"
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Inline script source code (required when action_type is 'script')"
                 },
                 "cooldown_secs": {
                     "type": "integer",
@@ -233,6 +242,66 @@ impl Tool for RoutineCreateTool {
                     tool_permissions,
                 }
             }
+            "wasm" => {
+                let tool_name = params
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        ToolError::InvalidParameters(
+                            "wasm action requires tool_name".to_string(),
+                        )
+                    })?
+                    .to_string();
+                let escalation_prompt = params
+                    .get("escalation_prompt")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                RoutineAction::Wasm {
+                    tool_name,
+                    escalation_prompt,
+                }
+            }
+            "script" => {
+                let language = params
+                    .get("language")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        ToolError::InvalidParameters(
+                            "script action requires 'language' (python or bash)".to_string(),
+                        )
+                    })?;
+                match language {
+                    "python" | "bash" => {}
+                    other => {
+                        return Err(ToolError::InvalidParameters(format!(
+                            "unsupported script language: {} (use 'python' or 'bash')",
+                            other
+                        )));
+                    }
+                }
+                let source = params
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        ToolError::InvalidParameters(
+                            "script action requires 'source' (the script code)".to_string(),
+                        )
+                    })?;
+                if source.trim().is_empty() {
+                    return Err(ToolError::InvalidParameters(
+                        "script source cannot be empty".to_string(),
+                    ));
+                }
+                let escalation_prompt = params
+                    .get("escalation_prompt")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                RoutineAction::Script {
+                    language: language.to_string(),
+                    source: source.to_string(),
+                    escalation_prompt,
+                }
+            }
             other => {
                 return Err(ToolError::InvalidParameters(format!(
                     "unknown action_type: {other}"
@@ -268,6 +337,7 @@ impl Tool for RoutineCreateTool {
                 cooldown: Duration::from_secs(cooldown_secs),
                 max_concurrent: 1,
                 dedup_window: None,
+                max_execution_time: None,
             },
             notify: NotifyConfig {
                 channel: params
@@ -441,6 +511,15 @@ impl Tool for RoutineUpdateTool {
                 "description": {
                     "type": "string",
                     "description": "New description"
+                },
+                "source": {
+                    "type": "string",
+                    "description": "New script source code (for script routines)"
+                },
+                "language": {
+                    "type": "string",
+                    "enum": ["python", "bash"],
+                    "description": "New script language (for script routines)"
                 }
             },
             "required": ["name"]
@@ -476,6 +555,45 @@ impl Tool for RoutineUpdateTool {
             match &mut routine.action {
                 RoutineAction::Lightweight { prompt: p, .. } => *p = prompt.to_string(),
                 RoutineAction::FullJob { description: d, .. } => *d = prompt.to_string(),
+                RoutineAction::Wasm { escalation_prompt, .. } => {
+                    *escalation_prompt = Some(prompt.to_string());
+                }
+                RoutineAction::Script { escalation_prompt, .. } => {
+                    *escalation_prompt = Some(prompt.to_string());
+                }
+            }
+        }
+
+        if let Some(source) = params.get("source").and_then(|v| v.as_str()) {
+            if let RoutineAction::Script { source: s, .. } = &mut routine.action {
+                if source.trim().is_empty() {
+                    return Err(ToolError::InvalidParameters(
+                        "script source cannot be empty".to_string(),
+                    ));
+                }
+                *s = source.to_string();
+            } else {
+                return Err(ToolError::InvalidParameters(
+                    "source can only be updated on script routines".to_string(),
+                ));
+            }
+        }
+
+        if let Some(language) = params.get("language").and_then(|v| v.as_str()) {
+            if let RoutineAction::Script { language: l, .. } = &mut routine.action {
+                match language {
+                    "python" | "bash" => *l = language.to_string(),
+                    other => {
+                        return Err(ToolError::InvalidParameters(format!(
+                            "unsupported script language: {} (use 'python' or 'bash')",
+                            other
+                        )));
+                    }
+                }
+            } else {
+                return Err(ToolError::InvalidParameters(
+                    "language can only be updated on script routines".to_string(),
+                ));
             }
         }
 

@@ -214,6 +214,14 @@ bedrock = ["dep:aws-config", "dep:aws-sdk-bedrockruntime", "dep:aws-smithy-types
 name = "html_to_markdown"
 required-features = ["html-to-markdown"]
 
+[[test]]
+name = "structured_collections"
+required-features = ["libsql"]
+
+[[test]]
+name = "structured_tools"
+required-features = ["libsql"]
+
 # The profile that 'cargo dist' will build with
 [profile.dist]
 inherits = "release"

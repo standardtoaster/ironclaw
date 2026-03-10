@@ -74,6 +74,10 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "image_generate",
     "image_edit",
     "image_analyze",
+    "collections_alter",
+    "collections_list",
+    "collections_register",
+    "collections_drop",
 ];
 
 /// Registry of available tools.
@@ -522,6 +526,166 @@ impl ToolRegistry {
             base_dir,
         )));
         tracing::info!("Registered 1 vision tool (analyze)");
+    }
+
+    /// Register structured collection tools.
+    ///
+    /// Registers three management tools (list, register, drop) plus dynamically
+    /// generated per-collection tools for each existing schema. The register tool
+    /// gets a reference to the registry so it can add per-collection tools
+    /// when new schemas are created mid-session.
+    ///
+    /// `user_id` is needed to load existing schemas at startup.
+    /// `skills_dir` is the directory where per-collection skills are written
+    /// for future session discovery.
+    pub async fn register_collection_tools(
+        self: &Arc<Self>,
+        db: Arc<dyn Database>,
+        user_id: &str,
+        skills_dir: Option<std::path::PathBuf>,
+        skill_registry: Option<Arc<std::sync::RwLock<SkillRegistry>>>,
+        collection_write_tx: Option<tokio::sync::broadcast::Sender<crate::agent::collection_events::CollectionWriteEvent>>,
+    ) {
+        use crate::tools::builtin::{
+            CollectionDropTool, CollectionListTool, CollectionRegisterTool, CollectionsAlterTool,
+            generate_collection_tools,
+        };
+        use crate::tools::builtin::collections::{
+            generate_collection_skill, generate_router_skill,
+        };
+
+        // Register management tools
+        self.register_sync(Arc::new(CollectionListTool::new(Arc::clone(&db))));
+        let mut register_tool = CollectionRegisterTool::new(Arc::clone(&db), Arc::clone(self));
+        if let Some(ref dir) = skills_dir {
+            register_tool = register_tool.with_skills_dir(dir.clone());
+        }
+        if let Some(ref sr) = skill_registry {
+            register_tool = register_tool.with_skill_registry(Arc::clone(sr));
+        }
+        if let Some(ref tx) = collection_write_tx {
+            register_tool = register_tool.with_collection_write_tx(tx.clone());
+        }
+        self.register_sync(Arc::new(register_tool));
+        let mut drop_tool = CollectionDropTool::new(Arc::clone(&db), Arc::clone(self));
+        if let Some(ref dir) = skills_dir {
+            drop_tool = drop_tool.with_skills_dir(dir.clone());
+        }
+        if let Some(ref sr) = skill_registry {
+            drop_tool = drop_tool.with_skill_registry(Arc::clone(sr));
+        }
+        self.register_sync(Arc::new(drop_tool));
+        let mut alter_tool = CollectionsAlterTool::new(Arc::clone(&db), Arc::clone(self));
+        if let Some(ref dir) = skills_dir {
+            alter_tool = alter_tool.with_skills_dir(dir.clone());
+        }
+        if let Some(ref sr) = skill_registry {
+            alter_tool = alter_tool.with_skill_registry(Arc::clone(sr));
+        }
+        if let Some(ref tx) = collection_write_tx {
+            alter_tool = alter_tool.with_collection_write_tx(tx.clone());
+        }
+        self.register_sync(Arc::new(alter_tool));
+
+        // Load existing schemas and generate per-collection tools + skills
+        match db.list_collections(user_id).await {
+            Ok(schemas) => {
+                let mut tool_count = 0;
+                for schema in &schemas {
+                    let tools = generate_collection_tools(schema, Arc::clone(&db), collection_write_tx.clone());
+                    tool_count += tools.len();
+                    for tool in tools {
+                        self.register(tool).await;
+                    }
+
+                    // Regenerate per-collection SKILL.md (best-effort)
+                    if let Some(ref dir) = skills_dir {
+                        generate_collection_skill(schema, dir);
+
+                        if let Some(ref sr) = skill_registry {
+                            let skill_path =
+                                dir.join(&schema.collection).join("SKILL.md");
+                            match crate::skills::load_and_validate_skill(
+                                &skill_path,
+                                crate::skills::SkillTrust::Trusted,
+                                crate::skills::SkillSource::User(
+                                    dir.join(&schema.collection),
+                                ),
+                            )
+                            .await
+                            {
+                                Ok((name, skill)) => {
+                                    if let Ok(mut reg) = sr.write() {
+                                        let _ = reg.commit_remove(&name);
+                                        if let Err(e) = reg.commit_install(&name, skill) {
+                                            tracing::warn!(
+                                                "Failed to install per-collection skill on startup: {e}"
+                                            );
+                                        } else {
+                                            tracing::info!("Loaded per-collection skill into registry: {name}");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to load per-collection skill on startup: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Regenerate the collections-router skill (best-effort)
+                if !schemas.is_empty()
+                    && let Some(ref dir) = skills_dir
+                {
+                    generate_router_skill(&schemas, dir);
+
+                    if let Some(ref sr) = skill_registry {
+                        let router_path =
+                            dir.join("collections-router").join("SKILL.md");
+                        if router_path.exists() {
+                            match crate::skills::load_and_validate_skill(
+                                &router_path,
+                                crate::skills::SkillTrust::Trusted,
+                                crate::skills::SkillSource::User(
+                                    dir.join("collections-router"),
+                                ),
+                            )
+                            .await
+                            {
+                                Ok((rname, rskill)) => {
+                                    if let Ok(mut reg) = sr.write() {
+                                        let _ = reg.commit_remove(&rname);
+                                        if let Err(e) = reg.commit_install(&rname, rskill) {
+                                            tracing::warn!("Failed to install router skill on startup: {e}");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to load router skill on startup: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                tracing::info!(
+                    "Registered 4 collection management tools + {} per-collection tools for {} schemas",
+                    tool_count,
+                    schemas.len()
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load collection schemas: {e}");
+                tracing::info!(
+                    "Registered 4 collection management tools (no existing schemas loaded)"
+                );
+            }
+        }
     }
 
     /// Register the software builder tool.

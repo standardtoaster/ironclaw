@@ -10,26 +10,42 @@
 //! Lightweight routines execute inline (single LLM call, no scheduler slot).
 //! Full-job routines are delegated to the existing `Scheduler`.
 
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
 use regex::Regex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
 use crate::agent::Scheduler;
+use crate::agent::collection_events::CollectionWriteEvent;
 use crate::agent::routine::{
     NotifyConfig, Routine, RoutineAction, RoutineRun, RunStatus, Trigger, next_cron_fire,
 };
 use crate::channels::{IncomingMessage, OutgoingResponse};
 use crate::config::RoutineConfig;
+use crate::context::JobContext;
 use crate::db::Database;
 use crate::error::RoutineError;
 use crate::llm::{ChatMessage, CompletionRequest, FinishReason, LlmProvider};
 use crate::tools::ApprovalContext;
+use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
+
+/// Check if a routine's CollectionWrite trigger matches an event.
+fn matches_collection_write(routine: &Routine, event: &CollectionWriteEvent) -> bool {
+    if routine.user_id != event.user_id {
+        return false;
+    }
+    match &routine.trigger {
+        Trigger::CollectionWrite { collection } => collection == &event.collection,
+        _ => false,
+    }
+}
 
 /// The routine execution engine.
 pub struct RoutineEngine {
@@ -43,8 +59,16 @@ pub struct RoutineEngine {
     running_count: Arc<AtomicUsize>,
     /// Compiled event regex cache: routine_id -> compiled regex.
     event_cache: Arc<RwLock<Vec<(Uuid, Routine, Regex)>>>,
+    /// Cache of collection-write triggered routines.
+    collection_write_cache: Arc<RwLock<Vec<Routine>>>,
     /// Scheduler for dispatching jobs (FullJob mode).
     scheduler: Option<Arc<Scheduler>>,
+    /// Tool registry for WASM routine execution.
+    tool_registry: Option<Arc<ToolRegistry>>,
+    /// Gateway port for script `IRONCLAW_PORT` env var (resolved at construction).
+    gateway_port: Option<u16>,
+    /// Default auth token for script `IRONCLAW_TOKEN` env var.
+    gateway_auth_token: Option<String>,
 }
 
 impl RoutineEngine {
@@ -55,7 +79,14 @@ impl RoutineEngine {
         workspace: Arc<Workspace>,
         notify_tx: mpsc::Sender<OutgoingResponse>,
         scheduler: Option<Arc<Scheduler>>,
+        tool_registry: Option<Arc<ToolRegistry>>,
     ) -> Self {
+        // Resolve gateway connection details from environment for script actions.
+        let gateway_port = std::env::var("GATEWAY_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let gateway_auth_token = std::env::var("GATEWAY_AUTH_TOKEN").ok();
+
         Self {
             config,
             store,
@@ -64,7 +95,11 @@ impl RoutineEngine {
             notify_tx,
             running_count: Arc::new(AtomicUsize::new(0)),
             event_cache: Arc::new(RwLock::new(Vec::new())),
+            collection_write_cache: Arc::new(RwLock::new(Vec::new())),
             scheduler,
+            tool_registry,
+            gateway_port,
+            gateway_auth_token,
         }
     }
 
@@ -95,6 +130,85 @@ impl RoutineEngine {
                 tracing::error!("Failed to refresh event cache: {}", e);
             }
         }
+    }
+
+    /// Refresh the in-memory collection write trigger cache from DB.
+    pub async fn refresh_collection_write_cache(&self) {
+        match self.store.list_all_routines().await {
+            Ok(routines) => {
+                let filtered: Vec<Routine> = routines
+                    .into_iter()
+                    .filter(|r| r.enabled && matches!(r.trigger, Trigger::CollectionWrite { .. }))
+                    .collect();
+                let count = filtered.len();
+                *self.collection_write_cache.write().await = filtered;
+                tracing::debug!("Refreshed collection write cache: {} routines", count);
+            }
+            Err(e) => {
+                tracing::error!("Failed to refresh collection write cache: {}", e);
+            }
+        }
+    }
+
+    /// Check a collection write event against cached triggers. Returns number of routines fired.
+    pub async fn check_collection_write_triggers(&self, event: &CollectionWriteEvent) -> usize {
+        let cache = self.collection_write_cache.read().await;
+        let mut fired = 0;
+
+        for routine in cache.iter() {
+            if !matches_collection_write(routine, event) {
+                continue;
+            }
+            if !self.check_cooldown(routine) {
+                tracing::debug!(routine = %routine.name, "Skipped: cooldown active");
+                continue;
+            }
+            if !self.check_concurrent(routine).await {
+                tracing::debug!(routine = %routine.name, "Skipped: max concurrent reached");
+                continue;
+            }
+            if self.running_count.load(Ordering::Relaxed) >= self.config.max_concurrent_routines {
+                tracing::warn!(routine = %routine.name, "Skipped: global max concurrent reached");
+                continue;
+            }
+            let detail = serde_json::to_string(&event.data).unwrap_or_default();
+            self.spawn_fire(routine.clone(), "collection_write", Some(detail));
+            fired += 1;
+        }
+
+        fired
+    }
+
+    /// Spawn a background task that listens for collection write events and fires matching triggers.
+    pub fn spawn_collection_write_listener(
+        self: &Arc<Self>,
+        mut rx: tokio::sync::broadcast::Receiver<CollectionWriteEvent>,
+    ) {
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        let fired = engine.check_collection_write_triggers(&event).await;
+                        if fired > 0 {
+                            tracing::info!(
+                                collection = %event.collection,
+                                record_id = %event.record_id,
+                                fired,
+                                "CollectionWrite triggers fired"
+                            );
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "CollectionWrite listener lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::info!("CollectionWrite broadcast channel closed");
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     /// Check incoming message against event triggers. Returns number of routines fired.
@@ -246,6 +360,9 @@ impl RoutineEngine {
             notify_tx: self.notify_tx.clone(),
             running_count: self.running_count.clone(),
             scheduler: self.scheduler.clone(),
+            tool_registry: self.tool_registry.clone(),
+            gateway_port: self.gateway_port,
+            user_token: self.gateway_auth_token.clone(),
         };
 
         tokio::spawn(async move {
@@ -278,6 +395,9 @@ impl RoutineEngine {
             notify_tx: self.notify_tx.clone(),
             running_count: self.running_count.clone(),
             scheduler: self.scheduler.clone(),
+            tool_registry: self.tool_registry.clone(),
+            gateway_port: self.gateway_port,
+            user_token: self.gateway_auth_token.clone(),
         };
 
         // Record the run in DB, then spawn execution
@@ -325,6 +445,11 @@ struct EngineContext {
     notify_tx: mpsc::Sender<OutgoingResponse>,
     running_count: Arc<AtomicUsize>,
     scheduler: Option<Arc<Scheduler>>,
+    tool_registry: Option<Arc<ToolRegistry>>,
+    /// Gateway port for script IRONCLAW_PORT env var.
+    gateway_port: Option<u16>,
+    /// Auth token for script IRONCLAW_TOKEN env var.
+    user_token: Option<String>,
 }
 
 /// Execute a routine run. Handles both lightweight and full_job modes.
@@ -352,6 +477,34 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
                 description,
                 *max_iterations,
                 tool_permissions,
+            )
+            .await
+        }
+        RoutineAction::Wasm {
+            tool_name,
+            escalation_prompt,
+        } => {
+            execute_wasm(
+                &ctx,
+                &routine,
+                tool_name,
+                escalation_prompt,
+                run.trigger_detail.as_deref(),
+            )
+            .await
+        }
+        RoutineAction::Script {
+            language,
+            source,
+            escalation_prompt,
+        } => {
+            execute_script(
+                &ctx,
+                &routine,
+                language,
+                source,
+                escalation_prompt,
+                run.trigger_detail.as_deref(),
             )
             .await
         }
@@ -468,6 +621,109 @@ fn sanitize_routine_name(name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Execute a WASM tool routine action.
+///
+/// Looks up the tool in the registry, executes it with the trigger data,
+/// and parses the response. If the tool returns `{"status": "escalate"}`,
+/// falls back to a lightweight LLM call with the escalation prompt.
+async fn execute_wasm(
+    ctx: &EngineContext,
+    routine: &Routine,
+    tool_name: &str,
+    escalation_prompt: &Option<String>,
+    trigger_detail: Option<&str>,
+) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
+    let registry = ctx
+        .tool_registry
+        .as_ref()
+        .ok_or_else(|| RoutineError::WasmFailed {
+            reason: "tool registry not available".to_string(),
+        })?;
+
+    let tool: Arc<dyn crate::tools::Tool> =
+        registry
+            .get(tool_name)
+            .await
+            .ok_or_else(|| RoutineError::WasmFailed {
+                reason: format!("tool '{}' not found in registry", tool_name),
+            })?;
+
+    // Build params from trigger detail
+    let params = match trigger_detail {
+        Some(detail) => serde_json::from_str(detail)
+            .unwrap_or_else(|_| serde_json::json!({"trigger_data": detail})),
+        None => serde_json::json!({}),
+    };
+
+    // Build a minimal JobContext for the routine's user
+    let job_ctx = JobContext::with_user(
+        &routine.user_id,
+        format!("routine:{}", routine.name),
+        "WASM routine action",
+    );
+
+    match tool.execute(params, &job_ctx).await {
+        Ok(output) => {
+            // Extract text from the result Value
+            let response_text = match &output.result {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+
+            // Try to parse as structured response
+            if let Ok(response) = serde_json::from_str::<serde_json::Value>(&response_text) {
+                match response.get("status").and_then(|s| s.as_str()) {
+                    Some("handled") => Ok((RunStatus::Ok, Some(response_text), None)),
+                    Some("noop") => Ok((RunStatus::Ok, None, None)),
+                    Some("escalate") => {
+                        let escalation_context = response
+                            .get("context")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("WASM module requested escalation");
+
+                        match escalation_prompt {
+                            Some(prompt) => {
+                                let full_prompt =
+                                    prompt.replace("{{context}}", escalation_context);
+                                tracing::info!(
+                                    routine = %routine.name,
+                                    "WASM escalated to LLM: {}",
+                                    escalation_context
+                                );
+                                execute_lightweight(ctx, routine, &full_prompt, &[], 4096).await
+                            }
+                            None => {
+                                tracing::warn!(
+                                    routine = %routine.name,
+                                    "WASM escalated but no escalation_prompt configured"
+                                );
+                                Ok((
+                                    RunStatus::Attention,
+                                    Some(format!(
+                                        "Escalation needed: {}",
+                                        escalation_context
+                                    )),
+                                    None,
+                                ))
+                            }
+                        }
+                    }
+                    _ => {
+                        // Unrecognized status — treat as handled
+                        Ok((RunStatus::Ok, Some(response_text), None))
+                    }
+                }
+            } else {
+                // Non-JSON response — treat as handled
+                Ok((RunStatus::Ok, Some(response_text), None))
+            }
+        }
+        Err(e) => Err(RoutineError::WasmFailed {
+            reason: format!("tool execution failed: {}", e),
+        }),
+    }
 }
 
 /// Execute a full-job routine by dispatching to the scheduler.
@@ -724,9 +980,263 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Maximum script output size before truncation (64KB).
+const SCRIPT_MAX_OUTPUT: usize = 64 * 1024;
+
+/// Default script timeout.
+const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Safe environment variables forwarded to script subprocesses.
+const SCRIPT_SAFE_ENV_VARS: &[&str] = &[
+    "PATH", "HOME", "USER", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TMP", "TEMP",
+];
+
+/// Result of parsing script subprocess output.
+#[derive(Debug, PartialEq)]
+enum ScriptResult {
+    Handled,
+    Noop,
+    Escalate(String),
+    Failed,
+}
+
+/// Parse the stdout + exit code from a script subprocess.
+fn parse_script_response(stdout: &str, exit_code: i32) -> (ScriptResult, Option<String>) {
+    if exit_code != 0 {
+        return (ScriptResult::Failed, Some(stdout.to_string()));
+    }
+
+    let stdout_trimmed = stdout.trim();
+    if stdout_trimmed.is_empty() {
+        return (ScriptResult::Noop, None);
+    }
+
+    match serde_json::from_str::<serde_json::Value>(stdout_trimmed) {
+        Ok(response) => match response.get("status").and_then(|s| s.as_str()) {
+            Some("handled") => (ScriptResult::Handled, Some(stdout_trimmed.to_string())),
+            Some("noop") => (ScriptResult::Noop, None),
+            Some("escalate") => {
+                let context = response
+                    .get("context")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("script requested escalation")
+                    .to_string();
+                (ScriptResult::Escalate(context), Some(stdout_trimmed.to_string()))
+            }
+            _ => (ScriptResult::Handled, Some(stdout_trimmed.to_string())),
+        },
+        Err(_) => (
+            ScriptResult::Escalate(stdout_trimmed.to_string()),
+            Some(stdout_trimmed.to_string()),
+        ),
+    }
+}
+
+/// Execute a script routine action.
+///
+/// Writes the script source to a temp file, spawns the appropriate interpreter
+/// (python3 or bash), pipes trigger data to stdin, captures output with timeout,
+/// and parses the response. Escalation falls back to a lightweight LLM call.
+async fn execute_script(
+    ctx: &EngineContext,
+    routine: &Routine,
+    language: &str,
+    source: &str,
+    escalation_prompt: &Option<String>,
+    trigger_detail: Option<&str>,
+) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
+    let ext = match language {
+        "python" => "py",
+        "bash" => "sh",
+        other => {
+            return Err(RoutineError::ScriptFailed {
+                reason: format!("unsupported script language: {other}"),
+            });
+        }
+    };
+
+    let interpreter = match language {
+        "python" => "python3",
+        _ => "bash",
+    };
+
+    // Write script to temp file
+    let script_id = Uuid::new_v4();
+    let script_path = format!("/tmp/ironclaw-script-{script_id}.{ext}");
+
+    if let Err(e) = tokio::fs::write(&script_path, source).await {
+        return Err(RoutineError::ScriptFailed {
+            reason: format!("failed to write temp script: {e}"),
+        });
+    }
+
+    // Use per-routine timeout if configured, otherwise default
+    let timeout = routine
+        .guardrails
+        .max_execution_time
+        .unwrap_or(SCRIPT_TIMEOUT);
+
+    // Ensure cleanup on all exit paths
+    let result = execute_script_inner(
+        ctx, routine, interpreter, &script_path, escalation_prompt, trigger_detail, timeout,
+    )
+    .await;
+
+    // Clean up temp file (best-effort)
+    let _ = tokio::fs::remove_file(&script_path).await;
+
+    result
+}
+
+/// Inner script execution (separated for cleanup guarantee).
+async fn execute_script_inner(
+    ctx: &EngineContext,
+    routine: &Routine,
+    interpreter: &str,
+    script_path: &str,
+    escalation_prompt: &Option<String>,
+    trigger_detail: Option<&str>,
+    timeout: Duration,
+) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
+    let mut command = tokio::process::Command::new(interpreter);
+    command.arg(script_path);
+
+    // Scrub environment: only safe vars + IRONCLAW_* context
+    command.env_clear();
+    for var in SCRIPT_SAFE_ENV_VARS {
+        if let Ok(val) = std::env::var(var) {
+            command.env(var, val);
+        }
+    }
+    if let Some(port) = ctx.gateway_port {
+        command.env("IRONCLAW_PORT", port.to_string());
+    }
+    if let Some(ref token) = ctx.user_token {
+        command.env("IRONCLAW_TOKEN", token);
+    }
+    command.env("IRONCLAW_USER_ID", &routine.user_id);
+
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|e| RoutineError::ScriptFailed {
+        reason: format!("failed to spawn {interpreter}: {e}"),
+    })?;
+
+    // Write trigger data to stdin, then close it so script sees EOF
+    if let Some(mut stdin) = child.stdin.take() {
+        let data = trigger_detail.unwrap_or("{}");
+        // Best-effort write — if it fails the script just gets empty stdin
+        let _ = stdin.write_all(data.as_bytes()).await;
+        let _ = stdin.shutdown().await;
+    }
+
+    // Drain stdout/stderr concurrently with timeout
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    let result = tokio::time::timeout(timeout, async {
+        let stdout_fut = async {
+            if let Some(mut out) = stdout_handle {
+                let mut buf = Vec::new();
+                (&mut out)
+                    .take(SCRIPT_MAX_OUTPUT as u64)
+                    .read_to_end(&mut buf)
+                    .await
+                    .ok();
+                tokio::io::copy(&mut out, &mut tokio::io::sink()).await.ok();
+                String::from_utf8_lossy(&buf).to_string()
+            } else {
+                String::new()
+            }
+        };
+
+        let stderr_fut = async {
+            if let Some(mut err) = stderr_handle {
+                let mut buf = Vec::new();
+                (&mut err)
+                    .take(SCRIPT_MAX_OUTPUT as u64)
+                    .read_to_end(&mut buf)
+                    .await
+                    .ok();
+                tokio::io::copy(&mut err, &mut tokio::io::sink()).await.ok();
+                String::from_utf8_lossy(&buf).to_string()
+            } else {
+                String::new()
+            }
+        };
+
+        let (stdout, stderr, wait_result) = tokio::join!(stdout_fut, stderr_fut, child.wait());
+        let status = wait_result.map_err(|e| RoutineError::ScriptFailed {
+            reason: format!("failed to wait for script: {e}"),
+        })?;
+
+        Ok::<_, RoutineError>((stdout, stderr, status.code().unwrap_or(-1)))
+    })
+    .await;
+
+    let (stdout, stderr, exit_code) = match result {
+        Ok(Ok(tuple)) => tuple,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            // Timeout — kill the process
+            let _ = child.kill().await;
+            return Err(RoutineError::ScriptFailed {
+                reason: format!(
+                    "script timed out after {}s",
+                    timeout.as_secs()
+                ),
+            });
+        }
+    };
+
+    let (script_result, output) = parse_script_response(&stdout, exit_code);
+
+    match script_result {
+        ScriptResult::Handled => Ok((RunStatus::Ok, output, None)),
+        ScriptResult::Noop => Ok((RunStatus::Ok, None, None)),
+        ScriptResult::Escalate(context) => {
+            match escalation_prompt {
+                Some(prompt) => {
+                    let full_prompt = prompt.replace("{{context}}", &context);
+                    tracing::info!(
+                        routine = %routine.name,
+                        "Script escalated to LLM: {}",
+                        context
+                    );
+                    execute_lightweight(ctx, routine, &full_prompt, &[], 4096).await
+                }
+                None => {
+                    tracing::warn!(
+                        routine = %routine.name,
+                        "Script escalated but no escalation_prompt configured"
+                    );
+                    Ok((
+                        RunStatus::Attention,
+                        Some(format!("Escalation needed: {context}")),
+                        None,
+                    ))
+                }
+            }
+        }
+        ScriptResult::Failed => {
+            let reason = if stderr.is_empty() {
+                stdout
+            } else {
+                format!("{stdout}\n--- stderr ---\n{stderr}")
+            };
+            Err(RoutineError::ScriptFailed { reason })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::agent::routine::{NotifyConfig, RunStatus};
+    use crate::agent::collection_events::CollectionWriteEvent;
+    use crate::agent::routine::{NotifyConfig, Routine, RoutineAction, RoutineGuardrails, RunStatus, Trigger};
+    use super::matches_collection_write;
 
     #[test]
     fn test_notification_gating() {
@@ -754,5 +1264,295 @@ mod tests {
         ] {
             let _ = status.to_string();
         }
+    }
+
+    fn make_collection_write_routine(name: &str, collection: &str, user_id: &str) -> Routine {
+        Routine {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            description: String::new(),
+            user_id: user_id.to_string(),
+            enabled: true,
+            trigger: Trigger::CollectionWrite {
+                collection: collection.to_string(),
+            },
+            action: RoutineAction::Lightweight {
+                prompt: "test prompt".to_string(),
+                context_paths: vec![],
+                max_tokens: 1024,
+            },
+            guardrails: RoutineGuardrails::default(),
+            notify: NotifyConfig::default(),
+            last_run_at: None,
+            next_fire_at: None,
+            run_count: 0,
+            consecutive_failures: 0,
+            state: serde_json::Value::Null,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_match_collection_write_trigger() {
+        let routine = make_collection_write_routine("presence-handler", "wifi_presence", "test-user");
+        let event = CollectionWriteEvent {
+            user_id: "test-user".to_string(),
+            collection: "wifi_presence".to_string(),
+            record_id: uuid::Uuid::new_v4(),
+            data: serde_json::json!({"device": "phone", "state": "home"}),
+        };
+        assert!(matches_collection_write(&routine, &event));
+    }
+
+    #[test]
+    fn test_no_match_wrong_collection() {
+        let routine = make_collection_write_routine("presence-handler", "wifi_presence", "test-user");
+        let event = CollectionWriteEvent {
+            user_id: "test-user".to_string(),
+            collection: "nanny_shifts".to_string(),
+            record_id: uuid::Uuid::new_v4(),
+            data: serde_json::json!({}),
+        };
+        assert!(!matches_collection_write(&routine, &event));
+    }
+
+    #[test]
+    fn test_no_match_wrong_user() {
+        let routine = make_collection_write_routine("presence-handler", "wifi_presence", "test-user");
+        let event = CollectionWriteEvent {
+            user_id: "other-user".to_string(),
+            collection: "wifi_presence".to_string(),
+            record_id: uuid::Uuid::new_v4(),
+            data: serde_json::json!({}),
+        };
+        assert!(!matches_collection_write(&routine, &event));
+    }
+
+    // ── parse_script_response tests ──────────────────────────────────
+
+    use super::{ScriptResult, parse_script_response};
+
+    #[test]
+    fn test_parse_script_response_handled() {
+        let stdout = r#"{"status": "handled", "summary": "done"}"#;
+        let (result, output) = parse_script_response(stdout, 0);
+        assert_eq!(result, ScriptResult::Handled);
+        assert!(output.is_some());
+        assert!(output.unwrap().contains("handled"));
+    }
+
+    #[test]
+    fn test_parse_script_response_noop() {
+        let stdout = r#"{"status": "noop"}"#;
+        let (result, output) = parse_script_response(stdout, 0);
+        assert_eq!(result, ScriptResult::Noop);
+        assert!(output.is_none());
+    }
+
+    #[test]
+    fn test_parse_script_response_escalate() {
+        let stdout = r#"{"status": "escalate", "context": "need human help"}"#;
+        let (result, output) = parse_script_response(stdout, 0);
+        assert_eq!(result, ScriptResult::Escalate("need human help".to_string()));
+        assert!(output.is_some());
+    }
+
+    #[test]
+    fn test_parse_script_response_nonzero_exit() {
+        let stdout = "some error output";
+        let (result, output) = parse_script_response(stdout, 1);
+        assert_eq!(result, ScriptResult::Failed);
+        assert_eq!(output.unwrap(), "some error output");
+    }
+
+    #[test]
+    fn test_parse_script_response_invalid_json() {
+        let stdout = "this is not json at all";
+        let (result, output) = parse_script_response(stdout, 0);
+        assert_eq!(
+            result,
+            ScriptResult::Escalate("this is not json at all".to_string())
+        );
+        assert_eq!(output.unwrap(), "this is not json at all");
+    }
+
+    // ── subprocess integration tests ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_execute_script_python_handled() {
+        use tokio::io::AsyncWriteExt;
+
+        let source = r#"#!/usr/bin/env python3
+import json, sys
+data = json.load(sys.stdin)
+print(json.dumps({"status": "handled"}))
+"#;
+        let script_path = std::env::temp_dir().join("ironclaw-test-handled.py");
+        tokio::fs::write(&script_path, source).await.unwrap();
+
+        let mut child = tokio::process::Command::new("python3")
+            .arg(&script_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(b"{}").await.unwrap();
+            drop(stdin);
+        }
+
+        let output = child.wait_with_output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (result, _) = parse_script_response(&stdout, output.status.code().unwrap_or(-1));
+        assert_eq!(result, ScriptResult::Handled);
+
+        let _ = tokio::fs::remove_file(&script_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_script_bash_noop() {
+        use tokio::io::AsyncWriteExt;
+
+        let source = r#"#!/usr/bin/env bash
+echo '{"status": "noop"}'
+"#;
+        let script_path = std::env::temp_dir().join("ironclaw-test-noop.sh");
+        tokio::fs::write(&script_path, source).await.unwrap();
+
+        let mut child = tokio::process::Command::new("bash")
+            .arg(&script_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(b"{}").await.unwrap();
+            drop(stdin);
+        }
+
+        let output = child.wait_with_output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (result, _) = parse_script_response(&stdout, output.status.code().unwrap_or(-1));
+        assert_eq!(result, ScriptResult::Noop);
+
+        let _ = tokio::fs::remove_file(&script_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_script_reads_stdin() {
+        use tokio::io::AsyncWriteExt;
+
+        let source = r#"#!/usr/bin/env python3
+import json, sys
+data = json.load(sys.stdin)
+if data.get("state") == "home":
+    print(json.dumps({"status": "handled", "summary": "user is home"}))
+else:
+    print(json.dumps({"status": "noop"}))
+"#;
+        let script_path = std::env::temp_dir().join("ironclaw-test-reads-stdin.py");
+        tokio::fs::write(&script_path, source).await.unwrap();
+
+        let mut child = tokio::process::Command::new("python3")
+            .arg(&script_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(br#"{"state": "home"}"#).await.unwrap();
+            drop(stdin);
+        }
+
+        let output = child.wait_with_output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (result, _) = parse_script_response(&stdout, output.status.code().unwrap_or(-1));
+        assert_eq!(result, ScriptResult::Handled);
+
+        let _ = tokio::fs::remove_file(&script_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_script_nonzero_exit() {
+        use tokio::io::AsyncWriteExt;
+
+        let source = "#!/usr/bin/env bash\nexit 1\n";
+        let script_path = std::env::temp_dir().join("ironclaw-test-nonzero.sh");
+        tokio::fs::write(&script_path, source).await.unwrap();
+
+        let mut child = tokio::process::Command::new("bash")
+            .arg(&script_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(b"{}").await.unwrap();
+            drop(stdin);
+        }
+
+        let output = child.wait_with_output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (result, _) = parse_script_response(&stdout, output.status.code().unwrap_or(-1));
+        assert_eq!(result, ScriptResult::Failed);
+
+        let _ = tokio::fs::remove_file(&script_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_script_env_vars() {
+        use tokio::io::AsyncWriteExt;
+
+        let source = r#"#!/usr/bin/env python3
+import json, os, sys
+_ = sys.stdin.read()
+result = {
+    "port_set": os.environ.get("IRONCLAW_PORT") == "3003",
+    "token_set": os.environ.get("IRONCLAW_TOKEN") == "test-token",
+    "user_id_set": os.environ.get("IRONCLAW_USER_ID") == "test-user",
+    "anthropic_scrubbed": os.environ.get("ANTHROPIC_API_KEY") is None,
+}
+if all(result.values()):
+    print(json.dumps({"status": "handled", "checks": result}))
+else:
+    print(json.dumps({"status": "escalate", "context": json.dumps(result)}))
+"#;
+        let script_path = std::env::temp_dir().join("ironclaw-test-env-vars.py");
+        tokio::fs::write(&script_path, source).await.unwrap();
+
+        let mut child = tokio::process::Command::new("python3")
+            .arg(&script_path)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("IRONCLAW_PORT", "3003")
+            .env("IRONCLAW_TOKEN", "test-token")
+            .env("IRONCLAW_USER_ID", "test-user")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(b"{}").await.unwrap();
+            drop(stdin);
+        }
+
+        let output = child.wait_with_output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (result, _) = parse_script_response(&stdout, output.status.code().unwrap_or(-1));
+        assert_eq!(result, ScriptResult::Handled);
+
+        let _ = tokio::fs::remove_file(&script_path).await;
     }
 }

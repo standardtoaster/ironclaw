@@ -1,5 +1,6 @@
 //! Built-in tools that come with the agent.
 
+pub mod collections;
 mod echo;
 pub mod extension_tools;
 mod file;
@@ -16,6 +17,10 @@ pub(crate) mod shell;
 pub mod skill_tools;
 mod time;
 
+pub use collections::{
+    CollectionDropTool, CollectionListTool, CollectionRegisterTool, CollectionsAlterTool,
+    generate_collection_tools,
+};
 pub use echo::EchoTool;
 pub use extension_tools::{
     ExtensionInfoTool, ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool,

@@ -396,6 +396,15 @@ pub enum RoutineError {
 
     #[error("LLM response truncated (finish_reason=length) with no content")]
     TruncatedResponse,
+
+    #[error("WASM action failed: {reason}")]
+    WasmFailed { reason: String },
+
+    #[error("Script execution failed: {reason}")]
+    ScriptFailed { reason: String },
+
+    #[error("Not implemented: {feature}")]
+    NotImplemented { feature: String },
 }
 
 /// Result type alias for the agent.

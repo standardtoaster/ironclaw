@@ -29,6 +29,7 @@ use crate::agent::SessionManager;
 use crate::bootstrap::ironclaw_base_dir;
 use crate::channels::IncomingMessage;
 use crate::channels::web::auth::{AuthenticatedUser, MultiAuthState, UserIdentity, auth_middleware};
+use crate::channels::web::handlers::events::events_ingest_handler;
 use crate::channels::web::handlers::jobs::{
     job_files_list_handler, job_files_read_handler, jobs_cancel_handler, jobs_detail_handler,
     jobs_events_handler, jobs_list_handler, jobs_prompt_handler, jobs_restart_handler,
@@ -278,6 +279,11 @@ pub struct GatewayState {
     pub routine_engine: RoutineEngineSlot,
     /// Server startup time for uptime calculation.
     pub startup_time: std::time::Instant,
+    /// Flag set when a restart has been requested via the API.
+    pub restart_requested: std::sync::atomic::AtomicBool,
+    /// Broadcast sender for collection write events (fires routine triggers).
+    pub collection_write_tx:
+        Option<tokio::sync::broadcast::Sender<crate::agent::collection_events::CollectionWriteEvent>>,
 }
 
 impl GatewayState {
@@ -399,6 +405,8 @@ pub async fn start_server(
         .route("/api/jobs/{id}/events", get(jobs_events_handler))
         .route("/api/jobs/{id}/files/list", get(job_files_list_handler))
         .route("/api/jobs/{id}/files/read", get(job_files_read_handler))
+        // Event ingest
+        .route("/api/events/ingest", post(events_ingest_handler))
         // Logs
         .route("/api/logs/events", get(logs_events_handler))
         .route("/api/logs/level", get(logs_level_get_handler))
@@ -2532,11 +2540,16 @@ fn routine_to_info(r: &crate::agent::routine::Routine) -> RoutineInfo {
             ("webhook".to_string(), format!("webhook: {}", p))
         }
         crate::agent::routine::Trigger::Manual => ("manual".to_string(), "manual only".to_string()),
+        crate::agent::routine::Trigger::CollectionWrite { collection } => {
+            ("collection_write".to_string(), format!("on write to {}", collection))
+        }
     };
 
     let action_type = match &r.action {
         crate::agent::routine::RoutineAction::Lightweight { .. } => "lightweight",
         crate::agent::routine::RoutineAction::FullJob { .. } => "full_job",
+        crate::agent::routine::RoutineAction::Wasm { .. } => "wasm",
+        crate::agent::routine::RoutineAction::Script { .. } => "script",
     };
 
     let status = if !r.enabled {

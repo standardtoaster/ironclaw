@@ -108,6 +108,8 @@ impl GatewayChannel {
             cost_guard: None,
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
+            restart_requested: std::sync::atomic::AtomicBool::new(false),
+            collection_write_tx: None,
         });
 
         Self {
@@ -147,6 +149,8 @@ impl GatewayChannel {
             cost_guard: None,
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
+            restart_requested: std::sync::atomic::AtomicBool::new(false),
+            collection_write_tx: None,
         });
 
         Self {
@@ -186,6 +190,8 @@ impl GatewayChannel {
             cost_guard: self.state.cost_guard.clone(),
             routine_engine: Arc::clone(&self.state.routine_engine),
             startup_time: self.state.startup_time,
+            restart_requested: std::sync::atomic::AtomicBool::new(false),
+            collection_write_tx: self.state.collection_write_tx.clone(),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
@@ -294,6 +300,17 @@ impl GatewayChannel {
     /// Inject the per-user workspace pool for multi-user mode.
     pub fn with_workspace_pool(mut self, pool: Arc<server::WorkspacePool>) -> Self {
         self.rebuild_state(|s| s.workspace_pool = Some(pool));
+        self
+    }
+
+    /// Inject the broadcast sender for collection write events.
+    pub fn with_collection_write_tx(
+        mut self,
+        tx: tokio::sync::broadcast::Sender<
+            crate::agent::collection_events::CollectionWriteEvent,
+        >,
+    ) -> Self {
+        self.rebuild_state(|s| s.collection_write_tx = Some(tx));
         self
     }
 

@@ -11,6 +11,7 @@ mod jobs;
 mod routines;
 mod sandbox;
 mod settings;
+mod structured;
 mod tool_failures;
 mod workspace;
 
@@ -25,6 +26,7 @@ use rust_decimal::Decimal;
 use crate::agent::routine::{
     NotifyConfig, Routine, RoutineAction, RoutineGuardrails, RoutineRun, RunStatus, Trigger,
 };
+
 use crate::context::JobState;
 use crate::db::Database;
 use crate::error::DatabaseError;
@@ -369,6 +371,7 @@ pub(crate) fn row_to_routine_libsql(row: &libsql::Row) -> Result<Routine, Databa
             cooldown: std::time::Duration::from_secs(cooldown_secs as u64),
             max_concurrent: max_concurrent as u32,
             dedup_window: dedup_window_secs.map(|s| std::time::Duration::from_secs(s as u64)),
+            max_execution_time: None,
         },
         notify: NotifyConfig {
             channel: get_opt_text(row, 12),

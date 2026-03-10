@@ -78,6 +78,11 @@ pub enum Trigger {
     },
     /// Only fires via tool call or CLI.
     Manual,
+    /// Fire when a record is written to a structured collection.
+    CollectionWrite {
+        /// Collection name to watch (e.g., "wifi_presence").
+        collection: String,
+    },
 }
 
 impl Trigger {
@@ -88,6 +93,7 @@ impl Trigger {
             Trigger::Event { .. } => "event",
             Trigger::Webhook { .. } => "webhook",
             Trigger::Manual => "manual",
+            Trigger::CollectionWrite { .. } => "collection_write",
         }
     }
 
@@ -146,6 +152,17 @@ impl Trigger {
                 Ok(Trigger::Webhook { path, secret })
             }
             "manual" => Ok(Trigger::Manual),
+            "collection_write" => {
+                let collection = config
+                    .get("collection")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| RoutineError::MissingField {
+                        context: "collection_write trigger".into(),
+                        field: "collection".into(),
+                    })?
+                    .to_string();
+                Ok(Trigger::CollectionWrite { collection })
+            }
             other => Err(RoutineError::UnknownTriggerType {
                 trigger_type: other.to_string(),
             }),
@@ -168,6 +185,7 @@ impl Trigger {
                 "secret": secret,
             }),
             Trigger::Manual => serde_json::json!({}),
+            Trigger::CollectionWrite { collection } => serde_json::json!({ "collection": collection }),
         }
     }
 }
@@ -202,6 +220,26 @@ pub enum RoutineAction {
         #[serde(default)]
         tool_permissions: Vec<String>,
     },
+    /// Execute a WASM tool with the trigger data. If the tool returns "escalate",
+    /// fall back to a Lightweight LLM call with the escalation prompt.
+    Wasm {
+        /// Name of the WASM tool to invoke.
+        tool_name: String,
+        /// Optional LLM prompt for escalation. Use {{context}} as placeholder for WASM context.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        escalation_prompt: Option<String>,
+    },
+    /// Execute a script with the trigger data on stdin. If the script returns
+    /// {"status": "escalate"}, fall back to a Lightweight LLM call.
+    Script {
+        /// Script language: "python" or "bash".
+        language: String,
+        /// Inline script source code.
+        source: String,
+        /// Optional LLM prompt for escalation. Use {{context}} as placeholder.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        escalation_prompt: Option<String>,
+    },
 }
 
 fn default_max_tokens() -> u32 {
@@ -231,6 +269,8 @@ impl RoutineAction {
         match self {
             RoutineAction::Lightweight { .. } => "lightweight",
             RoutineAction::FullJob { .. } => "full_job",
+            RoutineAction::Wasm { .. } => "wasm",
+            RoutineAction::Script { .. } => "script",
         }
     }
 
@@ -295,6 +335,51 @@ impl RoutineAction {
                     tool_permissions,
                 })
             }
+            "wasm" => {
+                let tool_name = config
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| RoutineError::MissingField {
+                        context: "wasm action".into(),
+                        field: "tool_name".into(),
+                    })?
+                    .to_string();
+                let escalation_prompt = config
+                    .get("escalation_prompt")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                Ok(RoutineAction::Wasm {
+                    tool_name,
+                    escalation_prompt,
+                })
+            }
+            "script" => {
+                let language = config
+                    .get("language")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| RoutineError::MissingField {
+                        context: "script action".into(),
+                        field: "language".into(),
+                    })?
+                    .to_string();
+                let source = config
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| RoutineError::MissingField {
+                        context: "script action".into(),
+                        field: "source".into(),
+                    })?
+                    .to_string();
+                let escalation_prompt = config
+                    .get("escalation_prompt")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                Ok(RoutineAction::Script {
+                    language,
+                    source,
+                    escalation_prompt,
+                })
+            }
             other => Err(RoutineError::UnknownActionType {
                 action_type: other.to_string(),
             }),
@@ -324,6 +409,22 @@ impl RoutineAction {
                 "max_iterations": max_iterations,
                 "tool_permissions": tool_permissions,
             }),
+            RoutineAction::Wasm {
+                tool_name,
+                escalation_prompt,
+            } => serde_json::json!({
+                "tool_name": tool_name,
+                "escalation_prompt": escalation_prompt,
+            }),
+            RoutineAction::Script {
+                language,
+                source,
+                escalation_prompt,
+            } => serde_json::json!({
+                "language": language,
+                "source": source,
+                "escalation_prompt": escalation_prompt,
+            }),
         }
     }
 }
@@ -337,6 +438,9 @@ pub struct RoutineGuardrails {
     pub max_concurrent: u32,
     /// Window for content-hash dedup (event triggers). None = no dedup.
     pub dedup_window: Option<Duration>,
+    /// Max execution time for script/wasm actions. None = use default (30s).
+    #[serde(default)]
+    pub max_execution_time: Option<Duration>,
 }
 
 impl Default for RoutineGuardrails {
@@ -345,6 +449,7 @@ impl Default for RoutineGuardrails {
             cooldown: Duration::from_secs(300),
             max_concurrent: 1,
             dedup_window: None,
+            max_execution_time: None,
         }
     }
 }
@@ -631,5 +736,173 @@ mod tests {
             "webhook"
         );
         assert_eq!(Trigger::Manual.type_tag(), "manual");
+        assert_eq!(
+            Trigger::CollectionWrite {
+                collection: String::new()
+            }
+            .type_tag(),
+            "collection_write"
+        );
+    }
+
+    #[test]
+    fn test_collection_write_trigger_serialization() {
+        let trigger = Trigger::CollectionWrite {
+            collection: "wifi_presence".to_string(),
+        };
+        let json = serde_json::to_value(&trigger).unwrap();
+        assert_eq!(json["type"], "collection_write");
+        assert_eq!(json["collection"], "wifi_presence");
+
+        let roundtrip: Trigger = serde_json::from_value(json).unwrap();
+        match roundtrip {
+            Trigger::CollectionWrite { collection } => assert_eq!(collection, "wifi_presence"),
+            _ => panic!("Expected CollectionWrite"),
+        }
+    }
+
+    #[test]
+    fn test_collection_write_trigger_db_roundtrip() {
+        let trigger = Trigger::CollectionWrite {
+            collection: "nanny_shifts".to_string(),
+        };
+        let tag = trigger.type_tag();
+        let config_json = trigger.to_config_json();
+
+        assert_eq!(tag, "collection_write");
+
+        let restored = Trigger::from_db(tag, config_json).unwrap();
+        match restored {
+            Trigger::CollectionWrite { collection } => assert_eq!(collection, "nanny_shifts"),
+            _ => panic!("Expected CollectionWrite"),
+        }
+    }
+
+    #[test]
+    fn test_wasm_action_serialization() {
+        let action = RoutineAction::Wasm {
+            tool_name: "presence_to_shift".to_string(),
+            escalation_prompt: Some(
+                "Handle ambiguous presence event: {{context}}".to_string(),
+            ),
+        };
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(json["type"], "wasm");
+        assert_eq!(json["tool_name"], "presence_to_shift");
+        assert!(json["escalation_prompt"]
+            .as_str()
+            .unwrap()
+            .contains("{{context}}"));
+
+        let roundtrip: RoutineAction = serde_json::from_value(json).unwrap();
+        match roundtrip {
+            RoutineAction::Wasm {
+                tool_name,
+                escalation_prompt,
+            } => {
+                assert_eq!(tool_name, "presence_to_shift");
+                assert!(escalation_prompt.is_some());
+            }
+            _ => panic!("Expected Wasm"),
+        }
+    }
+
+    #[test]
+    fn test_wasm_action_without_escalation() {
+        let action = RoutineAction::Wasm {
+            tool_name: "simple_transform".to_string(),
+            escalation_prompt: None,
+        };
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(json["type"], "wasm");
+        assert!(json
+            .get("escalation_prompt")
+            .is_none_or(|v| v.is_null()));
+    }
+
+    #[test]
+    fn test_wasm_action_db_roundtrip() {
+        let action = RoutineAction::Wasm {
+            tool_name: "presence_to_shift".to_string(),
+            escalation_prompt: Some("Escalate: {{context}}".to_string()),
+        };
+        let tag = action.type_tag();
+        let config_json = action.to_config_json();
+        assert_eq!(tag, "wasm");
+
+        let restored = RoutineAction::from_db(tag, config_json).unwrap();
+        match restored {
+            RoutineAction::Wasm {
+                tool_name,
+                escalation_prompt,
+            } => {
+                assert_eq!(tool_name, "presence_to_shift");
+                assert_eq!(escalation_prompt.unwrap(), "Escalate: {{context}}");
+            }
+            _ => panic!("Expected Wasm"),
+        }
+    }
+
+    #[test]
+    fn test_script_action_serialization() {
+        let action = RoutineAction::Script {
+            language: "python".to_string(),
+            source: "#!/usr/bin/env python3\nprint('hello')".to_string(),
+            escalation_prompt: Some("Script failed: {{context}}".to_string()),
+        };
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(json["language"], "python");
+        assert_eq!(json["source"], "#!/usr/bin/env python3\nprint('hello')");
+        assert_eq!(json["escalation_prompt"], "Script failed: {{context}}");
+
+        let roundtrip: RoutineAction = serde_json::from_value(json).unwrap();
+        match roundtrip {
+            RoutineAction::Script {
+                language,
+                source,
+                escalation_prompt,
+            } => {
+                assert_eq!(language, "python");
+                assert!(source.contains("print('hello')"));
+                assert_eq!(escalation_prompt.unwrap(), "Script failed: {{context}}");
+            }
+            _ => panic!("Expected Script"),
+        }
+    }
+
+    #[test]
+    fn test_script_action_without_escalation() {
+        let action = RoutineAction::Script {
+            language: "bash".to_string(),
+            source: "#!/bin/bash\necho done".to_string(),
+            escalation_prompt: None,
+        };
+        let json = serde_json::to_value(&action).unwrap();
+        assert!(json.get("escalation_prompt").is_none());
+    }
+
+    #[test]
+    fn test_script_action_db_roundtrip() {
+        let action = RoutineAction::Script {
+            language: "python".to_string(),
+            source: "import json, sys\nprint(json.dumps({'status': 'handled'}))".to_string(),
+            escalation_prompt: Some("Handle this: {{context}}".to_string()),
+        };
+        let tag = action.type_tag();
+        assert_eq!(tag, "script");
+        let config_json = action.to_config_json();
+        let restored = RoutineAction::from_db(tag, config_json).unwrap();
+        match restored {
+            RoutineAction::Script {
+                language,
+                source,
+                escalation_prompt,
+            } => {
+                assert_eq!(language, "python");
+                assert!(source.contains("json.dumps"));
+                assert!(escalation_prompt.unwrap().contains("{{context}}"));
+            }
+            _ => panic!("Expected Script"),
+        }
     }
 }
