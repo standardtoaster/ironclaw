@@ -1020,6 +1020,7 @@ mod tests {
                 cooldown: std::time::Duration::from_secs(60),
                 max_concurrent: 1,
                 dedup_window: None,
+                max_execution_time: None,
             },
             notify: NotifyConfig {
                 channel: None,
@@ -1151,6 +1152,7 @@ mod tests {
                 cooldown: std::time::Duration::from_secs(0),
                 max_concurrent: 1,
                 dedup_window: None,
+                max_execution_time: None,
             },
             notify: NotifyConfig {
                 channel: None,

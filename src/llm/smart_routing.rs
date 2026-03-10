@@ -1975,10 +1975,10 @@ mod tests {
 
         let router = SmartRoutingProvider::new(primary.clone(), cheap.clone(), default_config());
 
-        // Security audit triggers Frontier via pattern override → Complex → primary
+        // "implement" keyword triggers Complex → last tier → primary
         let resp = router
             .complete(make_request(
-                "Please do a security audit of this smart contract",
+                "Please implement a caching layer for this service",
             ))
             .await
             .unwrap();
@@ -2106,28 +2106,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tier_hint_overrides_pattern_override() {
-        // "[tier:flash] security audit review" has both a Flash tier hint and
-        // a Frontier pattern override. Tier hints should win.
+    async fn tier_hint_overrides_complexity() {
+        // Skill routing hint (tier 0) should override keyword-based complexity
+        // that would otherwise route to primary. Hints are passed via metadata.
         let primary = Arc::new(StubLlm::new("primary").with_model_name("primary"));
         let cheap = Arc::new(StubLlm::new("cheap").with_model_name("cheap"));
 
-        let router = SmartRoutingProvider::new(
-            primary.clone(),
-            cheap.clone(),
+        let router = SmartRoutingProvider::tiered(
+            vec![cheap.clone() as Arc<dyn LlmProvider>, primary.clone()],
+            Arc::new(SkillAwareClassifier),
             SmartRoutingConfig {
                 cascade_enabled: false,
                 ..default_config()
             },
         );
 
-        let resp = router
-            .complete(make_request("[tier:flash] security audit review"))
-            .await
-            .unwrap();
+        // "implement" triggers Complex (normally → primary), but skill hint
+        // sets tool_tier=0, and we include tools so the hint path is taken.
+        let hints = vec![SkillRoutingHint {
+            skill_name: "test".to_string(),
+            tool_tier: Some(0),
+            operation_tiers: None,
+        }];
+        let mut req = ToolCompletionRequest::new(
+            vec![ChatMessage::user("implement a search feature")],
+            vec![crate::llm::ToolDefinition {
+                name: "search_tool".to_string(),
+                description: "A search tool".to_string(),
+                parameters: serde_json::json!({}),
+            }],
+        );
+        req.metadata.insert(
+            META_ROUTING_SKILL_HINTS.to_string(),
+            serde_json::to_string(&hints).unwrap(),
+        );
 
-        // Tier hint -> Flash -> Simple -> cheap model
-        assert_eq!(resp.content, "cheap");
+        let resp = router.complete_with_tools(req).await.unwrap();
+
+        // Skill hint → tier 0 → cheap model
+        assert_eq!(resp.content, Some("cheap".to_string()));
         assert_eq!(cheap.calls(), 1);
         assert_eq!(primary.calls(), 0);
     }

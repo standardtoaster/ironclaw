@@ -404,6 +404,7 @@ mod tests {
             content_hash: "sha256:000".to_string(),
             compiled_patterns: vec![],
             lowercased_keywords: vec![],
+            lowercased_exclude_keywords: vec![],
             lowercased_tags: vec![],
         }
     }
@@ -709,6 +710,7 @@ mod tests {
             content_hash: "sha256:000".to_string(),
             compiled_patterns: vec![],
             lowercased_keywords: vec![],
+            lowercased_exclude_keywords: vec![],
             lowercased_tags: vec![],
         }];
 
