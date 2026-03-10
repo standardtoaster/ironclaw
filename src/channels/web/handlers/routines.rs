@@ -147,7 +147,7 @@ pub async fn routines_trigger_handler(
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
 
     let run_id = engine
-        .fire_manual(routine_id, Some(&state.user_id))
+        .fire_manual(routine_id, Some(&state.default_user_id))
         .await
         .map_err(|e| (routine_error_status(&e), e.to_string()))?;
 

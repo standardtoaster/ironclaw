@@ -98,9 +98,8 @@ pub struct ExtensionManager {
     active_channel_names: RwLock<HashSet<String>>,
     /// Last activation error for each WASM channel (ephemeral, cleared on success).
     activation_errors: RwLock<HashMap<String, String>>,
-    /// SSE broadcast sender (set post-construction via `set_sse_sender()`).
-    sse_sender:
-        RwLock<Option<tokio::sync::broadcast::Sender<crate::channels::web::types::SseEvent>>>,
+    /// SSE broadcast manager (set post-construction via `set_sse_sender()`).
+    sse_manager: RwLock<Option<Arc<crate::channels::web::sse::SseManager>>>,
     /// Shared registry of pending OAuth flows for gateway-routed callbacks.
     ///
     /// Keyed by CSRF `state` parameter. Populated in `start_wasm_oauth()`
@@ -150,7 +149,7 @@ impl ExtensionManager {
             store,
             active_channel_names: RwLock::new(HashSet::new()),
             activation_errors: RwLock::new(HashMap::new()),
-            sse_sender: RwLock::new(None),
+            sse_manager: RwLock::new(None),
             pending_oauth_flows: crate::cli::oauth_defaults::new_pending_oauth_registry(),
             gateway_token: std::env::var("GATEWAY_AUTH_TOKEN").ok(),
         }
@@ -235,9 +234,9 @@ impl ExtensionManager {
     /// Set the SSE broadcast sender for pushing extension status events to the web UI.
     pub async fn set_sse_sender(
         &self,
-        sender: tokio::sync::broadcast::Sender<crate::channels::web::types::SseEvent>,
+        sse: Arc<crate::channels::web::sse::SseManager>,
     ) {
-        *self.sse_sender.write().await = Some(sender);
+        *self.sse_manager.write().await = Some(sse);
     }
 
     /// Returns the pending OAuth flow registry for sharing with the web gateway.
@@ -250,8 +249,8 @@ impl ExtensionManager {
 
     /// Broadcast an extension status change to the web UI via SSE.
     async fn broadcast_extension_status(&self, name: &str, status: &str, message: Option<&str>) {
-        if let Some(ref sender) = *self.sse_sender.read().await {
-            let _ = sender.send(crate::channels::web::types::SseEvent::ExtensionStatus {
+        if let Some(ref sse) = *self.sse_manager.read().await {
+            sse.broadcast(crate::channels::web::types::SseEvent::ExtensionStatus {
                 extension_name: name.to_string(),
                 status: status.to_string(),
                 message: message.map(|m| m.to_string()),

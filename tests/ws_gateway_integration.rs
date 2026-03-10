@@ -20,7 +20,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use ironclaw::channels::IncomingMessage;
-use ironclaw::channels::web::server::{GatewayState, start_server};
+use ironclaw::channels::web::auth::MultiAuthState;
+use ironclaw::channels::web::server::{GatewayState, PerUserRateLimiter, start_server};
 use ironclaw::channels::web::sse::SseManager;
 use ironclaw::channels::web::types::SseEvent;
 use ironclaw::channels::web::ws::WsConnectionTracker;
@@ -39,8 +40,9 @@ async fn start_test_server() -> (
 
     let state = Arc::new(GatewayState {
         msg_tx: tokio::sync::RwLock::new(Some(agent_tx)),
-        sse: SseManager::new(),
+        sse: Arc::new(SseManager::new()),
         workspace: None,
+        workspace_pool: None,
         session_manager: None,
         log_broadcaster: None,
         log_level_handle: None,
@@ -50,13 +52,15 @@ async fn start_test_server() -> (
         job_manager: None,
         prompt_queue: None,
         scheduler: None,
-        user_id: "test-user".to_string(),
+        default_user_id: "test-user".to_string(),
         shutdown_tx: tokio::sync::RwLock::new(None),
         ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
         llm_provider: None,
+        user_llm_providers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        user_tokens: None,
         skill_registry: None,
         skill_catalog: None,
-        chat_rate_limiter: ironclaw::channels::web::server::RateLimiter::new(30, 60),
+        chat_rate_limiter: PerUserRateLimiter::new(30, 60),
         registry_entries: Vec::new(),
         cost_guard: None,
         routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
@@ -64,7 +68,7 @@ async fn start_test_server() -> (
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let bound_addr = start_server(addr, state.clone(), AUTH_TOKEN.to_string())
+    let bound_addr = start_server(addr, state.clone(), MultiAuthState::single(AUTH_TOKEN.to_string(), "test-user".to_string()))
         .await
         .expect("Failed to start test server");
 
