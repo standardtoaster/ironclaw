@@ -382,6 +382,16 @@ pub enum RoutineError {
     #[error("Routine {name} at max concurrent runs")]
     MaxConcurrent { name: String },
 
+    #[error("Routine {routine} has trigger type '{actual}', expected '{expected}'")]
+    TriggerMismatch {
+        routine: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[error("Routine {name} is in cooldown")]
+    CooldownActive { name: String },
+
     #[error("Database error: {reason}")]
     Database { reason: String },
 

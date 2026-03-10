@@ -102,6 +102,9 @@ pub struct Agent {
     /// Broadcast sender for collection write events (shared with gateway).
     pub(super) collection_write_tx:
         Option<tokio::sync::broadcast::Sender<crate::agent::collection_events::CollectionWriteEvent>>,
+    /// Gateway state for injecting routine engine (late init).
+    pub(super) gateway_state:
+        Option<Arc<crate::channels::web::server::GatewayState>>,
 }
 
 impl Agent {
@@ -157,6 +160,7 @@ impl Agent {
             routine_config,
             routine_engine_slot: None,
             collection_write_tx,
+            gateway_state: None,
         }
     }
 
@@ -166,6 +170,15 @@ impl Agent {
         slot: Arc<tokio::sync::RwLock<Option<Arc<crate::agent::routine_engine::RoutineEngine>>>>,
     ) {
         self.routine_engine_slot = Some(slot);
+    }
+
+    /// Inject the gateway state for late-init fields (e.g., routine engine).
+    pub fn with_gateway_state(
+        mut self,
+        state: Arc<crate::channels::web::server::GatewayState>,
+    ) -> Self {
+        self.gateway_state = Some(state);
+        self
     }
 
     // Convenience accessors

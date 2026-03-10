@@ -448,6 +448,8 @@ pub async fn start_server(
             axum::routing::delete(routines_delete_handler),
         )
         .route("/api/routines/{id}/runs", get(routines_runs_handler))
+        // Webhooks
+        .route("/api/hooks/{id}", post(webhook_fire_handler))
         // Skills
         .route("/api/skills", get(skills_list_handler))
         .route("/api/skills/search", post(skills_search_handler))
@@ -2576,6 +2578,72 @@ fn routine_to_info(r: &crate::agent::routine::Routine) -> RoutineInfo {
         run_count: r.run_count,
         consecutive_failures: r.consecutive_failures,
         status: status.to_string(),
+    }
+}
+
+// --- Webhook handlers ---
+
+#[derive(Deserialize)]
+struct WebhookBody {
+    /// Optional payload from the external service.
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
+}
+
+async fn webhook_fire_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    body: Option<Json<WebhookBody>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let engine_guard = state.routine_engine.read().await;
+    let engine = engine_guard.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Routine engine not available".to_string(),
+    ))?;
+
+    let routine_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
+
+    let payload_str = body.and_then(|Json(b)| {
+        b.payload.map(|v| {
+            if let serde_json::Value::String(s) = v {
+                s
+            } else {
+                v.to_string()
+            }
+        })
+    });
+
+    match engine
+        .fire_webhook(routine_id, &state.user_id, payload_str)
+        .await
+    {
+        Ok(run_id) => Ok(Json(serde_json::json!({
+            "status": "fired",
+            "routine_id": routine_id,
+            "run_id": run_id,
+        }))),
+        Err(crate::error::RoutineError::NotFound { .. }) => Err((
+            StatusCode::NOT_FOUND,
+            "Routine not found".to_string(),
+        )),
+        Err(crate::error::RoutineError::Disabled { name }) => Err((
+            StatusCode::CONFLICT,
+            format!("Routine '{name}' is disabled"),
+        )),
+        Err(crate::error::RoutineError::TriggerMismatch { actual, .. }) => Err((
+            StatusCode::BAD_REQUEST,
+            format!("Routine has trigger type '{actual}', not 'webhook'"),
+        )),
+        Err(crate::error::RoutineError::MaxConcurrent { name }) => Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("Routine '{name}' at max concurrent runs"),
+        )),
+        Err(crate::error::RoutineError::CooldownActive { name }) => Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("Routine '{name}' is in cooldown"),
+        )),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
 

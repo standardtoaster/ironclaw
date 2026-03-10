@@ -500,7 +500,7 @@ async fn async_main() -> anyhow::Result<()> {
     let mut gateway_url: Option<String> = None;
     let mut sse_manager: Option<std::sync::Arc<ironclaw::channels::web::sse::SseManager>> = None;
     let mut routine_engine_slot: Option<ironclaw::channels::web::server::RoutineEngineSlot> = None;
-    let mut _gateway_state: Option<std::sync::Arc<ironclaw::channels::web::server::GatewayState>> =
+    let mut gateway_state: Option<std::sync::Arc<ironclaw::channels::web::server::GatewayState>> =
         None;
     if let Some(ref gw_config) = config.channels.gateway {
         // Build multi-user auth state if user_tokens is configured, else single-user.
@@ -592,7 +592,7 @@ async fn async_main() -> anyhow::Result<()> {
         // creates a new SseManager, which would orphan this sender.
         sse_manager = Some(Arc::clone(&gw.state().sse));
         routine_engine_slot = Some(Arc::clone(&gw.state().routine_engine));
-        _gateway_state = Some(Arc::clone(gw.state()));
+        gateway_state = Some(Arc::clone(gw.state()));
 
         channel_names.push("gateway".to_string());
         channels.add(Box::new(gw)).await;
@@ -753,6 +753,9 @@ async fn async_main() -> anyhow::Result<()> {
         Some(session_manager),
         Some(collection_write_tx),
     );
+    if let Some(ref gw_state) = gateway_state {
+        agent = agent.with_gateway_state(Arc::clone(gw_state));
+    }
 
     // Fill the scheduler slot now that Agent (and its Scheduler) exist.
     *scheduler_slot.write().await = Some(agent.scheduler());

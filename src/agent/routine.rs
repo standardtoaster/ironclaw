@@ -905,4 +905,33 @@ mod tests {
             _ => panic!("Expected Script"),
         }
     }
+
+    #[test]
+    fn test_webhook_trigger_roundtrip() {
+        let trigger = Trigger::Webhook {
+            path: Some("/my-hook".to_string()),
+            secret: Some("s3cret".to_string()),
+        };
+        let json = trigger.to_config_json();
+        let parsed = Trigger::from_db("webhook", json).expect("parse webhook");
+        assert!(matches!(
+            parsed,
+            Trigger::Webhook { path: Some(p), secret: Some(s) }
+            if p == "/my-hook" && s == "s3cret"
+        ));
+    }
+
+    #[test]
+    fn test_webhook_trigger_roundtrip_no_optional_fields() {
+        let trigger = Trigger::Webhook {
+            path: None,
+            secret: None,
+        };
+        let json = trigger.to_config_json();
+        let parsed = Trigger::from_db("webhook", json).expect("parse webhook");
+        assert!(matches!(
+            parsed,
+            Trigger::Webhook { path: None, secret: None }
+        ));
+    }
 }
