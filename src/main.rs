@@ -762,12 +762,51 @@ async fn async_main() -> anyhow::Result<()> {
                 {
                     resolver_config.organizer_max_tokens = t;
                 }
+                // Build organizer LLM: dedicated provider (env vars) > cheap_llm > main LLM.
+                let organizer_llm = match (
+                    std::env::var("ORGANIZER_LLM_BACKEND"),
+                    std::env::var("ORGANIZER_LLM_MODEL"),
+                ) {
+                    (Ok(backend_str), Ok(model)) => {
+                        let backend = backend_str.parse::<ironclaw::config::LlmBackend>()
+                            .map_err(|e| tracing::warn!("Invalid ORGANIZER_LLM_BACKEND: {e}"))
+                            .ok();
+                        if let Some(backend) = backend {
+                            let user_config = ironclaw::config::UserLlmConfig {
+                                backend,
+                                model,
+                                api_key: std::env::var("ORGANIZER_LLM_API_KEY").ok()
+                                    .map(secrecy::SecretString::from),
+                                base_url: std::env::var("ORGANIZER_LLM_BASE_URL").ok(),
+                            };
+                            match ironclaw::llm::create_provider_from_user_config(&user_config) {
+                                Ok(provider) => {
+                                    tracing::info!(
+                                        backend = %backend_str,
+                                        model = %user_config.model,
+                                        "Organizer using dedicated LLM provider"
+                                    );
+                                    Some(provider)
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to create organizer LLM: {e}, falling back");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+                .or_else(|| components.cheap_llm.clone())
+                .or_else(|| Some(Arc::clone(&components.llm)));
                 Some(Arc::new(
                     ironclaw::agent::workspace_thread_resolver::WorkspaceThreadResolver::new(
                         Arc::clone(router),
                         Arc::clone(db) as Arc<dyn ironclaw::db::AgentWorkspaceStore>,
                         Arc::clone(db) as Arc<dyn ironclaw::db::ConversationStore>,
-                        components.cheap_llm.clone(),
+                        organizer_llm,
                         resolver_config,
                     )
                     .with_organizer_channel(organize_tx),

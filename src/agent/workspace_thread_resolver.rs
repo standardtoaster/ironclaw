@@ -425,23 +425,25 @@ impl ThreadResolver for WorkspaceThreadResolver {
             ..Default::default()
         };
 
-        for project in projects {
-            let topic_for_embed = format!("{}: {}", project.name, project.description);
-            let topic_for_embed =
-                &topic_for_embed[..topic_for_embed.len().min(500)];
+        // Build lowercase set for dedup (existing + created-this-batch)
+        let mut known_topics: std::collections::HashSet<String> = existing_names
+            .iter()
+            .map(|n| n.to_lowercase())
+            .collect();
 
-            // Dedup: check if a similar workspace already exists
-            if let Ok(Some(_existing)) = self
-                .router
-                .route_with_hint(user_id, topic_for_embed, Some(&project.name))
-                .await
-            {
+        for project in projects {
+            // Dedup: check if a workspace with this name already exists (case-insensitive)
+            if known_topics.contains(&project.name.to_lowercase()) {
                 tracing::info!(
                     name = %project.name,
                     "Organizer: workspace already exists, skipping"
                 );
                 continue;
             }
+
+            let topic_for_embed = format!("{}: {}", project.name, project.description);
+            let topic_for_embed =
+                &topic_for_embed[..topic_for_embed.len().min(500)];
 
             // Create conversation for new workspace
             let conversation_id = match self
@@ -514,6 +516,8 @@ impl ThreadResolver for WorkspaceThreadResolver {
                 name = %project.name,
                 "Organizer: created workspace"
             );
+
+            known_topics.insert(project.name.to_lowercase());
 
             result.created.push(WorkspaceInfo {
                 id: ws.id,
@@ -597,18 +601,44 @@ impl WorkspaceThreadResolver {
             return Ok(Some(existing.clone()));
         }
 
-        // Create default workspace — need a ConversationStore for this, but we
-        // only have AgentWorkspaceStore. For now, return None (no default created).
-        // The caller falls back to the session's ephemeral thread.
-        //
-        // In production, the workspace_router in agent_loop.rs handles default
-        // workspace creation via get_or_create_default_workspace() which has
-        // access to the full Database trait.
-        tracing::debug!(
-            "WorkspaceThreadResolver: no default workspace for {}, cannot create (need ConversationStore)",
+        // Create default workspace with a backing conversation.
+        tracing::info!(
+            "WorkspaceThreadResolver: creating default '{}' workspace for {}",
+            DEFAULT_WORKSPACE_TOPIC,
             user_id
         );
-        Ok(None)
+
+        let conversation_id = self
+            .conversations
+            .create_conversation("workspace", user_id, None)
+            .await
+            .map_err(|e| ResolverError::Database(e.to_string()))?;
+
+        let ws = self
+            .db
+            .create_agent_workspace(user_id, conversation_id)
+            .await
+            .map_err(|e| ResolverError::Database(e.to_string()))?;
+
+        // Embed and set the topic to "general" so it's recognized as the default workspace.
+        let embedding = self
+            .router
+            .embed("general conversation and miscellaneous topics")
+            .await
+            .map_err(|e| ResolverError::Embedding(e.to_string()))?;
+        self.db
+            .update_agent_workspace_topic(ws.id, DEFAULT_WORKSPACE_TOPIC, &embedding)
+            .await
+            .map_err(|e| ResolverError::Database(e.to_string()))?;
+
+        // Re-fetch to get updated fields
+        let workspaces = self
+            .db
+            .list_agent_workspaces(user_id, Some("active"))
+            .await
+            .map_err(|e| ResolverError::Database(e.to_string()))?;
+
+        Ok(workspaces.into_iter().find(|w| w.id == ws.id))
     }
 }
 
