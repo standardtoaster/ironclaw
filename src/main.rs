@@ -495,7 +495,7 @@ async fn async_main() -> anyhow::Result<()> {
         let workspace_router = Arc::new(ironclaw::agent::workspace_router::WorkspaceRouter::new(
             Arc::clone(db) as Arc<dyn ironclaw::db::AgentWorkspaceStore>,
             Arc::clone(embedder),
-            0.6, // similarity threshold
+            0.5, // similarity threshold (confidence gap handles ambiguity)
         ));
         let workspace_queue = Arc::new(
             ironclaw::agent::workspace_queue::WorkspaceQueueManager::new(32),

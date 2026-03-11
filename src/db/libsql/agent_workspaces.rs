@@ -108,6 +108,16 @@ impl AgentWorkspaceStore for LibSqlBackend {
         Ok(None)
     }
 
+    async fn find_top_matching_workspaces(
+        &self,
+        _user_id: &str,
+        _embedding: &[f32],
+        _limit: i64,
+    ) -> Result<Vec<(AgentWorkspace, f64)>, DatabaseError> {
+        // No pgvector in libSQL — vector similarity search is not supported.
+        Ok(vec![])
+    }
+
     async fn get_agent_workspace(
         &self,
         id: Uuid,

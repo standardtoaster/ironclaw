@@ -605,6 +605,13 @@ pub trait AgentWorkspaceStore: Send + Sync {
         embedding: &[f32],
         threshold: f64,
     ) -> Result<Option<AgentWorkspace>, DatabaseError>;
+    /// Return the top-N workspaces by similarity, each paired with its score.
+    async fn find_top_matching_workspaces(
+        &self,
+        user_id: &str,
+        embedding: &[f32],
+        limit: i64,
+    ) -> Result<Vec<(AgentWorkspace, f64)>, DatabaseError>;
     async fn get_agent_workspace(
         &self,
         id: Uuid,

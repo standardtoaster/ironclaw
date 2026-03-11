@@ -15,11 +15,26 @@ pub enum RouterError {
     Database(#[from] crate::error::DatabaseError),
 }
 
+/// Result of a confidence-aware routing attempt.
+#[derive(Debug)]
+pub struct RouteResult {
+    /// The best-matching workspace (if any exceeds the threshold with sufficient confidence).
+    pub workspace: Option<AgentWorkspace>,
+    /// Similarity score of the best match (0.0 if no match).
+    pub score: f64,
+    /// Gap between #1 and #2 scores (-1.0 if only one candidate).
+    pub gap: f64,
+    /// Whether the match was ambiguous (gap below `min_gap`).
+    pub ambiguous: bool,
+}
+
 /// Routes prompts to the best-matching workspace via embedding similarity.
 pub struct WorkspaceRouter {
     db: Arc<dyn AgentWorkspaceStore>,
     embedder: Arc<dyn EmbeddingProvider>,
     threshold: f64,
+    /// Minimum gap between #1 and #2 scores to consider a match confident.
+    min_gap: f64,
 }
 
 impl WorkspaceRouter {
@@ -32,22 +47,92 @@ impl WorkspaceRouter {
             db,
             embedder,
             threshold,
+            min_gap: 0.05,
         }
     }
 
-    /// Route a prompt to the best matching workspace, or `None` if no match
-    /// exceeds the similarity threshold.
+    /// Set the minimum confidence gap between #1 and #2 matches.
+    pub fn with_min_gap(mut self, min_gap: f64) -> Self {
+        self.min_gap = min_gap;
+        self
+    }
+
+    /// Route a prompt to the best matching workspace with confidence gap check.
+    ///
+    /// Returns `None` if:
+    /// - No workspace exceeds the similarity threshold, OR
+    /// - The top two matches are too close (gap < `min_gap`) — ambiguous.
     pub async fn route(
         &self,
         user_id: &str,
         prompt: &str,
     ) -> Result<Option<AgentWorkspace>, RouterError> {
+        let result = self.route_with_confidence(user_id, prompt).await?;
+        Ok(result.workspace)
+    }
+
+    /// Route with full confidence metadata returned.
+    pub async fn route_with_confidence(
+        &self,
+        user_id: &str,
+        prompt: &str,
+    ) -> Result<RouteResult, RouterError> {
         let embedding = self.embedder.embed(prompt).await?;
-        let workspace = self
-            .db
-            .find_matching_workspace(user_id, &embedding, self.threshold)
-            .await?;
-        Ok(workspace)
+        let matches = self.db.find_top_matching_workspaces(user_id, &embedding, 3).await?;
+
+        let (first, second) = match matches.as_slice() {
+            [] => {
+                return Ok(RouteResult {
+                    workspace: None,
+                    score: 0.0,
+                    gap: -1.0,
+                    ambiguous: false,
+                });
+            }
+            [(ws, score)] => (Some((ws.clone(), *score)), None),
+            [(ws1, s1), (ws2, s2), ..] => (Some((ws1.clone(), *s1)), Some((ws2.clone(), *s2))),
+        };
+
+        let (best_ws, best_score) = first.unwrap();
+
+        if best_score < self.threshold {
+            return Ok(RouteResult {
+                workspace: None,
+                score: best_score,
+                gap: -1.0,
+                ambiguous: false,
+            });
+        }
+
+        let gap = match second {
+            Some((_, s2)) => best_score - s2,
+            None => -1.0, // only one candidate, no ambiguity
+        };
+
+        let ambiguous = gap >= 0.0 && gap < self.min_gap;
+
+        if ambiguous {
+            tracing::debug!(
+                topic = %best_ws.topic,
+                score = best_score,
+                gap,
+                "WorkspaceRouter: ambiguous match (gap < {:.2}), falling to default",
+                self.min_gap,
+            );
+            return Ok(RouteResult {
+                workspace: None,
+                score: best_score,
+                gap,
+                ambiguous: true,
+            });
+        }
+
+        Ok(RouteResult {
+            workspace: Some(best_ws),
+            score: best_score,
+            gap,
+            ambiguous: false,
+        })
     }
 
     /// Embed text using the router's embedding provider.
@@ -69,12 +154,8 @@ impl WorkspaceRouter {
             Some(h) => format!("{h}: {prompt}"),
             None => prompt.to_string(),
         };
-        let embedding = self.embedder.embed(&text).await?;
-        let workspace = self
-            .db
-            .find_matching_workspace(user_id, &embedding, self.threshold)
-            .await?;
-        Ok(workspace)
+        let result = self.route_with_confidence(user_id, &text).await?;
+        Ok(result.workspace)
     }
 }
 
@@ -211,6 +292,23 @@ mod tests {
                 }
             }
             Ok(best.map(|(_, ws)| ws.clone()))
+        }
+
+        async fn find_top_matching_workspaces(
+            &self,
+            user_id: &str,
+            embedding: &[f32],
+            limit: i64,
+        ) -> Result<Vec<(AgentWorkspace, f64)>, DatabaseError> {
+            let guard = self.workspaces.lock().unwrap();
+            let mut matches: Vec<(AgentWorkspace, f64)> = guard
+                .iter()
+                .filter(|(ws, _)| ws.user_id == user_id)
+                .map(|(ws, ws_emb)| (ws.clone(), cosine_similarity(embedding, ws_emb)))
+                .collect();
+            matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            matches.truncate(limit as usize);
+            Ok(matches)
         }
 
         async fn get_agent_workspace(

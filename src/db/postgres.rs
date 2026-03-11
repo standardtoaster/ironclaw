@@ -1435,6 +1435,40 @@ impl AgentWorkspaceStore for PgBackend {
         }
     }
 
+    async fn find_top_matching_workspaces(
+        &self,
+        user_id: &str,
+        embedding: &[f32],
+        limit: i64,
+    ) -> Result<Vec<(AgentWorkspace, f64)>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let embedding_vec = Vector::from(embedding.to_vec());
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, user_id, topic, conversation_id, status,
+                       last_accessed, turn_count, created_at,
+                       1 - (topic_embedding <=> $2) AS similarity
+                FROM agent_workspaces
+                WHERE user_id = $1
+                  AND status != 'archived'
+                  AND topic_embedding IS NOT NULL
+                ORDER BY topic_embedding <=> $2
+                LIMIT $3
+                "#,
+                &[&user_id, &embedding_vec, &limit],
+            )
+            .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let similarity: f64 = row.get("similarity");
+                (pg_row_to_agent_workspace(row), similarity)
+            })
+            .collect())
+    }
+
     async fn get_agent_workspace(
         &self,
         id: Uuid,

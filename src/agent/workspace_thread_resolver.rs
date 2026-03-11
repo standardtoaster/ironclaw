@@ -177,63 +177,73 @@ impl ThreadResolver for WorkspaceThreadResolver {
         message_content: &str,
         _default_thread_id: Uuid,
     ) -> Result<ThreadResolution, ResolverError> {
-        // Check stickiness: if there's an active workspace and message looks like a reply,
-        // continue in the same workspace.
-        let sticky_result = {
-            let state = self.stickiness.read().await;
-            if let Some(s) = state.get(user_id) {
-                if let (Some(ws_id), Some(conv_id)) =
-                    (s.active_workspace_id, s.active_conversation_id)
-                {
-                    // Check time gap
-                    let timed_out = s
-                        .last_message_at
-                        .is_some_and(|t| t.elapsed() > self.config.stickiness_timeout);
-
-                    if !timed_out && is_reply_like(message_content, self.config.reply_max_words) {
-                        Some((ws_id, conv_id, s.active_topic.clone()))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-
-        if let Some((ws_id, conv_id, topic)) = sticky_result {
-            tracing::info!(
-                workspace_id = %ws_id,
-                "ThreadResolver: sticky continuation (reply-like message)"
-            );
-            let mut metadata = HashMap::new();
-            metadata.insert("workspace_id".to_string(), ws_id.to_string());
-            if let Some(ref t) = topic {
-                metadata.insert("topic".to_string(), t.clone());
-            }
-            metadata.insert("routing_reason".to_string(), "sticky".to_string());
-
-            return Ok(ThreadResolution {
-                thread_id: Some(conv_id),
-                context: self.build_workspace_context(ws_id, topic.as_deref()).await,
-                metadata,
-            });
-        }
-
-        // Embedding-based routing: find the best matching workspace
-        let match_result = self
+        // Embedding-based routing with confidence gap check.
+        // This runs FIRST — a confident embedding match always wins over stickiness.
+        let route_result = self
             .router
-            .route(user_id, message_content)
+            .route_with_confidence(user_id, message_content)
             .await
             .map_err(|e| ResolverError::Embedding(e.to_string()))?;
 
-        match match_result {
+        // Helper: get current stickiness state (non-timed-out, reply-like).
+        let get_sticky_state = |require_reply_like: bool| async move {
+            let state = self.stickiness.read().await;
+            let s = state.get(user_id)?;
+            let (ws_id, conv_id) = match (s.active_workspace_id, s.active_conversation_id) {
+                (Some(w), Some(c)) => (w, c),
+                _ => return None,
+            };
+            let timed_out = s
+                .last_message_at
+                .is_some_and(|t| t.elapsed() > self.config.stickiness_timeout);
+            if timed_out {
+                return None;
+            }
+            if require_reply_like
+                && !is_reply_like(message_content, self.config.reply_max_words)
+            {
+                return None;
+            }
+            Some((ws_id, conv_id, s.active_topic.clone()))
+        };
+
+        // If no confident match (ambiguous or below threshold), try stickiness.
+        if route_result.workspace.is_none()
+            && let Some((ws_id, conv_id, topic)) = get_sticky_state(route_result.ambiguous).await {
+                let reason = if route_result.ambiguous {
+                    "sticky_ambiguous"
+                } else {
+                    "sticky"
+                };
+                tracing::info!(
+                    workspace_id = %ws_id,
+                    score = route_result.score,
+                    gap = route_result.gap,
+                    reason,
+                    "ThreadResolver: using stickiness (no confident embedding match)"
+                );
+                let mut metadata = HashMap::new();
+                metadata.insert("workspace_id".to_string(), ws_id.to_string());
+                if let Some(ref t) = topic {
+                    metadata.insert("topic".to_string(), t.clone());
+                }
+                metadata.insert("routing_reason".to_string(), reason.to_string());
+
+                return Ok(ThreadResolution {
+                    thread_id: Some(conv_id),
+                    context: self.build_workspace_context(ws_id, topic.as_deref()).await,
+                    metadata,
+                });
+            }
+            // No stickiness → fall through to default workspace below
+
+        match route_result.workspace {
             Some(ws) if ws.topic != DEFAULT_WORKSPACE_TOPIC => {
                 tracing::info!(
                     workspace_id = %ws.id,
                     topic = %ws.topic,
+                    score = route_result.score,
+                    gap = route_result.gap,
                     "ThreadResolver: embedding match"
                 );
 

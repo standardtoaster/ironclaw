@@ -905,6 +905,15 @@ mod tests {
             Ok(None)
         }
 
+        async fn find_top_matching_workspaces(
+            &self,
+            _user_id: &str,
+            _embedding: &[f32],
+            _limit: i64,
+        ) -> Result<Vec<(AgentWorkspace, f64)>, DatabaseError> {
+            Ok(vec![])
+        }
+
         async fn get_agent_workspace(
             &self,
             id: Uuid,
