@@ -20,6 +20,7 @@ pub mod cost_guard;
 mod dispatcher;
 mod heartbeat;
 pub mod job_monitor;
+mod organizer_runner;
 pub mod passive_buffer;
 mod router;
 pub mod routine;
@@ -44,6 +45,7 @@ pub use thread_resolver::{OrganizeResult, ResolverError, ThreadResolution, Threa
 pub use compaction::{CompactionResult, ContextCompactor};
 pub use context_monitor::{CompactionStrategy, ContextBreakdown, ContextMonitor};
 pub use heartbeat::{HeartbeatConfig, HeartbeatResult, HeartbeatRunner, spawn_heartbeat};
+pub use organizer_runner::{OrganizerConfig, OrganizerSignal, spawn_organizer};
 pub use router::{MessageIntent, Router};
 pub use routine::{Routine, RoutineAction, RoutineRun, Trigger};
 pub use routine_engine::RoutineEngine;

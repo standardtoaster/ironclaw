@@ -13,6 +13,7 @@ use futures::StreamExt;
 
 use crate::agent::context_monitor::ContextMonitor;
 use crate::agent::heartbeat::spawn_heartbeat;
+use crate::agent::organizer_runner::{OrganizerConfig, spawn_organizer};
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
 use crate::agent::self_repair::{DefaultSelfRepair, RepairResult, SelfRepair};
 use crate::agent::session_manager::SessionManager;
@@ -92,6 +93,9 @@ pub struct AgentDeps {
     /// When non-empty, only core + discovered tools are sent to the LLM.
     /// Empty = backward compatible (all tools sent).
     pub core_tools: Vec<String>,
+    /// Receiver for organizer signals (passed to the organizer runner on spawn).
+    /// Created in main.rs alongside the resolver; consumed once by spawn_organizer.
+    pub organize_rx: Option<tokio::sync::mpsc::Receiver<crate::agent::organizer_runner::OrganizerSignal>>,
 }
 
 /// The main agent that coordinates all components.
@@ -325,7 +329,7 @@ impl Agent {
     }
 
     /// Run the agent main loop.
-    pub async fn run(self) -> Result<(), Error> {
+    pub async fn run(mut self) -> Result<(), Error> {
         // Start channels
         let mut message_stream = self.channels.start_all().await?;
 
@@ -498,6 +502,25 @@ impl Agent {
                     None
                 }
             } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Spawn organizer if enabled
+        let organizer_config = OrganizerConfig::from_env();
+        let organizer_handle = if organizer_config.enabled {
+            if let Some(ref resolver) = self.deps.thread_resolver {
+                let rx = self.deps.organize_rx.take().unwrap_or_else(|| {
+                    // No signal channel configured; create a dummy one.
+                    // The organizer will still run on ceiling ticks.
+                    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+                    rx
+                });
+                Some(spawn_organizer(organizer_config, Arc::clone(resolver), rx))
+            } else {
+                tracing::warn!("Organizer enabled but no thread resolver available");
                 None
             }
         } else {
@@ -757,6 +780,9 @@ impl Agent {
         }
         if let Some((cron_handle, _)) = routine_handle {
             cron_handle.abort();
+        }
+        if let Some(handle) = organizer_handle {
+            handle.abort();
         }
         self.scheduler.stop_all().await;
         self.channels.shutdown_all().await?;

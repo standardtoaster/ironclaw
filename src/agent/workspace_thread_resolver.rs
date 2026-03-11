@@ -13,12 +13,16 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::agent::organizer_runner::OrganizerSignal;
 use crate::agent::thread_resolver::{
     OrganizeResult, ResolverError, ThreadResolution, ThreadResolver, WorkspaceInfo,
 };
 use crate::agent::workspace_router::WorkspaceRouter;
 use crate::db::{AgentWorkspace, AgentWorkspaceStore, ConversationStore};
 use crate::llm::{ChatMessage, CompletionRequest, LlmProvider};
+
+/// Default workspace topic name.
+pub const DEFAULT_WORKSPACE_TOPIC: &str = "general";
 
 /// Per-user stickiness state for conversation continuity.
 struct StickinessState {
@@ -75,6 +79,11 @@ pub struct WorkspaceThreadResolver {
     config: WorkspaceResolverConfig,
     /// Per-user stickiness tracking (in-memory, resets on restart).
     stickiness: RwLock<HashMap<String, StickinessState>>,
+    /// Per-user watermark: turn_count of the general workspace at last organize run.
+    /// Resets on restart (first run after restart always processes).
+    organize_watermarks: RwLock<HashMap<String, i32>>,
+    /// Channel to signal the organizer runner when unrouted messages land in general.
+    organize_tx: Option<tokio::sync::mpsc::Sender<OrganizerSignal>>,
 }
 
 impl WorkspaceThreadResolver {
@@ -92,7 +101,19 @@ impl WorkspaceThreadResolver {
             llm,
             config,
             stickiness: RwLock::new(HashMap::new()),
+            organize_watermarks: RwLock::new(HashMap::new()),
+            organize_tx: None,
         }
+    }
+
+    /// Set the channel used to signal the organizer runner when unrouted messages
+    /// land in the general workspace.
+    pub fn with_organizer_channel(
+        mut self,
+        tx: tokio::sync::mpsc::Sender<OrganizerSignal>,
+    ) -> Self {
+        self.organize_tx = Some(tx);
+        self
     }
 }
 
@@ -209,7 +230,7 @@ impl ThreadResolver for WorkspaceThreadResolver {
             .map_err(|e| ResolverError::Embedding(e.to_string()))?;
 
         match match_result {
-            Some(ws) if ws.topic != "general" => {
+            Some(ws) if ws.topic != DEFAULT_WORKSPACE_TOPIC => {
                 tracing::info!(
                     workspace_id = %ws.id,
                     topic = %ws.topic,
@@ -233,7 +254,14 @@ impl ThreadResolver for WorkspaceThreadResolver {
                 })
             }
             _ => {
-                // No match or matched "general" — try to get/create default workspace
+                // No match or matched "general" — try to get/create default workspace.
+                // Signal the organizer that an unrouted message landed in general.
+                if let Some(ref tx) = self.organize_tx {
+                    let _ = tx.try_send(OrganizerSignal {
+                        user_id: user_id.to_string(),
+                    });
+                }
+
                 match self.get_or_create_default(user_id).await {
                     Ok(Some(ws)) => {
                         let mut metadata = HashMap::new();
@@ -276,7 +304,7 @@ impl ThreadResolver for WorkspaceThreadResolver {
             .await
             .map_err(|e| ResolverError::Database(e.to_string()))?;
 
-        let default_ws = match workspaces.iter().find(|ws| ws.topic == "general") {
+        let default_ws = match workspaces.iter().find(|ws| ws.topic == DEFAULT_WORKSPACE_TOPIC) {
             Some(ws) => ws,
             None => {
                 tracing::info!("Organizer: no default workspace, nothing to organize");
@@ -284,23 +312,39 @@ impl ThreadResolver for WorkspaceThreadResolver {
             }
         };
 
-        // 2. Read last 20 messages from default workspace conversation
-        let messages = self
+        // 1b. Watermark check: skip if no new messages since last organize run
+        let current_turn_count = default_ws.turn_count;
+        let last_watermark = self
+            .organize_watermarks
+            .read()
+            .await
+            .get(user_id)
+            .copied()
+            .unwrap_or(-1);
+        if current_turn_count <= last_watermark {
+            tracing::debug!(
+                user_id,
+                turn_count = current_turn_count,
+                watermark = last_watermark,
+                "Organizer: no new messages since last run, skipping"
+            );
+            return Ok(OrganizeResult::default());
+        }
+
+        // 2. Read last 20 messages from default workspace conversation (paginated, DESC order)
+        let (mut messages, _has_more) = self
             .conversations
-            .list_conversation_messages(default_ws.conversation_id)
+            .list_conversation_messages_paginated(default_ws.conversation_id, None, 20)
             .await
             .map_err(|e| ResolverError::Database(e.to_string()))?;
 
-        let relevant: Vec<_> = messages
+        // Paginated returns newest-first; reverse to chronological for the LLM
+        messages.reverse();
+
+        let recent: Vec<_> = messages
             .iter()
             .filter(|m| m.role == "user" || m.role == "assistant")
             .collect();
-
-        let recent = if relevant.len() > 20 {
-            &relevant[relevant.len() - 20..]
-        } else {
-            &relevant
-        };
 
         if recent.is_empty() {
             return Ok(OrganizeResult::default());
@@ -309,7 +353,7 @@ impl ThreadResolver for WorkspaceThreadResolver {
         // 3. Build context about existing workspaces for dedup
         let existing_names: Vec<String> = workspaces
             .iter()
-            .filter(|ws| ws.topic != "general")
+            .filter(|ws| ws.topic != DEFAULT_WORKSPACE_TOPIC)
             .map(|ws| ws.topic.clone())
             .collect();
 
@@ -478,6 +522,12 @@ impl ThreadResolver for WorkspaceThreadResolver {
             });
         }
 
+        // Update watermark after successful organize
+        self.organize_watermarks
+            .write()
+            .await
+            .insert(user_id.to_string(), current_turn_count);
+
         Ok(result)
     }
 
@@ -543,7 +593,7 @@ impl WorkspaceThreadResolver {
             .await
             .map_err(|e| ResolverError::Database(e.to_string()))?;
 
-        if let Some(existing) = workspaces.iter().find(|ws| ws.topic == "general") {
+        if let Some(existing) = workspaces.iter().find(|ws| ws.topic == DEFAULT_WORKSPACE_TOPIC) {
             return Ok(Some(existing.clone()));
         }
 
@@ -577,19 +627,16 @@ NOT projects: single factual questions, unit conversions, quick calculations.
 For each project:
 - name: short label (2-5 words)
 - description: one sentence summary
-- message_indices: which message numbers belong to this project
 
 Respond ONLY with a JSON array. No explanation, no markdown.
 
-[{\"name\": \"Kitchen renovation\", \"description\": \"Planning kitchen remodel including contractor quotes and timeline\", \"message_indices\": [3, 5, 8]}]";
+[{\"name\": \"Kitchen renovation\", \"description\": \"Planning kitchen remodel including contractor quotes and timeline\"}]";
 
 /// A project identified by the organizer LLM.
 #[derive(Debug, Deserialize)]
 struct OrganizerProject {
     name: String,
     description: String,
-    #[allow(dead_code)]
-    message_indices: Vec<usize>,
 }
 
 /// Parse the organizer LLM response, extracting a JSON array from the text.
@@ -688,16 +735,15 @@ mod tests {
 
     #[test]
     fn parse_organizer_valid_json() {
-        let input = r#"[{"name": "Japan trip", "description": "Planning a trip to Japan", "message_indices": [0, 1, 2]}]"#;
+        let input = r#"[{"name": "Japan trip", "description": "Planning a trip to Japan"}]"#;
         let projects = parse_organizer_response(input).expect("should parse");
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].name, "Japan trip");
-        assert_eq!(projects[0].message_indices, vec![0, 1, 2]);
     }
 
     #[test]
     fn parse_organizer_markdown_code_block() {
-        let input = "Here are the projects:\n```json\n[{\"name\": \"School apps\", \"description\": \"Applying to schools\", \"message_indices\": [3, 4]}]\n```\n";
+        let input = "Here are the projects:\n```json\n[{\"name\": \"School apps\", \"description\": \"Applying to schools\"}]\n```\n";
         let projects = parse_organizer_response(input).expect("should parse");
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].name, "School apps");
@@ -705,7 +751,7 @@ mod tests {
 
     #[test]
     fn parse_organizer_embedded_json() {
-        let input = "I found these projects:\n[{\"name\": \"Trip\", \"description\": \"A trip\", \"message_indices\": [0]}]\nThat's all.";
+        let input = "I found these projects:\n[{\"name\": \"Trip\", \"description\": \"A trip\"}]\nThat's all.";
         let projects = parse_organizer_response(input).expect("should parse");
         assert_eq!(projects.len(), 1);
     }
@@ -726,12 +772,20 @@ mod tests {
     #[test]
     fn parse_organizer_multiple_projects() {
         let input = r#"[
-            {"name": "Japan trip", "description": "Planning Japan", "message_indices": [0, 1, 2, 3, 4]},
-            {"name": "School applications", "description": "Schools for Emma", "message_indices": [5, 6, 7, 8]}
+            {"name": "Japan trip", "description": "Planning Japan"},
+            {"name": "School applications", "description": "Schools for Emma"}
         ]"#;
         let projects = parse_organizer_response(input).expect("should parse");
         assert_eq!(projects.len(), 2);
         assert_eq!(projects[0].name, "Japan trip");
         assert_eq!(projects[1].name, "School applications");
+    }
+
+    #[test]
+    fn parse_organizer_backwards_compatible_with_indices() {
+        // Old LLM responses with message_indices should still parse (serde ignores unknown fields)
+        let input = r#"[{"name": "Trip", "description": "A trip", "message_indices": [0, 1]}]"#;
+        let projects = parse_organizer_response(input).expect("should parse");
+        assert_eq!(projects.len(), 1);
     }
 }

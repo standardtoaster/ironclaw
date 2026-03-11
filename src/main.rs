@@ -741,6 +741,10 @@ async fn async_main() -> anyhow::Result<()> {
     let reaper_context_manager = Arc::clone(&components.context_manager);
 
     // Build ThreadResolver if workspace routing is available.
+    // Create organizer signal channel (tx goes to resolver, rx goes to runner via AgentDeps)
+    let (organize_tx, organize_rx) =
+        tokio::sync::mpsc::channel::<ironclaw::agent::OrganizerSignal>(64);
+
     let thread_resolver_for_agent: Option<Arc<dyn ironclaw::agent::ThreadResolver>> =
         match (&workspace_router_for_agent, &components.db) {
             (Some(router), Some(db)) => {
@@ -765,7 +769,8 @@ async fn async_main() -> anyhow::Result<()> {
                         Arc::clone(db) as Arc<dyn ironclaw::db::ConversationStore>,
                         components.cheap_llm.clone(),
                         resolver_config,
-                    ),
+                    )
+                    .with_organizer_channel(organize_tx),
                 ))
             }
             _ => None,
@@ -796,6 +801,7 @@ async fn async_main() -> anyhow::Result<()> {
         workspace_router: workspace_router_for_agent.clone(),
         thread_resolver: thread_resolver_for_agent,
         core_tools: config.core_tools.clone(),
+        organize_rx: Some(organize_rx),
     };
 
     let mut agent = Agent::new(
