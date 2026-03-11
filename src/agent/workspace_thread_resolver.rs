@@ -9,14 +9,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::agent::thread_resolver::{
-    OrganizeResult, ResolverError, ThreadResolution, ThreadResolver,
+    OrganizeResult, ResolverError, ThreadResolution, ThreadResolver, WorkspaceInfo,
 };
 use crate::agent::workspace_router::WorkspaceRouter;
-use crate::db::{AgentWorkspace, AgentWorkspaceStore};
+use crate::db::{AgentWorkspace, AgentWorkspaceStore, ConversationStore};
+use crate::llm::{ChatMessage, CompletionRequest, LlmProvider};
 
 /// Per-user stickiness state for conversation continuity.
 struct StickinessState {
@@ -40,6 +42,14 @@ pub struct WorkspaceResolverConfig {
     pub stickiness_timeout: Duration,
     /// Maximum word count for a message to be considered "reply-like".
     pub reply_max_words: usize,
+    /// Model override for the organizer LLM call (`ORGANIZER_MODEL`).
+    /// When set, passed via `CompletionRequest::with_model()`.
+    /// Only effective with providers that support per-request model overrides.
+    pub organizer_model: Option<String>,
+    /// Temperature for organizer LLM calls (default: 0.3).
+    pub organizer_temperature: f32,
+    /// Max tokens for organizer LLM responses (default: 2000).
+    pub organizer_max_tokens: u32,
 }
 
 impl Default for WorkspaceResolverConfig {
@@ -49,6 +59,9 @@ impl Default for WorkspaceResolverConfig {
             low_threshold: 0.5,
             stickiness_timeout: Duration::from_secs(30 * 60),
             reply_max_words: 15,
+            organizer_model: None,
+            organizer_temperature: 0.3_f32,
+            organizer_max_tokens: 2000,
         }
     }
 }
@@ -57,6 +70,8 @@ impl Default for WorkspaceResolverConfig {
 pub struct WorkspaceThreadResolver {
     router: Arc<WorkspaceRouter>,
     db: Arc<dyn AgentWorkspaceStore>,
+    conversations: Arc<dyn ConversationStore>,
+    llm: Option<Arc<dyn LlmProvider>>,
     config: WorkspaceResolverConfig,
     /// Per-user stickiness tracking (in-memory, resets on restart).
     stickiness: RwLock<HashMap<String, StickinessState>>,
@@ -66,11 +81,15 @@ impl WorkspaceThreadResolver {
     pub fn new(
         router: Arc<WorkspaceRouter>,
         db: Arc<dyn AgentWorkspaceStore>,
+        conversations: Arc<dyn ConversationStore>,
+        llm: Option<Arc<dyn LlmProvider>>,
         config: WorkspaceResolverConfig,
     ) -> Self {
         Self {
             router,
             db,
+            conversations,
+            llm,
             config,
             stickiness: RwLock::new(HashMap::new()),
         }
@@ -241,10 +260,225 @@ impl ThreadResolver for WorkspaceThreadResolver {
         }
     }
 
-    async fn organize(&self, _user_id: &str) -> Result<OrganizeResult, ResolverError> {
-        // TODO: Implement LLM-based auto-organizer.
-        // For now, return empty result (no workspaces created/updated).
-        Ok(OrganizeResult::default())
+    async fn organize(&self, user_id: &str) -> Result<OrganizeResult, ResolverError> {
+        let llm = match &self.llm {
+            Some(llm) => Arc::clone(llm),
+            None => {
+                tracing::warn!("Organizer: no LLM available, skipping");
+                return Ok(OrganizeResult::default());
+            }
+        };
+
+        // 1. Find default workspace
+        let workspaces = self
+            .db
+            .list_agent_workspaces(user_id, Some("active"))
+            .await
+            .map_err(|e| ResolverError::Database(e.to_string()))?;
+
+        let default_ws = match workspaces.iter().find(|ws| ws.topic == "general") {
+            Some(ws) => ws,
+            None => {
+                tracing::info!("Organizer: no default workspace, nothing to organize");
+                return Ok(OrganizeResult::default());
+            }
+        };
+
+        // 2. Read last 20 messages from default workspace conversation
+        let messages = self
+            .conversations
+            .list_conversation_messages(default_ws.conversation_id)
+            .await
+            .map_err(|e| ResolverError::Database(e.to_string()))?;
+
+        let relevant: Vec<_> = messages
+            .iter()
+            .filter(|m| m.role == "user" || m.role == "assistant")
+            .collect();
+
+        let recent = if relevant.len() > 20 {
+            &relevant[relevant.len() - 20..]
+        } else {
+            &relevant
+        };
+
+        if recent.is_empty() {
+            return Ok(OrganizeResult::default());
+        }
+
+        // 3. Build context about existing workspaces for dedup
+        let existing_names: Vec<String> = workspaces
+            .iter()
+            .filter(|ws| ws.topic != "general")
+            .map(|ws| ws.topic.clone())
+            .collect();
+
+        // 4. Format messages for LLM
+        let mut formatted = String::new();
+        for (i, msg) in recent.iter().enumerate() {
+            let role_label = if msg.role == "user" { "User" } else { "Assistant" };
+            // Truncate long messages to avoid blowing up context
+            let content = if msg.content.len() > 300 {
+                let boundary = msg.content.char_indices()
+                    .take_while(|(idx, _)| *idx < 300)
+                    .last()
+                    .map(|(idx, c)| idx + c.len_utf8())
+                    .unwrap_or(300.min(msg.content.len()));
+                format!("{}...", &msg.content[..boundary])
+            } else {
+                msg.content.clone()
+            };
+            formatted.push_str(&format!("[{i}] {role_label}: {content}\n"));
+        }
+
+        let existing_ctx = if existing_names.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nExisting workspaces (do not duplicate): {}\n",
+                existing_names.join(", ")
+            )
+        };
+
+        let user_prompt = format!("{existing_ctx}\nMessages:\n{formatted}");
+
+        // 5. Call LLM
+        let mut request = CompletionRequest::new(vec![
+            ChatMessage::system(ORGANIZER_PROMPT.to_string()),
+            ChatMessage::user(user_prompt),
+        ])
+        .with_max_tokens(self.config.organizer_max_tokens)
+        .with_temperature(self.config.organizer_temperature);
+
+        if let Some(ref model) = self.config.organizer_model {
+            request = request.with_model(model.clone());
+        }
+
+        let response = match llm.complete(request).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Organizer: LLM call failed: {e}");
+                return Ok(OrganizeResult::default());
+            }
+        };
+
+        // 6. Clean thinking tags, then parse JSON response
+        let cleaned = crate::llm::clean_response(&response.content);
+        let projects = match parse_organizer_response(&cleaned) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    "Organizer: failed to parse LLM response as JSON: {}",
+                    &cleaned[..cleaned.len().min(200)]
+                );
+                return Ok(OrganizeResult::default());
+            }
+        };
+
+        // 7. Create workspaces for each project (with dedup)
+        let mut result = OrganizeResult {
+            messages_analyzed: recent.len(),
+            ..Default::default()
+        };
+
+        for project in projects {
+            let topic_for_embed = format!("{}: {}", project.name, project.description);
+            let topic_for_embed =
+                &topic_for_embed[..topic_for_embed.len().min(500)];
+
+            // Dedup: check if a similar workspace already exists
+            if let Ok(Some(_existing)) = self
+                .router
+                .route_with_hint(user_id, topic_for_embed, Some(&project.name))
+                .await
+            {
+                tracing::info!(
+                    name = %project.name,
+                    "Organizer: workspace already exists, skipping"
+                );
+                continue;
+            }
+
+            // Create conversation for new workspace
+            let conversation_id = match self
+                .conversations
+                .create_conversation("workspace", user_id, None)
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(
+                        name = %project.name,
+                        "Organizer: failed to create conversation: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            // Create workspace
+            let ws = match self
+                .db
+                .create_agent_workspace(user_id, conversation_id)
+                .await
+            {
+                Ok(ws) => ws,
+                Err(e) => {
+                    tracing::warn!(
+                        name = %project.name,
+                        "Organizer: failed to create workspace: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            // Embed and store topic
+            let embedding = match self.router.embed(topic_for_embed).await {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        name = %project.name,
+                        "Organizer: failed to embed topic: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(e) = self
+                .db
+                .update_agent_workspace_topic(ws.id, topic_for_embed, &embedding)
+                .await
+            {
+                tracing::warn!(
+                    name = %project.name,
+                    "Organizer: failed to set topic: {e}"
+                );
+                continue;
+            }
+
+            // Pre-seed: write a summary message into the new workspace conversation
+            let summary = format!(
+                "This workspace was created by the organizer for: {}. {}",
+                project.name, project.description
+            );
+            let _ = self
+                .conversations
+                .add_conversation_message(conversation_id, "system", &summary)
+                .await;
+
+            tracing::info!(
+                workspace_id = %ws.id,
+                name = %project.name,
+                "Organizer: created workspace"
+            );
+
+            result.created.push(WorkspaceInfo {
+                id: ws.id,
+                topic: project.name.clone(),
+                description: project.description.clone(),
+            });
+        }
+
+        Ok(result)
     }
 
     async fn notify_routed(&self, user_id: &str, thread_id: Uuid) {
@@ -328,6 +562,87 @@ impl WorkspaceThreadResolver {
     }
 }
 
+const ORGANIZER_PROMPT: &str = "\
+You are a conversation organizer. Below are recent messages from a personal \
+assistant conversation. Identify any ongoing topics that the user is likely \
+to revisit — even if only mentioned briefly so far.
+
+A topic qualifies if the user would benefit from having a dedicated workspace \
+for it. Two messages about the same trip, event, or goal is enough. Each \
+distinct topic gets its own workspace — e.g. two different trips should be \
+two separate projects, not combined.
+
+NOT projects: single factual questions, unit conversions, quick calculations.
+
+For each project:
+- name: short label (2-5 words)
+- description: one sentence summary
+- message_indices: which message numbers belong to this project
+
+Respond ONLY with a JSON array. No explanation, no markdown.
+
+[{\"name\": \"Kitchen renovation\", \"description\": \"Planning kitchen remodel including contractor quotes and timeline\", \"message_indices\": [3, 5, 8]}]";
+
+/// A project identified by the organizer LLM.
+#[derive(Debug, Deserialize)]
+struct OrganizerProject {
+    name: String,
+    description: String,
+    #[allow(dead_code)]
+    message_indices: Vec<usize>,
+}
+
+/// Parse the organizer LLM response, extracting a JSON array from the text.
+fn parse_organizer_response(content: &str) -> Option<Vec<OrganizerProject>> {
+    // Try direct parse first
+    if let Ok(projects) = serde_json::from_str::<Vec<OrganizerProject>>(content.trim()) {
+        return Some(projects);
+    }
+
+    // Try extracting JSON from markdown code blocks or surrounding text
+    let trimmed = content.trim();
+
+    // Look for ```json ... ``` blocks
+    if let Some(start) = trimmed.find("```json") {
+        let json_start = start + 7;
+        if let Some(end) = trimmed[json_start..].find("```") {
+            let json_str = &trimmed[json_start..json_start + end].trim();
+            if let Ok(projects) = serde_json::from_str::<Vec<OrganizerProject>>(json_str) {
+                return Some(projects);
+            }
+        }
+    }
+
+    // Look for ``` ... ``` blocks (without language tag)
+    if let Some(start) = trimmed.find("```") {
+        let json_start = start + 3;
+        // Skip the optional language tag line
+        let after_tag = if let Some(nl) = trimmed[json_start..].find('\n') {
+            json_start + nl + 1
+        } else {
+            json_start
+        };
+        if let Some(end) = trimmed[after_tag..].find("```") {
+            let json_str = trimmed[after_tag..after_tag + end].trim();
+            if let Ok(projects) = serde_json::from_str::<Vec<OrganizerProject>>(json_str) {
+                return Some(projects);
+            }
+        }
+    }
+
+    // Look for first [ ... last ]
+    let bracket_start = trimmed.find('[');
+    let bracket_end = trimmed.rfind(']');
+    if let (Some(start), Some(end)) = (bracket_start, bracket_end)
+        && end > start
+        && let Ok(projects) = serde_json::from_str::<Vec<OrganizerProject>>(&trimmed[start..=end])
+    {
+        return Some(projects);
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +684,54 @@ mod tests {
             "when do the school entrance exams happen for private schools in London?",
             15
         ));
+    }
+
+    #[test]
+    fn parse_organizer_valid_json() {
+        let input = r#"[{"name": "Japan trip", "description": "Planning a trip to Japan", "message_indices": [0, 1, 2]}]"#;
+        let projects = parse_organizer_response(input).expect("should parse");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "Japan trip");
+        assert_eq!(projects[0].message_indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn parse_organizer_markdown_code_block() {
+        let input = "Here are the projects:\n```json\n[{\"name\": \"School apps\", \"description\": \"Applying to schools\", \"message_indices\": [3, 4]}]\n```\n";
+        let projects = parse_organizer_response(input).expect("should parse");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "School apps");
+    }
+
+    #[test]
+    fn parse_organizer_embedded_json() {
+        let input = "I found these projects:\n[{\"name\": \"Trip\", \"description\": \"A trip\", \"message_indices\": [0]}]\nThat's all.";
+        let projects = parse_organizer_response(input).expect("should parse");
+        assert_eq!(projects.len(), 1);
+    }
+
+    #[test]
+    fn parse_organizer_empty_array() {
+        let input = "[]";
+        let projects = parse_organizer_response(input).expect("should parse");
+        assert!(projects.is_empty());
+    }
+
+    #[test]
+    fn parse_organizer_malformed_graceful() {
+        let input = "I don't see any projects here, sorry!";
+        assert!(parse_organizer_response(input).is_none());
+    }
+
+    #[test]
+    fn parse_organizer_multiple_projects() {
+        let input = r#"[
+            {"name": "Japan trip", "description": "Planning Japan", "message_indices": [0, 1, 2, 3, 4]},
+            {"name": "School applications", "description": "Schools for Emma", "message_indices": [5, 6, 7, 8]}
+        ]"#;
+        let projects = parse_organizer_response(input).expect("should parse");
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].name, "Japan trip");
+        assert_eq!(projects[1].name, "School applications");
     }
 }

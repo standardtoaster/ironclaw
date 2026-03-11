@@ -509,6 +509,19 @@ fn extract_cache_creation<T: Serialize>(raw: &T) -> u32 {
         .unwrap_or(0)
 }
 
+/// Check if a rig-core error is about an empty/missing response.
+///
+/// Thinking/reasoning models (Qwen3.5, DeepSeek-R1, etc.) served via
+/// OpenAI-compatible APIs (MLX-LM, vLLM) put internal reasoning into a
+/// non-standard `reasoning` field that rig-core does not parse. If the model
+/// exhausts its output token budget on reasoning, `content` is empty and
+/// rig-core reports "no message or tool call". This helper detects that
+/// error pattern so callers can log a more helpful diagnostic.
+fn is_empty_response_error(error_msg: &str) -> bool {
+    let lower = error_msg.to_lowercase();
+    lower.contains("no message") || lower.contains("no choices") || lower.contains("empty")
+}
+
 /// Build a rig-core CompletionRequest from our internal types.
 ///
 /// When `cache_retention` is not `None`, injects a top-level `cache_control`
@@ -635,19 +648,42 @@ where
             self.additional_params.clone(),
         )?;
 
-        let response =
-            self.model
-                .completion(rig_req)
-                .await
-                .map_err(|e| LlmError::RequestFailed {
+        let response = self
+            .model
+            .completion(rig_req)
+            .await
+            .map_err(|e| {
+                let reason = e.to_string();
+                if is_empty_response_error(&reason) {
+                    tracing::warn!(
+                        model = %self.model_name,
+                        "LLM returned empty content — if using a thinking/reasoning model \
+                         (e.g. Qwen3.5, DeepSeek-R1), the model likely exhausted its output \
+                         tokens on internal reasoning before producing a response. \
+                         Try increasing max_tokens or using a non-thinking model.",
+                    );
+                }
+                LlmError::RequestFailed {
                     provider: self.model_name.clone(),
-                    reason: e.to_string(),
-                })?;
+                    reason,
+                }
+            })?;
 
         let (text, _tool_calls, finish) = extract_response(&response.choice, &response.usage);
 
+        let content = text.unwrap_or_default();
+        if content.is_empty() && response.usage.output_tokens > 0 {
+            tracing::warn!(
+                model = %self.model_name,
+                output_tokens = response.usage.output_tokens,
+                "LLM returned empty content despite generating {} output tokens — \
+                 thinking/reasoning model may have spent all tokens on internal reasoning",
+                response.usage.output_tokens,
+            );
+        }
+
         let resp = CompletionResponse {
-            content: text.unwrap_or_default(),
+            content,
             input_tokens: saturate_u32(response.usage.input_tokens),
             output_tokens: saturate_u32(response.usage.output_tokens),
             finish_reason: finish,
@@ -704,16 +740,38 @@ where
             self.additional_params.clone(),
         )?;
 
-        let response =
-            self.model
-                .completion(rig_req)
-                .await
-                .map_err(|e| LlmError::RequestFailed {
+        let response = self
+            .model
+            .completion(rig_req)
+            .await
+            .map_err(|e| {
+                let reason = e.to_string();
+                if is_empty_response_error(&reason) {
+                    tracing::warn!(
+                        model = %self.model_name,
+                        "LLM returned empty content — if using a thinking/reasoning model \
+                         (e.g. Qwen3.5, DeepSeek-R1), the model likely exhausted its output \
+                         tokens on internal reasoning before producing a response. \
+                         Try increasing max_tokens or using a non-thinking model.",
+                    );
+                }
+                LlmError::RequestFailed {
                     provider: self.model_name.clone(),
-                    reason: e.to_string(),
-                })?;
+                    reason,
+                }
+            })?;
 
         let (text, mut tool_calls, finish) = extract_response(&response.choice, &response.usage);
+
+        if text.is_none() && tool_calls.is_empty() && response.usage.output_tokens > 0 {
+            tracing::warn!(
+                model = %self.model_name,
+                output_tokens = response.usage.output_tokens,
+                "LLM returned no content and no tool calls despite generating {} output tokens — \
+                 thinking/reasoning model may have spent all tokens on internal reasoning",
+                response.usage.output_tokens,
+            );
+        }
 
         // Normalize tool call names: some proxies prepend "proxy_" prefixes.
         for tc in &mut tool_calls {
@@ -1325,5 +1383,31 @@ mod tests {
         let adapter = RigAdapter::new(model, "test-model");
 
         assert!(adapter.unsupported_params.is_empty());
+    }
+
+    // -- is_empty_response_error tests --
+
+    #[test]
+    fn test_is_empty_response_error_matches_rig_core_errors() {
+        // Rig-core error when content is empty and no tool calls
+        assert!(is_empty_response_error(
+            "Response contained no message or tool call (empty)"
+        ));
+        // Rig-core error when choices array is empty
+        assert!(is_empty_response_error("Response contained no choices"));
+    }
+
+    #[test]
+    fn test_is_empty_response_error_case_insensitive() {
+        assert!(is_empty_response_error("NO MESSAGE found"));
+        assert!(is_empty_response_error("EMPTY response"));
+    }
+
+    #[test]
+    fn test_is_empty_response_error_rejects_unrelated_errors() {
+        assert!(!is_empty_response_error("Connection refused"));
+        assert!(!is_empty_response_error("Rate limited"));
+        assert!(!is_empty_response_error("Invalid API key"));
+        assert!(!is_empty_response_error("Timeout after 120s"));
     }
 }

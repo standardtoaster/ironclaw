@@ -1441,7 +1441,7 @@ fn recover_bare_json_tool_call(
 /// 5. Strip pipe-delimited reasoning tags (code-aware)
 /// 6. Strip tool tags (string matching — no code-awareness needed)
 /// 7. Collapse triple+ newlines, trim
-fn clean_response(text: &str) -> String {
+pub fn clean_response(text: &str) -> String {
     // 1. Quick-check
     let mut result = if !QUICK_TAG_RE.is_match(text) {
         text.to_string()

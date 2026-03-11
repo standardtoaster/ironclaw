@@ -740,6 +740,37 @@ async fn async_main() -> anyhow::Result<()> {
     // Clone context_manager for the reaper before it's moved into Agent::new()
     let reaper_context_manager = Arc::clone(&components.context_manager);
 
+    // Build ThreadResolver if workspace routing is available.
+    let thread_resolver_for_agent: Option<Arc<dyn ironclaw::agent::ThreadResolver>> =
+        match (&workspace_router_for_agent, &components.db) {
+            (Some(router), Some(db)) => {
+                let mut resolver_config = ironclaw::agent::workspace_thread_resolver::WorkspaceResolverConfig::default();
+                if let Ok(model) = std::env::var("ORGANIZER_MODEL") {
+                    resolver_config.organizer_model = Some(model);
+                }
+                if let Ok(temp) = std::env::var("ORGANIZER_TEMPERATURE")
+                    && let Ok(t) = temp.parse::<f32>()
+                {
+                    resolver_config.organizer_temperature = t;
+                }
+                if let Ok(tokens) = std::env::var("ORGANIZER_MAX_TOKENS")
+                    && let Ok(t) = tokens.parse::<u32>()
+                {
+                    resolver_config.organizer_max_tokens = t;
+                }
+                Some(Arc::new(
+                    ironclaw::agent::workspace_thread_resolver::WorkspaceThreadResolver::new(
+                        Arc::clone(router),
+                        Arc::clone(db) as Arc<dyn ironclaw::db::AgentWorkspaceStore>,
+                        Arc::clone(db) as Arc<dyn ironclaw::db::ConversationStore>,
+                        components.cheap_llm.clone(),
+                        resolver_config,
+                    ),
+                ))
+            }
+            _ => None,
+        };
+
     let deps = AgentDeps {
         store: components.db,
         llm: components.llm,
@@ -762,8 +793,8 @@ async fn async_main() -> anyhow::Result<()> {
         document_extraction: Some(Arc::new(
             ironclaw::document_extraction::DocumentExtractionMiddleware::new(),
         )),
-        workspace_router: workspace_router_for_agent,
-        thread_resolver: None, // Pluggable; set by downstream (e.g. Percy) at startup
+        workspace_router: workspace_router_for_agent.clone(),
+        thread_resolver: thread_resolver_for_agent,
         core_tools: config.core_tools.clone(),
     };
 
