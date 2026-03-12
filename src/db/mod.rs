@@ -584,6 +584,7 @@ pub struct AgentWorkspace {
     pub last_accessed: DateTime<Utc>,
     pub turn_count: i32,
     pub created_at: DateTime<Utc>,
+    pub summary: Option<String>,
 }
 
 #[async_trait]
@@ -643,6 +644,16 @@ pub trait AgentWorkspaceStore: Send + Sync {
         workspace_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<WorkspaceMessageResult>, DatabaseError>;
+    async fn update_agent_workspace_summary(
+        &self,
+        id: Uuid,
+        summary: &str,
+    ) -> Result<(), DatabaseError>;
+    /// Retrieve the topic embedding vector for a workspace (PostgreSQL only).
+    async fn get_workspace_embedding(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<Vec<f32>>, DatabaseError>;
 }
 
 /// Result from searching across workspace conversation messages.

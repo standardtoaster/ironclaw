@@ -11,6 +11,7 @@
 pub mod events;
 pub mod jobs;
 pub mod skills;
+pub mod workspaces;
 
 // Modules not yet wired into server.rs router -- suppress dead_code until
 // they replace their inline counterparts.

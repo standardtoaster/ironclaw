@@ -27,6 +27,9 @@ pub struct SendMessageRequest {
     /// the caller wants extraction/side-effects without a reply.
     #[serde(default)]
     pub suppress_response: bool,
+    /// Optional workspace ID to pin this message to a specific workspace.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

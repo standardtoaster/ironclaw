@@ -38,6 +38,9 @@ use crate::channels::web::handlers::jobs::{
 use crate::channels::web::handlers::skills::{
     skills_install_handler, skills_list_handler, skills_remove_handler, skills_search_handler,
 };
+use crate::channels::web::handlers::workspaces::{
+    workspaces_detail_handler, workspaces_list_handler,
+};
 use crate::channels::web::log_layer::LogBroadcaster;
 use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
@@ -448,6 +451,9 @@ pub async fn start_server(
             axum::routing::delete(routines_delete_handler),
         )
         .route("/api/routines/{id}/runs", get(routines_runs_handler))
+        // Workspaces
+        .route("/api/workspaces", get(workspaces_list_handler))
+        .route("/api/workspaces/{id}", get(workspaces_detail_handler))
         // Webhooks
         .route("/api/hooks/{id}", post(webhook_fire_handler))
         // Skills
@@ -873,6 +879,9 @@ async fn chat_send_handler(
     }
     if req.suppress_response {
         meta["suppress_response"] = serde_json::json!(true);
+    }
+    if let Some(ref ws_id) = req.workspace_id {
+        meta["workspace_id"] = serde_json::Value::String(ws_id.clone());
     }
     msg = msg.with_metadata(meta);
 

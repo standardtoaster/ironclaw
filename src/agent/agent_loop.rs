@@ -905,9 +905,24 @@ impl Agent {
         }
 
         // Thread routing: if no explicit thread_id, resolve which thread to use.
-        // Priority: thread_resolver (pluggable) > workspace_router (legacy).
+        // Priority: workspace_id metadata pin > thread_resolver (pluggable) > workspace_router (legacy).
         let mut routed_thread_id = message.thread_id.clone();
         let mut resolver_context: Option<String> = None;
+        let mut resolved_embedding: Option<Vec<f32>> = None;
+
+        // If a workspace_id is provided in metadata, pin to that workspace's thread.
+        if routed_thread_id.is_none()
+            && let Some(ws_id_str) = message.metadata.get("workspace_id").and_then(|v| v.as_str())
+            && let Ok(ws_id) = uuid::Uuid::parse_str(ws_id_str)
+            && let Some(ref store) = self.deps.store
+        {
+            use crate::db::AgentWorkspaceStore;
+            if let Ok(Some(ws)) = AgentWorkspaceStore::get_agent_workspace(store.as_ref(), ws_id).await {
+                routed_thread_id = Some(ws.conversation_id.to_string());
+                tracing::info!(workspace_id = %ws_id, "Pinned to workspace via metadata");
+            }
+        }
+
         if routed_thread_id.is_none()
             && let Submission::UserInput { ref content } = submission
         {
@@ -927,6 +942,7 @@ impl Agent {
                             routed_thread_id = Some(tid.to_string());
                         }
                         resolver_context = resolution.context;
+                        resolved_embedding = resolution.message_embedding;
                         // Broadcast routing metadata via SSE
                         if !resolution.metadata.is_empty()
                             && let Some(ref sse) = self.deps.sse_tx
@@ -1110,6 +1126,16 @@ impl Agent {
             Submission::Summarize => self.process_summarize(session, thread_id).await,
             Submission::Suggest => self.process_suggest(session, thread_id).await,
             Submission::Organize => self.process_organize(&message.user_id).await,
+            Submission::WorkspaceList => {
+                self.process_workspace_list(&message.user_id).await
+            }
+            Submission::WorkspaceSwitch { name } => {
+                self.process_workspace_switch(&message.user_id, &name)
+                    .await
+            }
+            Submission::WorkspaceSummary => {
+                self.process_workspace_summary(&message.user_id).await
+            }
             Submission::JobStatus { job_id } => {
                 self.process_job_status(&message.user_id, job_id.as_deref())
                     .await
@@ -1150,7 +1176,13 @@ impl Agent {
         if let Some(ref resolver) = self.deps.thread_resolver
             && result.is_ok()
         {
-            resolver.notify_routed(&message.user_id, thread_id).await;
+            resolver
+                .notify_routed(
+                    &message.user_id,
+                    thread_id,
+                    resolved_embedding.as_deref(),
+                )
+                .await;
         }
 
         // Convert SubmissionResult to response string

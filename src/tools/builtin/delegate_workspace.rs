@@ -882,6 +882,7 @@ mod tests {
                 last_accessed: Utc::now(),
                 turn_count: 0,
                 created_at: Utc::now(),
+                summary: None,
             };
             self.workspaces.lock().unwrap().push(ws.clone());
             Ok(ws)
@@ -956,6 +957,21 @@ mod tests {
             _stale_days: i64,
         ) -> Result<u64, DatabaseError> {
             Ok(0)
+        }
+
+        async fn update_agent_workspace_summary(
+            &self,
+            _id: Uuid,
+            _summary: &str,
+        ) -> Result<(), DatabaseError> {
+            Ok(())
+        }
+
+        async fn get_workspace_embedding(
+            &self,
+            _id: Uuid,
+        ) -> Result<Option<Vec<f32>>, DatabaseError> {
+            Ok(None)
         }
 
         async fn search_workspace_messages(
@@ -1148,6 +1164,7 @@ mod tests {
             last_accessed: Utc::now(),
             turn_count: 0,
             created_at: Utc::now(),
+            summary: None,
         };
         let ws_id = ws.id;
         db.insert_workspace(ws);

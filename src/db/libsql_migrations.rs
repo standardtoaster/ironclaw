@@ -597,7 +597,8 @@ CREATE TABLE IF NOT EXISTS agent_workspaces (
     last_accessed TEXT NOT NULL DEFAULT (datetime('now')),
     turn_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    summary TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_workspaces_user_id ON agent_workspaces(user_id);

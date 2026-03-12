@@ -24,6 +24,23 @@ use crate::llm::{ChatMessage, CompletionRequest, LlmProvider};
 /// Default workspace topic name.
 pub const DEFAULT_WORKSPACE_TOPIC: &str = "general";
 
+const WORKSPACE_SUMMARY_PROMPT: &str = r#"You are summarizing a workspace conversation. Given the messages below,
+produce a brief summary with these sections:
+
+## Topic
+One-line description of what this workspace is about.
+
+## Key Decisions
+- Bullet list of decisions made (if any)
+
+## Open Questions
+- Bullet list of unresolved questions or pending items
+
+## Context
+2-3 sentences of important context for continuing this conversation.
+
+Keep it concise — under 200 words total. Output ONLY the summary, no preamble."#;
+
 /// Per-user stickiness state for conversation continuity.
 struct StickinessState {
     /// Currently active workspace (most recent routing destination).
@@ -82,6 +99,8 @@ pub struct WorkspaceThreadResolver {
     /// Per-user watermark: turn_count of the general workspace at last organize run.
     /// Resets on restart (first run after restart always processes).
     organize_watermarks: RwLock<HashMap<String, i32>>,
+    /// Per-workspace turn count at last summary generation.
+    summary_watermarks: RwLock<HashMap<Uuid, i32>>,
     /// Channel to signal the organizer runner when unrouted messages land in general.
     organize_tx: Option<tokio::sync::mpsc::Sender<OrganizerSignal>>,
 }
@@ -102,6 +121,7 @@ impl WorkspaceThreadResolver {
             config,
             stickiness: RwLock::new(HashMap::new()),
             organize_watermarks: RwLock::new(HashMap::new()),
+            summary_watermarks: RwLock::new(HashMap::new()),
             organize_tx: None,
         }
     }
@@ -185,6 +205,9 @@ impl ThreadResolver for WorkspaceThreadResolver {
             .await
             .map_err(|e| ResolverError::Embedding(e.to_string()))?;
 
+        // Capture the message embedding for centroid drift (passed through ThreadResolution).
+        let msg_embedding = route_result.message_embedding.clone();
+
         // Helper: get current stickiness state (non-timed-out, reply-like).
         let get_sticky_state = |require_reply_like: bool| async move {
             let state = self.stickiness.read().await;
@@ -255,6 +278,7 @@ impl ThreadResolver for WorkspaceThreadResolver {
                         thread_id: Some(conv_id),
                         context: self.build_workspace_context(ws_id, topic.as_deref()).await,
                         metadata,
+                        message_embedding: msg_embedding,
                     });
                 }
             }
@@ -284,6 +308,7 @@ impl ThreadResolver for WorkspaceThreadResolver {
                         .build_workspace_context(ws.id, Some(&ws.topic))
                         .await,
                     metadata,
+                    message_embedding: msg_embedding,
                 })
             }
             _ => {
@@ -306,6 +331,7 @@ impl ThreadResolver for WorkspaceThreadResolver {
                             thread_id: Some(ws.conversation_id),
                             context: None, // No special context for default workspace
                             metadata,
+                            message_embedding: msg_embedding,
                         })
                     }
                     Ok(None) => {
@@ -568,13 +594,52 @@ impl ThreadResolver for WorkspaceThreadResolver {
         Ok(result)
     }
 
-    async fn notify_routed(&self, user_id: &str, thread_id: Uuid) {
+    async fn summarize_workspaces(&self, user_id: &str) -> Result<usize, ResolverError> {
+        self.summarize_stale_workspaces(user_id).await
+    }
+
+    async fn notify_routed(
+        &self,
+        user_id: &str,
+        thread_id: Uuid,
+        message_embedding: Option<&[f32]>,
+    ) {
         // Update stickiness: the workspace this message was processed in
         // becomes the active workspace for future reply detection.
         let workspace = match self.db.get_agent_workspace_by_conversation(thread_id).await {
             Ok(Some(ws)) => ws,
             _ => return, // Not a workspace thread, nothing to track
         };
+
+        // Centroid blend: drift workspace embedding toward this message (90/10).
+        if let Some(msg_emb) = message_embedding
+            && workspace.topic != DEFAULT_WORKSPACE_TOPIC
+        {
+            match self.db.get_workspace_embedding(workspace.id).await {
+                Ok(Some(current)) if current.len() == msg_emb.len() => {
+                    let blended: Vec<f32> = current
+                        .iter()
+                        .zip(msg_emb.iter())
+                        .map(|(old, new)| old * 0.9 + new * 0.1)
+                        .collect();
+                    // Normalize to unit vector
+                    let norm = blended.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if norm > 0.0 {
+                        let normalized: Vec<f32> =
+                            blended.iter().map(|x| x / norm).collect();
+                        let _ = self
+                            .db
+                            .update_agent_workspace_topic(
+                                workspace.id,
+                                &workspace.topic,
+                                &normalized,
+                            )
+                            .await;
+                    }
+                }
+                _ => {} // No existing embedding or dimension mismatch — skip blend
+            }
+        }
 
         let mut state = self.stickiness.write().await;
         let entry = state.entry(user_id.to_string()).or_insert(StickinessState {
@@ -610,6 +675,9 @@ impl WorkspaceThreadResolver {
             ctx.push_str(&format!("**Topic:** {}\n", ws.topic));
         }
         ctx.push_str(&format!("**Turn count:** {}\n", ws.turn_count));
+        if let Some(ref summary) = ws.summary {
+            ctx.push_str(&format!("\n{summary}\n"));
+        }
         ctx.push_str(&format!("**Workspace ID:** {}\n", ws.id));
         ctx.push_str(
             "\nYou are continuing a workspace conversation. \
@@ -672,6 +740,165 @@ impl WorkspaceThreadResolver {
             .map_err(|e| ResolverError::Database(e.to_string()))?;
 
         Ok(workspaces.into_iter().find(|w| w.id == ws.id))
+    }
+
+    /// Generate or update the summary for a workspace.
+    pub async fn summarize_workspace(
+        &self,
+        workspace: &AgentWorkspace,
+    ) -> Result<String, ResolverError> {
+        let llm = match &self.llm {
+            Some(llm) => Arc::clone(llm),
+            None => {
+                return Err(ResolverError::Classification(
+                    "No LLM available for summarization".into(),
+                ))
+            }
+        };
+
+        // Load last 30 messages from the workspace conversation
+        let (mut messages, _has_more) = self
+            .conversations
+            .list_conversation_messages_paginated(workspace.conversation_id, None, 30)
+            .await
+            .map_err(|e| ResolverError::Database(e.to_string()))?;
+
+        if messages.is_empty() {
+            return Ok(String::new());
+        }
+
+        // Paginated returns newest-first; reverse to chronological for the LLM
+        messages.reverse();
+
+        // Build message text for the LLM
+        let mut message_text = String::new();
+        for msg in &messages {
+            let role_label = if msg.role == "user" {
+                "User"
+            } else {
+                "Assistant"
+            };
+            // Truncate long messages to avoid blowing up context
+            let content = if msg.content.len() > 300 {
+                let boundary = msg
+                    .content
+                    .char_indices()
+                    .take_while(|(idx, _)| *idx < 300)
+                    .last()
+                    .map(|(idx, c)| idx + c.len_utf8())
+                    .unwrap_or(300.min(msg.content.len()));
+                format!("{}...", &msg.content[..boundary])
+            } else {
+                msg.content.clone()
+            };
+            message_text.push_str(&format!("[{role_label}]: {content}\n\n"));
+        }
+
+        // Call the LLM
+        let mut request = CompletionRequest::new(vec![
+            ChatMessage::system(WORKSPACE_SUMMARY_PROMPT.to_string()),
+            ChatMessage::user(message_text),
+        ])
+        .with_max_tokens(self.config.organizer_max_tokens)
+        .with_temperature(self.config.organizer_temperature);
+
+        if let Some(ref model) = self.config.organizer_model {
+            request = request.with_model(model.clone());
+        }
+
+        let response = llm
+            .complete(request)
+            .await
+            .map_err(|e| ResolverError::Classification(e.to_string()))?;
+
+        // Clean response (handle thinking tags from Qwen3 etc.)
+        let summary = crate::llm::clean_response(&response.content);
+
+        // Store the summary
+        self.db
+            .update_agent_workspace_summary(workspace.id, &summary)
+            .await
+            .map_err(|e| ResolverError::Database(e.to_string()))?;
+
+        // Re-embed from topic + summary for a periodic correction that captures
+        // the full conversation context (not just gradual per-message drift).
+        let embed_text = format!("{}: {}", workspace.topic, summary);
+        match self.router.embed(&embed_text).await {
+            Ok(embedding) => {
+                let _ = self
+                    .db
+                    .update_agent_workspace_topic(workspace.id, &workspace.topic, &embedding)
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    workspace_id = %workspace.id,
+                    error = %e,
+                    "Failed to re-embed workspace after summary"
+                );
+            }
+        }
+
+        Ok(summary)
+    }
+
+    /// Summarize all active workspaces that have new messages since last summary.
+    pub async fn summarize_stale_workspaces(
+        &self,
+        user_id: &str,
+    ) -> Result<usize, ResolverError> {
+        let workspaces = self
+            .db
+            .list_agent_workspaces(user_id, Some("active"))
+            .await
+            .map_err(|e| ResolverError::Database(e.to_string()))?;
+
+        let mut summarized = 0;
+        for ws in &workspaces {
+            // Skip the default workspace
+            if ws.topic == DEFAULT_WORKSPACE_TOPIC {
+                continue;
+            }
+            // Skip if no new messages since last summary
+            let last_watermark = self
+                .summary_watermarks
+                .read()
+                .await
+                .get(&ws.id)
+                .copied()
+                .unwrap_or(-1);
+            if ws.turn_count <= last_watermark {
+                continue;
+            }
+            // Skip workspaces with very few messages
+            if ws.turn_count < 2 {
+                continue;
+            }
+
+            match self.summarize_workspace(ws).await {
+                Ok(_) => {
+                    self.summary_watermarks
+                        .write()
+                        .await
+                        .insert(ws.id, ws.turn_count);
+                    summarized += 1;
+                    tracing::info!(
+                        workspace_id = %ws.id,
+                        topic = %ws.topic,
+                        "Summarized workspace"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        workspace_id = %ws.id,
+                        topic = %ws.topic,
+                        error = %e,
+                        "Failed to summarize workspace"
+                    );
+                }
+            }
+        }
+        Ok(summarized)
     }
 }
 

@@ -15,7 +15,7 @@ use crate::error::DatabaseError;
 /// Column list for agent_workspaces (matches positional access in `row_to_agent_workspace`).
 const AGENT_WORKSPACE_COLUMNS: &str = "\
     id, user_id, topic, conversation_id, status, \
-    last_accessed, turn_count, created_at";
+    last_accessed, turn_count, created_at, summary";
 
 fn row_to_agent_workspace(row: &libsql::Row) -> AgentWorkspace {
     AgentWorkspace {
@@ -27,6 +27,7 @@ fn row_to_agent_workspace(row: &libsql::Row) -> AgentWorkspace {
         last_accessed: get_ts(row, 5),
         turn_count: get_i64(row, 6) as i32,
         created_at: get_ts(row, 7),
+        summary: row.get::<Option<String>>(8).ok().flatten(),
     }
 }
 
@@ -322,5 +323,28 @@ impl AgentWorkspaceStore for LibSqlBackend {
             });
         }
         Ok(results)
+    }
+
+    async fn update_agent_workspace_summary(
+        &self,
+        id: Uuid,
+        summary: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        conn.execute(
+            "UPDATE agent_workspaces SET summary = ?2 WHERE id = ?1",
+            params![id.to_string(), summary],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_workspace_embedding(
+        &self,
+        _id: Uuid,
+    ) -> Result<Option<Vec<f32>>, DatabaseError> {
+        // libSQL has no pgvector — embedding retrieval is not supported.
+        Ok(None)
     }
 }

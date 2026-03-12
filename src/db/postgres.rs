@@ -1356,6 +1356,7 @@ fn pg_row_to_agent_workspace(row: &tokio_postgres::Row) -> AgentWorkspace {
         last_accessed: row.get("last_accessed"),
         turn_count: row.get("turn_count"),
         created_at: row.get("created_at"),
+        summary: row.get("summary"),
     }
 }
 
@@ -1373,7 +1374,7 @@ impl AgentWorkspaceStore for PgBackend {
                 INSERT INTO agent_workspaces (user_id, conversation_id)
                 VALUES ($1, $2)
                 RETURNING id, user_id, topic, conversation_id, status,
-                          last_accessed, turn_count, created_at
+                          last_accessed, turn_count, created_at, summary
                 "#,
                 &[&user_id, &conversation_id],
             )
@@ -1409,7 +1410,7 @@ impl AgentWorkspaceStore for PgBackend {
             .query(
                 r#"
                 SELECT id, user_id, topic, conversation_id, status,
-                       last_accessed, turn_count, created_at,
+                       last_accessed, turn_count, created_at, summary,
                        1 - (topic_embedding <=> $2) AS similarity
                 FROM agent_workspaces
                 WHERE user_id = $1
@@ -1447,7 +1448,7 @@ impl AgentWorkspaceStore for PgBackend {
             .query(
                 r#"
                 SELECT id, user_id, topic, conversation_id, status,
-                       last_accessed, turn_count, created_at,
+                       last_accessed, turn_count, created_at, summary,
                        1 - (topic_embedding <=> $2) AS similarity
                 FROM agent_workspaces
                 WHERE user_id = $1
@@ -1478,7 +1479,7 @@ impl AgentWorkspaceStore for PgBackend {
             .query(
                 r#"
                 SELECT id, user_id, topic, conversation_id, status,
-                       last_accessed, turn_count, created_at
+                       last_accessed, turn_count, created_at, summary
                 FROM agent_workspaces WHERE id = $1
                 "#,
                 &[&id],
@@ -1496,7 +1497,7 @@ impl AgentWorkspaceStore for PgBackend {
             .query(
                 r#"
                 SELECT id, user_id, topic, conversation_id, status,
-                       last_accessed, turn_count, created_at
+                       last_accessed, turn_count, created_at, summary
                 FROM agent_workspaces WHERE conversation_id = $1
                 "#,
                 &[&conversation_id],
@@ -1516,7 +1517,7 @@ impl AgentWorkspaceStore for PgBackend {
                 conn.query(
                     r#"
                     SELECT id, user_id, topic, conversation_id, status,
-                           last_accessed, turn_count, created_at
+                           last_accessed, turn_count, created_at, summary
                     FROM agent_workspaces
                     WHERE user_id = $1 AND status = $2
                     ORDER BY last_accessed DESC
@@ -1529,7 +1530,7 @@ impl AgentWorkspaceStore for PgBackend {
                 conn.query(
                     r#"
                     SELECT id, user_id, topic, conversation_id, status,
-                           last_accessed, turn_count, created_at
+                           last_accessed, turn_count, created_at, summary
                     FROM agent_workspaces
                     WHERE user_id = $1
                     ORDER BY last_accessed DESC
@@ -1639,6 +1640,40 @@ impl AgentWorkspaceStore for PgBackend {
                 workspace_id: row.get("workspace_id"),
             })
             .collect())
+    }
+
+    async fn update_agent_workspace_summary(
+        &self,
+        id: Uuid,
+        summary: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "UPDATE agent_workspaces SET summary = $2 WHERE id = $1",
+            &[&id, &summary],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn get_workspace_embedding(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<Vec<f32>>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT topic_embedding FROM agent_workspaces WHERE id = $1",
+                &[&id],
+            )
+            .await?;
+        match rows.first() {
+            Some(row) => {
+                let embedding: Option<Vector> = row.get("topic_embedding");
+                Ok(embedding.map(|v| v.to_vec()))
+            }
+            None => Ok(None),
+        }
     }
 }
 

@@ -16,6 +16,20 @@ use crate::context::JobState;
 use crate::error::Error;
 use crate::llm::{ChatMessage, Reasoning};
 
+/// Format a duration since `dt` as a human-readable "Xd ago" / "Xh ago" / "Xm ago" / "just now".
+fn format_time_ago(dt: chrono::DateTime<chrono::Utc>) -> String {
+    let elapsed = chrono::Utc::now() - dt;
+    if elapsed.num_days() > 0 {
+        format!("{}d ago", elapsed.num_days())
+    } else if elapsed.num_hours() > 0 {
+        format!("{}h ago", elapsed.num_hours())
+    } else if elapsed.num_minutes() > 0 {
+        format!("{}m ago", elapsed.num_minutes())
+    } else {
+        "just now".to_string()
+    }
+}
+
 /// Format a count with a suffix, using K/M abbreviations for large numbers.
 fn format_count(n: u64, suffix: &str) -> String {
     if n >= 1_000_000 {
@@ -418,6 +432,115 @@ impl Agent {
         }
     }
 
+    /// List all active workspaces for a user.
+    pub(super) async fn process_workspace_list(
+        &self,
+        user_id: &str,
+    ) -> Result<SubmissionResult, Error> {
+        let Some(ref db) = self.deps.store else {
+            return Ok(SubmissionResult::error("Database not available."));
+        };
+
+        let workspaces = db
+            .list_agent_workspaces(user_id, Some("active"))
+            .await?;
+
+        if workspaces.is_empty() {
+            return Ok(SubmissionResult::response(
+                "No active workspaces. Send some messages and run /organize to create workspaces.",
+            ));
+        }
+
+        let mut lines = vec!["Active workspaces:".to_string()];
+        for ws in &workspaces {
+            let ago = format_time_ago(ws.last_accessed);
+            lines.push(format!(
+                "  {} ({} turns, last active {})",
+                ws.topic, ws.turn_count, ago
+            ));
+        }
+        Ok(SubmissionResult::response(lines.join("\n")))
+    }
+
+    /// Switch to a workspace by fuzzy-matching on topic name.
+    pub(super) async fn process_workspace_switch(
+        &self,
+        user_id: &str,
+        name: &str,
+    ) -> Result<SubmissionResult, Error> {
+        let Some(ref db) = self.deps.store else {
+            return Ok(SubmissionResult::error("Database not available."));
+        };
+
+        let workspaces = db
+            .list_agent_workspaces(user_id, Some("active"))
+            .await?;
+
+        let name_lower = name.to_ascii_lowercase();
+        let matched: Vec<_> = workspaces
+            .iter()
+            .filter(|ws| ws.topic.to_ascii_lowercase().contains(&name_lower))
+            .collect();
+
+        match matched.len() {
+            0 => Ok(SubmissionResult::response(format!(
+                "No workspace matching \"{name}\". Use /workspace list to see available workspaces."
+            ))),
+            1 => {
+                let ws = matched[0];
+                // Set stickiness via thread resolver
+                if let Some(ref resolver) = self.deps.thread_resolver {
+                    resolver.notify_routed(user_id, ws.conversation_id, None).await;
+                }
+                let mut response = format!("Switched to workspace: **{}**", ws.topic);
+                if let Some(ref summary) = ws.summary {
+                    response.push_str(&format!("\n\n{summary}"));
+                }
+                Ok(SubmissionResult::response(response))
+            }
+            _ => {
+                let names: Vec<&str> = matched.iter().map(|ws| ws.topic.as_str()).collect();
+                Ok(SubmissionResult::response(format!(
+                    "Multiple workspaces match \"{name}\": {}. Be more specific.",
+                    names.join(", ")
+                )))
+            }
+        }
+    }
+
+    /// Show the current (most recently accessed) workspace summary.
+    pub(super) async fn process_workspace_summary(
+        &self,
+        user_id: &str,
+    ) -> Result<SubmissionResult, Error> {
+        let Some(ref db) = self.deps.store else {
+            return Ok(SubmissionResult::error("Database not available."));
+        };
+
+        let workspaces = db
+            .list_agent_workspaces(user_id, Some("active"))
+            .await?;
+
+        // The first workspace is the most recently accessed (sorted by last_accessed DESC)
+        let ws = match workspaces.first() {
+            Some(ws) => ws,
+            None => {
+                return Ok(SubmissionResult::response("No active workspaces."));
+            }
+        };
+
+        match &ws.summary {
+            Some(summary) => Ok(SubmissionResult::response(format!(
+                "**{}**\n\n{summary}",
+                ws.topic
+            ))),
+            None => Ok(SubmissionResult::response(format!(
+                "**{}** — no summary yet. Summary will be generated after the next organizer run.",
+                ws.topic
+            ))),
+        }
+    }
+
     /// Summarize the current thread's conversation.
     pub(super) async fn process_summarize(
         &self,
@@ -553,6 +676,11 @@ impl Agent {
                 "Skills:\n",
                 "  /skills             List installed skills\n",
                 "  /skills search <q>  Search ClawHub registry\n",
+                "\n",
+                "Workspaces:\n",
+                "  /workspace        List active workspaces\n",
+                "  /workspace <name> Switch to a workspace\n",
+                "  /workspace summary Show current workspace summary\n",
                 "\n",
                 "Agent:\n",
                 "  /heartbeat        Run heartbeat check\n",

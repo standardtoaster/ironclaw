@@ -30,6 +30,8 @@ pub struct RouteResult {
     pub ambiguous: bool,
     /// Top candidate workspace IDs with scores (for momentum tiebreak).
     pub candidates: Vec<(Uuid, f64)>,
+    /// The message embedding computed during routing (for centroid drift).
+    pub message_embedding: Option<Vec<f32>>,
 }
 
 /// Routes prompts to the best-matching workspace via embedding similarity.
@@ -114,6 +116,7 @@ impl WorkspaceRouter {
                 gap: -1.0,
                 ambiguous: false,
                 candidates: vec![],
+                message_embedding: Some(embedding),
             });
         }
 
@@ -130,6 +133,7 @@ impl WorkspaceRouter {
                 gap: -1.0,
                 ambiguous: false,
                 candidates,
+                message_embedding: Some(embedding),
             });
         }
 
@@ -154,6 +158,7 @@ impl WorkspaceRouter {
                 gap,
                 ambiguous: false,
                 candidates,
+                message_embedding: Some(embedding),
             });
         }
 
@@ -173,6 +178,7 @@ impl WorkspaceRouter {
                 gap,
                 ambiguous: false,
                 candidates,
+                message_embedding: Some(embedding),
             });
         }
 
@@ -190,6 +196,7 @@ impl WorkspaceRouter {
             gap,
             ambiguous: true,
             candidates,
+            message_embedding: Some(embedding),
         })
     }
 
@@ -430,6 +437,21 @@ mod tests {
         ) -> Result<u64, DatabaseError> {
             Ok(0)
         }
+
+        async fn update_agent_workspace_summary(
+            &self,
+            _id: Uuid,
+            _summary: &str,
+        ) -> Result<(), DatabaseError> {
+            Ok(())
+        }
+
+        async fn get_workspace_embedding(
+            &self,
+            _id: Uuid,
+        ) -> Result<Option<Vec<f32>>, DatabaseError> {
+            Ok(None)
+        }
     }
 
     // ── Helper ─────────────────────────────────────────────────────────
@@ -444,6 +466,7 @@ mod tests {
             last_accessed: Utc::now(),
             turn_count: 0,
             created_at: Utc::now(),
+            summary: None,
         }
     }
 

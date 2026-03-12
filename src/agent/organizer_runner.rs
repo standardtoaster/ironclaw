@@ -293,6 +293,17 @@ impl OrganizerRunner {
                     );
                 }
                 self.consecutive_failures = 0;
+
+                // Generate/update summaries for workspaces with new content
+                match self.resolver.summarize_workspaces(user_id).await {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(user_id, summarized = n, "Organizer: updated workspace summaries");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(user_id, error = %e, "Organizer: summary generation failed");
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!(user_id, error = %e, "Organizer failed for user");

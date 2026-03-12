@@ -44,6 +44,21 @@ impl SubmissionParser {
         if lower == "/organize" {
             return Submission::Organize;
         }
+        if lower == "/workspace" || lower == "/workspace list" || lower == "/workspaces" {
+            return Submission::WorkspaceList;
+        }
+        if lower.starts_with("/workspace ") {
+            let arg = trimmed[11..].trim();
+            if arg.eq_ignore_ascii_case("summary") {
+                return Submission::WorkspaceSummary;
+            }
+            if arg.eq_ignore_ascii_case("list") {
+                return Submission::WorkspaceList;
+            }
+            return Submission::WorkspaceSwitch {
+                name: arg.to_string(),
+            };
+        }
         if lower == "/thread new" || lower == "/new" {
             return Submission::NewThread;
         }
@@ -266,6 +281,15 @@ pub enum Submission {
     /// Trigger the workspace organizer to classify and create workspaces.
     Organize,
 
+    /// List all workspaces.
+    WorkspaceList,
+
+    /// Switch to a workspace by topic name (fuzzy match).
+    WorkspaceSwitch { name: String },
+
+    /// Show the current workspace's summary.
+    WorkspaceSummary,
+
     /// Check job status. No job_id shows all jobs; with job_id shows a specific job.
     JobStatus {
         /// Optional job ID (UUID or short prefix). If None, shows all jobs.
@@ -362,6 +386,9 @@ impl Submission {
                 | Self::Heartbeat
                 | Self::Summarize
                 | Self::Suggest
+                | Self::WorkspaceList
+                | Self::WorkspaceSwitch { .. }
+                | Self::WorkspaceSummary
                 | Self::JobStatus { .. }
                 | Self::JobCancel { .. }
                 | Self::SystemCommand { .. }

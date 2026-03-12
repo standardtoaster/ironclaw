@@ -26,6 +26,9 @@ pub struct ThreadResolution {
 
     /// Routing metadata for SSE events and logging.
     pub metadata: HashMap<String, String>,
+
+    /// The message embedding computed during routing (for centroid drift).
+    pub message_embedding: Option<Vec<f32>>,
 }
 
 /// Information about a workspace created or updated by the organizer.
@@ -84,10 +87,21 @@ pub trait ThreadResolver: Send + Sync {
     /// Notify the resolver that a message was processed in a specific thread.
     ///
     /// Called after the agentic loop completes. Implementations use this to
-    /// update stickiness state (active workspace, last message time).
-    async fn notify_routed(&self, user_id: &str, thread_id: Uuid) {
+    /// update stickiness state (active workspace, last message time) and
+    /// optionally blend the message embedding into the workspace centroid.
+    async fn notify_routed(
+        &self,
+        user_id: &str,
+        thread_id: Uuid,
+        message_embedding: Option<&[f32]>,
+    ) {
         // Default: no-op. Implementations override for stickiness tracking.
-        let _ = (user_id, thread_id);
+        let _ = (user_id, thread_id, message_embedding);
+    }
+
+    /// Summarize workspaces with new messages. Returns count of workspaces summarized.
+    async fn summarize_workspaces(&self, _user_id: &str) -> Result<usize, ResolverError> {
+        Ok(0) // Default: no-op
     }
 }
 
