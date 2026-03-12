@@ -67,6 +67,10 @@ async fn async_main() -> anyhow::Result<()> {
             )
             .await;
         }
+        Some(Command::Routines(routines_cmd)) => {
+            init_cli_tracing();
+            return ironclaw::cli::run_routines_cli(routines_cmd, cli.config.as_deref()).await;
+        }
         Some(Command::Mcp(mcp_cmd)) => {
             init_cli_tracing();
             return run_mcp_command(*mcp_cmd.clone()).await;
