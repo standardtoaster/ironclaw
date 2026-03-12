@@ -207,35 +207,58 @@ impl ThreadResolver for WorkspaceThreadResolver {
             Some((ws_id, conv_id, s.active_topic.clone()))
         };
 
-        // If no confident match (ambiguous or below threshold), try stickiness.
+        // If no confident match, try stickiness or momentum tiebreak.
         if route_result.workspace.is_none()
-            && let Some((ws_id, conv_id, topic)) = get_sticky_state(route_result.ambiguous).await {
-                let reason = if route_result.ambiguous {
-                    "sticky_ambiguous"
-                } else {
-                    "sticky"
-                };
-                tracing::info!(
-                    workspace_id = %ws_id,
-                    score = route_result.score,
-                    gap = route_result.gap,
-                    reason,
-                    "ThreadResolver: using stickiness (no confident embedding match)"
-                );
-                let mut metadata = HashMap::new();
-                metadata.insert("workspace_id".to_string(), ws_id.to_string());
-                if let Some(ref t) = topic {
-                    metadata.insert("topic".to_string(), t.clone());
-                }
-                metadata.insert("routing_reason".to_string(), reason.to_string());
+            && let Some((ws_id, conv_id, topic)) = get_sticky_state(false).await
+        {
+                // Momentum tiebreak: if ambiguous and the active workspace is a
+                // competitive candidate (above threshold and within 0.10 of the
+                // top score), prefer it.
+                let active_is_competitive = route_result.ambiguous
+                    && route_result.candidates.iter().any(|(id, score)| {
+                        *id == ws_id
+                            && *score >= self.config.low_threshold
+                            && (route_result.score - score) < 0.10
+                    });
 
-                return Ok(ThreadResolution {
-                    thread_id: Some(conv_id),
-                    context: self.build_workspace_context(ws_id, topic.as_deref()).await,
-                    metadata,
-                });
+                let reason = if active_is_competitive {
+                    "momentum"
+                } else if route_result.ambiguous {
+                    // Active workspace not competitive or not among candidates —
+                    // the user has changed topic. Don't use stickiness.
+                    "none"
+                } else {
+                    // Below threshold — only use stickiness for reply-like messages.
+                    if is_reply_like(message_content, self.config.reply_max_words) {
+                        "sticky"
+                    } else {
+                        "none"
+                    }
+                };
+
+                if reason != "none" {
+                    tracing::info!(
+                        workspace_id = %ws_id,
+                        score = route_result.score,
+                        gap = route_result.gap,
+                        reason,
+                        "ThreadResolver: using stickiness/momentum"
+                    );
+                    let mut metadata = HashMap::new();
+                    metadata.insert("workspace_id".to_string(), ws_id.to_string());
+                    if let Some(ref t) = topic {
+                        metadata.insert("topic".to_string(), t.clone());
+                    }
+                    metadata.insert("routing_reason".to_string(), reason.to_string());
+
+                    return Ok(ThreadResolution {
+                        thread_id: Some(conv_id),
+                        context: self.build_workspace_context(ws_id, topic.as_deref()).await,
+                        metadata,
+                    });
+                }
             }
-            // No stickiness → fall through to default workspace below
+        // Fall through to embedding match or default workspace below
 
         match route_result.workspace {
             Some(ws) if ws.topic != DEFAULT_WORKSPACE_TOPIC => {

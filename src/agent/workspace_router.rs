@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use uuid::Uuid;
+
 use crate::db::{AgentWorkspace, AgentWorkspaceStore};
 use crate::workspace::{EmbeddingError, EmbeddingProvider};
 
@@ -24,36 +26,55 @@ pub struct RouteResult {
     pub score: f64,
     /// Gap between #1 and #2 scores (-1.0 if only one candidate).
     pub gap: f64,
-    /// Whether the match was ambiguous (gap below `min_gap`).
+    /// Whether the match was ambiguous (gap below confidence threshold).
     pub ambiguous: bool,
+    /// Top candidate workspace IDs with scores (for momentum tiebreak).
+    pub candidates: Vec<(Uuid, f64)>,
 }
 
 /// Routes prompts to the best-matching workspace via embedding similarity.
+///
+/// Uses a tiered routing strategy:
+/// - Score > `high_threshold` (0.75): always route (clear winner)
+/// - Score > `low_threshold` (0.5) and gap > 0.15: route confidently
+/// - Score > `low_threshold` (0.5) and gap < 0.10: ambiguous (momentum tiebreak zone)
+/// - Score < `low_threshold`: no match
 pub struct WorkspaceRouter {
     db: Arc<dyn AgentWorkspaceStore>,
     embedder: Arc<dyn EmbeddingProvider>,
-    threshold: f64,
-    /// Minimum gap between #1 and #2 scores to consider a match confident.
-    min_gap: f64,
+    /// Minimum score for any routing (default 0.5).
+    low_threshold: f64,
+    /// Score above which we always route without gap check (default 0.75).
+    high_threshold: f64,
+    /// Minimum gap for a confident moderate match (default 0.08).
+    /// Below this gap, routing is ambiguous and needs momentum/stickiness.
+    confident_gap: f64,
 }
 
 impl WorkspaceRouter {
     pub fn new(
         db: Arc<dyn AgentWorkspaceStore>,
         embedder: Arc<dyn EmbeddingProvider>,
-        threshold: f64,
+        low_threshold: f64,
     ) -> Self {
         Self {
             db,
             embedder,
-            threshold,
-            min_gap: 0.05,
+            low_threshold,
+            high_threshold: 0.75,
+            confident_gap: 0.05,
         }
     }
 
-    /// Set the minimum confidence gap between #1 and #2 matches.
-    pub fn with_min_gap(mut self, min_gap: f64) -> Self {
-        self.min_gap = min_gap;
+    /// Set the high threshold for unconditional routing.
+    pub fn with_high_threshold(mut self, high_threshold: f64) -> Self {
+        self.high_threshold = high_threshold;
+        self
+    }
+
+    /// Set the minimum gap for confident moderate matches.
+    pub fn with_confident_gap(mut self, confident_gap: f64) -> Self {
+        self.confident_gap = confident_gap;
         self
     }
 
@@ -72,6 +93,12 @@ impl WorkspaceRouter {
     }
 
     /// Route with full confidence metadata returned.
+    ///
+    /// Tiered routing:
+    /// 1. Score > high_threshold (0.75) → always route (clear winner)
+    /// 2. Score > low_threshold (0.5) and gap > 0.15 → route confidently
+    /// 3. Score > low_threshold (0.5) and gap < 0.10 → ambiguous (momentum zone)
+    /// 4. Score < low_threshold → no match
     pub async fn route_with_confidence(
         &self,
         user_id: &str,
@@ -80,58 +107,89 @@ impl WorkspaceRouter {
         let embedding = self.embedder.embed(prompt).await?;
         let matches = self.db.find_top_matching_workspaces(user_id, &embedding, 3).await?;
 
-        let (first, second) = match matches.as_slice() {
-            [] => {
-                return Ok(RouteResult {
-                    workspace: None,
-                    score: 0.0,
-                    gap: -1.0,
-                    ambiguous: false,
-                });
-            }
-            [(ws, score)] => (Some((ws.clone(), *score)), None),
-            [(ws1, s1), (ws2, s2), ..] => (Some((ws1.clone(), *s1)), Some((ws2.clone(), *s2))),
-        };
+        if matches.is_empty() {
+            return Ok(RouteResult {
+                workspace: None,
+                score: 0.0,
+                gap: -1.0,
+                ambiguous: false,
+                candidates: vec![],
+            });
+        }
 
-        let (best_ws, best_score) = first.unwrap();
+        let candidates: Vec<(Uuid, f64)> = matches.iter().map(|(ws, s)| (ws.id, *s)).collect();
 
-        if best_score < self.threshold {
+        let best_ws = matches[0].0.clone();
+        let best_score = matches[0].1;
+
+        // Below minimum threshold — no match
+        if best_score < self.low_threshold {
             return Ok(RouteResult {
                 workspace: None,
                 score: best_score,
                 gap: -1.0,
                 ambiguous: false,
+                candidates,
             });
         }
 
-        let gap = match second {
-            Some((_, s2)) => best_score - s2,
-            None => -1.0, // only one candidate, no ambiguity
+        let gap = if matches.len() > 1 {
+            best_score - matches[1].1
+        } else {
+            -1.0 // only one candidate, no ambiguity
         };
 
-        let ambiguous = gap >= 0.0 && gap < self.min_gap;
-
-        if ambiguous {
+        // Tier 1: Strong match — always route, no gap check needed
+        if best_score >= self.high_threshold {
             tracing::debug!(
                 topic = %best_ws.topic,
                 score = best_score,
                 gap,
-                "WorkspaceRouter: ambiguous match (gap < {:.2}), falling to default",
-                self.min_gap,
+                "WorkspaceRouter: strong match (score >= {:.2})",
+                self.high_threshold,
             );
             return Ok(RouteResult {
-                workspace: None,
+                workspace: Some(best_ws),
                 score: best_score,
                 gap,
-                ambiguous: true,
+                ambiguous: false,
+                candidates,
             });
         }
 
+        // Tier 2: Moderate match with confident gap
+        if gap < 0.0 || gap > self.confident_gap {
+            // Only one candidate (gap < 0) or clear separation
+            tracing::debug!(
+                topic = %best_ws.topic,
+                score = best_score,
+                gap,
+                confident_gap = self.confident_gap,
+                "WorkspaceRouter: confident moderate match",
+            );
+            return Ok(RouteResult {
+                workspace: Some(best_ws),
+                score: best_score,
+                gap,
+                ambiguous: false,
+                candidates,
+            });
+        }
+
+        // Tier 3: Ambiguous — gap <= confident_gap, needs momentum tiebreak
+        tracing::debug!(
+            topic = %best_ws.topic,
+            score = best_score,
+            gap,
+            confident_gap = self.confident_gap,
+            "WorkspaceRouter: ambiguous match, momentum zone",
+        );
         Ok(RouteResult {
-            workspace: Some(best_ws),
+            workspace: None,
             score: best_score,
             gap,
-            ambiguous: false,
+            ambiguous: true,
+            candidates,
         })
     }
 
