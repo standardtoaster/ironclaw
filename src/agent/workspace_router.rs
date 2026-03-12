@@ -61,7 +61,7 @@ impl WorkspaceRouter {
             db,
             embedder,
             low_threshold,
-            high_threshold: 0.75,
+            high_threshold: 0.65,
             confident_gap: 0.05,
         }
     }

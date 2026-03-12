@@ -59,8 +59,8 @@ pub struct WorkspaceResolverConfig {
 impl Default for WorkspaceResolverConfig {
     fn default() -> Self {
         Self {
-            high_threshold: 0.75,
-            low_threshold: 0.5,
+            high_threshold: 0.65,
+            low_threshold: 0.4,
             stickiness_timeout: Duration::from_secs(30 * 60),
             reply_max_words: 15,
             organizer_model: None,
