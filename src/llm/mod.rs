@@ -17,7 +17,7 @@ pub mod config;
 pub mod costs;
 pub mod error;
 pub mod failover;
-mod nearai_chat;
+pub(crate) mod nearai_chat;
 pub mod oauth_helpers;
 mod provider;
 mod reasoning;
@@ -176,27 +176,12 @@ async fn create_bedrock_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvid
 fn create_openai_compat_from_registry(
     config: &RegistryProviderConfig,
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
-    use rig::providers::openai;
-
-    let mut extra_headers = reqwest::header::HeaderMap::new();
-    for (key, value) in &config.extra_headers {
-        let name = match reqwest::header::HeaderName::from_bytes(key.as_bytes()) {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(header = %key, error = %e, "Skipping extra header: invalid name");
-                continue;
-            }
-        };
-        let val = match reqwest::header::HeaderValue::from_str(value) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(header = %key, error = %e, "Skipping extra header: invalid value");
-                continue;
-            }
-        };
-        extra_headers.insert(name, val);
-    }
-
+    // Use NearAiChatProvider for all OpenAI-compatible endpoints.
+    // Despite its name, it's a generic Chat Completions client that
+    // serializes message content as plain strings (not arrays), which
+    // is required by strict providers like NVIDIA NIM, Groq, etc.
+    // The rig-core RigAdapter path serializes content as arrays via
+    // OneOrMany<T>, which those providers reject with 400 errors.
     let api_key = config
         .api_key
         .as_ref()
@@ -211,35 +196,42 @@ fn create_openai_compat_from_registry(
             "no-key".to_string()
         });
 
-    let mut builder = openai::Client::builder().api_key(&api_key);
-    if !config.base_url.is_empty() {
-        builder = builder.base_url(&config.base_url);
-    }
-    if !extra_headers.is_empty() {
-        builder = builder.http_headers(extra_headers);
-    }
+    let nearai_config = config::NearAiConfig {
+        model: config.model.clone(),
+        base_url: config.base_url.clone(),
+        api_key: Some(secrecy::SecretString::from(api_key)),
+        cheap_model: None,
+        fallback_model: None,
+        max_retries: 3,
+        circuit_breaker_threshold: None,
+        circuit_breaker_recovery_secs: 30,
+        response_cache_enabled: false,
+        response_cache_ttl_secs: 3600,
+        response_cache_max_entries: 1000,
+        failover_cooldown_secs: 300,
+        failover_cooldown_threshold: 3,
+        smart_routing_cascade: false,
+    };
 
-    let client: openai::Client = builder.build().map_err(|e| LlmError::RequestFailed {
-        provider: config.provider_id.clone(),
-        reason: format!("Failed to create OpenAI-compatible client: {e}"),
-    })?;
+    // SessionManager is required by NearAiChatProvider but unused when
+    // api_key is set — the provider goes straight to Bearer key auth.
+    let session = Arc::new(session::SessionManager::new(session::SessionConfig::default()));
 
-    // Use CompletionsClient (Chat Completions API) instead of the default
-    // Client (Responses API). The Responses API path in rig-core handles
-    // tool results differently, which breaks IronClaw's tool call flow.
-    let client = client.completions_api();
-    let model = client.completion_model(&config.model);
+    let provider = nearai_chat::NearAiChatProvider::new_with_options(
+        nearai_config,
+        session,
+        false, // don't flatten tool messages — most providers handle role:tool
+        120,
+    )?;
 
     tracing::info!(
         provider = %config.provider_id,
         model = %config.model,
         base_url = %config.base_url,
-        "Using OpenAI-compatible provider"
+        "Using OpenAI-compatible provider (chat completions)"
     );
 
-    let adapter = RigAdapter::new(model, &config.model)
-        .with_unsupported_params(config.unsupported_params.clone());
-    Ok(Arc::new(adapter))
+    Ok(Arc::new(provider))
 }
 
 fn create_anthropic_from_registry(
@@ -759,35 +751,41 @@ pub fn create_provider_from_user_config(
             Arc::new(RigAdapter::new(model, &user_config.model)) as Arc<dyn LlmProvider>
         }
         LlmBackend::OpenAiCompatible => {
-            use rig::providers::openai;
-
             let base_url = user_config.base_url.as_deref().ok_or_else(|| LlmError::RequestFailed {
                 provider: "openai_compatible".to_string(),
                 reason: "llm_base_url is required for openai_compatible backend".to_string(),
             })?;
 
-            let client: openai::CompletionsClient = openai::Client::builder()
-                .base_url(base_url)
-                .api_key(
-                    user_config
-                        .api_key
-                        .as_ref()
-                        .map(|k| k.expose_secret().to_string())
-                        .unwrap_or_else(|| "no-key".to_string()),
-                )
-                .build()
-                .map_err(|e| LlmError::RequestFailed {
-                    provider: "openai_compatible".to_string(),
-                    reason: format!("Failed to create OpenAI-compatible client: {e}"),
-                })?
-                .completions_api();
+            let nearai_config = config::NearAiConfig {
+                model: user_config.model.clone(),
+                base_url: base_url.to_string(),
+                api_key: user_config.api_key.clone(),
+                cheap_model: None,
+                fallback_model: None,
+                max_retries: 3,
+                circuit_breaker_threshold: None,
+                circuit_breaker_recovery_secs: 30,
+                response_cache_enabled: false,
+                response_cache_ttl_secs: 3600,
+                response_cache_max_entries: 1000,
+                failover_cooldown_secs: 300,
+                failover_cooldown_threshold: 3,
+                smart_routing_cascade: false,
+            };
 
-            let model = client.completion_model(&user_config.model);
+            let session = Arc::new(session::SessionManager::new(session::SessionConfig::default()));
+            let provider = nearai_chat::NearAiChatProvider::new_with_options(
+                nearai_config,
+                session,
+                false,
+                120,
+            )?;
+
             tracing::info!(
                 user_model = %user_config.model,
                 "Per-user OpenAI-compatible provider created"
             );
-            Arc::new(RigAdapter::new(model, &user_config.model)) as Arc<dyn LlmProvider>
+            Arc::new(provider) as Arc<dyn LlmProvider>
         }
         LlmBackend::Tinfoil => {
             let api_key = user_config.api_key.as_ref().ok_or_else(|| LlmError::AuthFailed {
