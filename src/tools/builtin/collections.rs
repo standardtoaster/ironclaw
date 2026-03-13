@@ -962,6 +962,7 @@ impl Tool for CollectionsAlterTool {
                     "description": "Whether the field is required (add_field only, default: false)"
                 },
                 "default": {
+                    "type": "string",
                     "description": "Default value for the field (add_field only)"
                 },
                 "values": {
