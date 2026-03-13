@@ -12,6 +12,7 @@ mod anthropic_oauth;
 #[cfg(feature = "bedrock")]
 mod bedrock;
 pub mod circuit_breaker;
+mod cleaning_provider;
 pub mod config;
 pub mod costs;
 pub mod error;
@@ -32,6 +33,7 @@ pub mod image_models;
 pub mod vision_models;
 
 pub use circuit_breaker::{CircuitBreakerConfig, CircuitBreakerProvider};
+pub use cleaning_provider::CleaningProvider;
 pub use config::{
     BedrockConfig, CacheRetention, LlmConfig, NearAiConfig, OAUTH_PLACEHOLDER,
     RegistryProviderConfig,
@@ -649,6 +651,9 @@ pub async fn build_provider_chain(
         llm
     };
 
+    // 7. Response cleaning (strip thinking tags from all LLM output)
+    let llm: Arc<dyn LlmProvider> = Arc::new(CleaningProvider::new(llm));
+
     // Standalone cheap LLM for heartbeat/evaluation (not part of the chain)
     let cheap_llm = create_cheap_llm_provider(config, session)?;
     if let Some(ref cheap) = cheap_llm {
@@ -672,7 +677,7 @@ pub fn create_provider_from_user_config(
     use crate::config::LlmBackend;
     use secrecy::ExposeSecret;
 
-    match user_config.backend {
+    let provider: Arc<dyn LlmProvider> = match user_config.backend {
         LlmBackend::Anthropic => {
             let api_key = user_config.api_key.as_ref().ok_or_else(|| LlmError::AuthFailed {
                 provider: "anthropic".to_string(),
@@ -698,7 +703,7 @@ pub fn create_provider_from_user_config(
                 user_model = %user_config.model,
                 "Per-user Anthropic provider created"
             );
-            Ok(Arc::new(RigAdapter::new(model, &user_config.model)))
+            Arc::new(RigAdapter::new(model, &user_config.model)) as Arc<dyn LlmProvider>
         }
         LlmBackend::OpenAi => {
             let api_key = user_config.api_key.as_ref().ok_or_else(|| LlmError::AuthFailed {
@@ -726,7 +731,7 @@ pub fn create_provider_from_user_config(
                 user_model = %user_config.model,
                 "Per-user OpenAI provider created"
             );
-            Ok(Arc::new(RigAdapter::new(model, &user_config.model)))
+            Arc::new(RigAdapter::new(model, &user_config.model)) as Arc<dyn LlmProvider>
         }
         LlmBackend::Ollama => {
             use rig::client::Nothing;
@@ -751,7 +756,7 @@ pub fn create_provider_from_user_config(
                 user_model = %user_config.model,
                 "Per-user Ollama provider created"
             );
-            Ok(Arc::new(RigAdapter::new(model, &user_config.model)))
+            Arc::new(RigAdapter::new(model, &user_config.model)) as Arc<dyn LlmProvider>
         }
         LlmBackend::OpenAiCompatible => {
             use rig::providers::openai;
@@ -782,7 +787,7 @@ pub fn create_provider_from_user_config(
                 user_model = %user_config.model,
                 "Per-user OpenAI-compatible provider created"
             );
-            Ok(Arc::new(RigAdapter::new(model, &user_config.model)))
+            Arc::new(RigAdapter::new(model, &user_config.model)) as Arc<dyn LlmProvider>
         }
         LlmBackend::Tinfoil => {
             let api_key = user_config.api_key.as_ref().ok_or_else(|| LlmError::AuthFailed {
@@ -806,19 +811,22 @@ pub fn create_provider_from_user_config(
                 user_model = %user_config.model,
                 "Per-user Tinfoil provider created"
             );
-            Ok(Arc::new(RigAdapter::new(model, &user_config.model)))
+            Arc::new(RigAdapter::new(model, &user_config.model)) as Arc<dyn LlmProvider>
         }
         LlmBackend::NearAi => {
             // NearAi requires a session manager which we don't have in per-user context.
             // Users wanting NearAi should use the global provider.
-            Err(LlmError::RequestFailed {
+            return Err(LlmError::RequestFailed {
                 provider: "nearai".to_string(),
                 reason: "NearAI backend is not supported for per-user LLM config; \
                          use anthropic, openai, ollama, openai_compatible, or tinfoil"
                     .to_string(),
-            })
+            });
         }
-    }
+    };
+
+    // Wrap with CleaningProvider to strip thinking tags from all output
+    Ok(Arc::new(CleaningProvider::new(provider)))
 }
 
 #[cfg(test)]

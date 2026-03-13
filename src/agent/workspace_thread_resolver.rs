@@ -465,14 +465,13 @@ impl ThreadResolver for WorkspaceThreadResolver {
             }
         };
 
-        // 6. Clean thinking tags, then parse JSON response
-        let cleaned = crate::llm::clean_response(&response.content);
-        let projects = match parse_organizer_response(&cleaned) {
+        // 6. Parse JSON response (thinking tags already stripped by CleaningProvider)
+        let projects = match parse_organizer_response(&response.content) {
             Some(p) => p,
             None => {
                 tracing::warn!(
                     "Organizer: failed to parse LLM response as JSON: {}",
-                    &cleaned[..cleaned.len().min(200)]
+                    &response.content[..response.content.len().min(200)]
                 );
                 return Ok(OrganizeResult::default());
             }
@@ -811,8 +810,8 @@ impl WorkspaceThreadResolver {
             .await
             .map_err(|e| ResolverError::Classification(e.to_string()))?;
 
-        // Clean response (handle thinking tags from Qwen3 etc.)
-        let summary = crate::llm::clean_response(&response.content);
+        // Thinking tags already stripped by CleaningProvider
+        let summary = response.content.trim().to_string();
 
         // Store the summary
         self.db
