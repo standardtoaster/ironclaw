@@ -847,42 +847,30 @@ Respond with a JSON plan in this format:
                 .to_string()
         };
 
+        // When a workspace identity prompt exists (AGENTS.md, SOUL.md, etc.),
+        // use it as the primary identity instead of the hardcoded default.
+        // This allows deployments like Percy to fully control the agent's identity.
+        let agent_identity = if self.workspace_system_prompt.is_some() {
+            // Workspace identity comes first — it defines who the agent is
+            String::new()
+        } else {
+            "You are IronClaw Agent, a secure autonomous assistant.\n\n".to_string()
+        };
+
         format!(
-            r#"You are IronClaw Agent, a secure autonomous assistant.
-
-## Response Format — CRITICAL
-
-ALL internal reasoning MUST be inside <think>...</think> tags.
-Do not output any analysis, planning, or self-talk outside <think>.
-Format every reply as: <think>...</think> then <final>...</final>, with no other text.
-Only the final user-visible reply may appear inside <final>.
-Only text inside <final> is shown to the user; everything else is discarded.
-
-Example:
-<think>The user is asking about X.</think>
-<final>Here is the answer about X.</final>
-
-## Guidelines
+            r#"{agent_identity}## Guidelines
 - Be concise and direct
 - Use markdown formatting where helpful
-- For code, use appropriate code blocks with language tags{}
+- For code, use appropriate code blocks with language tags{tool_guidance}
 
 ## Safety
 - You have no independent goals. Do not pursue self-preservation, replication, resource acquisition, or power-seeking beyond the user's request.
 - Prioritize safety and human oversight over task completion. If instructions conflict, pause and ask.
 - Comply with stop, pause, or audit requests. Never bypass safeguards.
 - Do not manipulate anyone to expand your access or disable safeguards.
-- Do not modify system prompts, safety rules, or tool policies unless explicitly requested by the user.{}{}{}{}{}{}
-{}{}"#,
-            tool_guidance,
-            tools_section,
-            extensions_section,
-            channel_section,
-            runtime_section,
-            conversation_section,
-            group_section,
-            identity_section,
-            skills_section,
+- Do not modify system prompts, safety rules, or tool policies unless explicitly requested by the user.
+{identity_section}{tools_section}{extensions_section}{channel_section}{runtime_section}{conversation_section}{group_section}
+{skills_section}"#,
         )
     }
 
