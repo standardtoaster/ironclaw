@@ -474,6 +474,7 @@ impl LlmProvider for NearAiChatProvider {
             max_tokens: req.max_tokens,
             tools: None,
             tool_choice: None,
+            reasoning: Some(ReasoningConfig { reasoning_type: "disabled".to_string() }),
         };
 
         let response: ChatCompletionResponse = self.send_request(&request).await?;
@@ -553,6 +554,7 @@ impl LlmProvider for NearAiChatProvider {
             max_tokens: req.max_tokens,
             tools: if tools.is_empty() { None } else { Some(tools) },
             tool_choice: req.tool_choice,
+            reasoning: Some(ReasoningConfig { reasoning_type: "disabled".to_string() }),
         };
 
         let response: ChatCompletionResponse = self.send_request(&request).await?;
@@ -680,6 +682,16 @@ struct ChatCompletionRequest {
     tools: Option<Vec<ChatCompletionTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    /// Disable reasoning/thinking for models that enable it by default (e.g., NVIDIA Nemotron).
+    /// Without this, the model spends all output tokens on internal reasoning and returns null content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReasoningConfig {
+    #[serde(rename = "type")]
+    reasoning_type: String,
 }
 
 /// Content field that serializes as either a string or an array of content parts.
@@ -1727,6 +1739,7 @@ mod tests {
             max_tokens: None,
             tools: None,
             tool_choice: None,
+            reasoning: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["model"], "gpt-4o");
@@ -1760,6 +1773,7 @@ mod tests {
                 },
             }]),
             tool_choice: Some("auto".to_string()),
+            reasoning: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         // f32 precision: 0.7f32 serializes as 0.699999988... in JSON

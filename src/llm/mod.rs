@@ -380,7 +380,7 @@ async fn create_tier_provider(
             nearai,
             provider: None,
             bedrock: None,
-            request_timeout_secs: 120,
+            request_timeout_secs: 300,
             routing_tiers: Vec::new(),
         };
         return create_llm_provider(&config, session).await;
@@ -420,7 +420,7 @@ async fn create_tier_provider(
         },
         provider: Some(reg_config),
         bedrock: None,
-        request_timeout_secs: 120,
+        request_timeout_secs: 300,
         routing_tiers: Vec::new(),
     };
 
@@ -858,7 +858,7 @@ mod tests {
             nearai: test_nearai_config(),
             provider: None,
             bedrock: None,
-            request_timeout_secs: 120,
+            request_timeout_secs: 300,
             routing_tiers: Vec::new(),
         }
     }
