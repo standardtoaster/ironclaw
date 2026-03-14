@@ -474,7 +474,7 @@ impl LlmProvider for NearAiChatProvider {
             max_tokens: req.max_tokens,
             tools: None,
             tool_choice: None,
-            reasoning: Some(ReasoningConfig { reasoning_type: "disabled".to_string() }),
+            reasoning: None,
         };
 
         let response: ChatCompletionResponse = self.send_request(&request).await?;
@@ -554,7 +554,7 @@ impl LlmProvider for NearAiChatProvider {
             max_tokens: req.max_tokens,
             tools: if tools.is_empty() { None } else { Some(tools) },
             tool_choice: req.tool_choice,
-            reasoning: Some(ReasoningConfig { reasoning_type: "disabled".to_string() }),
+            reasoning: None,
         };
 
         let response: ChatCompletionResponse = self.send_request(&request).await?;
