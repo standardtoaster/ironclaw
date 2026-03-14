@@ -160,7 +160,7 @@ async def ironclaw_server(ironclaw_binary, mock_llm_server, wasm_tools_dir):
         "LIBSQL_PATH": os.path.join(_DB_TMPDIR.name, "e2e.db"),
         "SANDBOX_ENABLED": "false",
         "SKILLS_ENABLED": "true",
-        "ROUTINES_ENABLED": "false",
+        "ROUTINES_ENABLED": "true",
         "HEARTBEAT_ENABLED": "false",
         "EMBEDDING_ENABLED": "false",
         # WASM tool/channel support
