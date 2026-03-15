@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Query, State, WebSocketUpgrade},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware,
     response::{
         IntoResponse,
@@ -2602,16 +2602,60 @@ struct WebhookBody {
 async fn webhook_fire_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     body: Option<Json<WebhookBody>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let routine_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
+
+    // Look up the routine to validate the webhook secret before firing.
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Store not available".to_string(),
+    ))?;
+
+    let routine = store
+        .get_routine(routine_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
+
+    // Validate webhook secret using constant-time comparison.
+    if let crate::agent::routine::Trigger::Webhook { ref secret, .. } = routine.trigger {
+        let expected = secret.as_deref().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Routine webhook has no secret configured".to_string(),
+        ))?;
+        let provided = headers
+            .get("X-Webhook-Secret")
+            .and_then(|v| v.to_str().ok())
+            .ok_or((
+                StatusCode::UNAUTHORIZED,
+                "Missing X-Webhook-Secret header".to_string(),
+            ))?;
+        if !bool::from(
+            subtle::ConstantTimeEq::ct_eq(provided.as_bytes(), expected.as_bytes()),
+        ) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "Invalid webhook secret".to_string(),
+            ));
+        }
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Routine has trigger type '{}', not 'webhook'",
+                routine.trigger.type_tag()
+            ),
+        ));
+    }
+
     let engine_guard = state.routine_engine.read().await;
     let engine = engine_guard.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Routine engine not available".to_string(),
     ))?;
-
-    let routine_id = Uuid::parse_str(&id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
 
     let payload_str = body.and_then(|Json(b)| {
         b.payload.map(|v| {

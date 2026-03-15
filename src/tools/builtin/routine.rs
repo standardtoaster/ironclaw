@@ -199,10 +199,14 @@ impl Tool for RoutineCreateTool {
                     pattern: pattern.to_string(),
                 }
             }
-            "webhook" => Trigger::Webhook {
-                path: None,
-                secret: None,
-            },
+            "webhook" => {
+                // Auto-generate a secret for webhook routines (required for HMAC validation).
+                let secret = Uuid::new_v4().to_string();
+                Trigger::Webhook {
+                    path: None,
+                    secret: Some(secret),
+                }
+            }
             "manual" => Trigger::Manual,
             other => {
                 return Err(ToolError::InvalidParameters(format!(
