@@ -32,6 +32,7 @@ use crate::skills::SkillRegistry;
 use crate::tools::ToolRegistry;
 use uuid::Uuid;
 
+use crate::channels::web::server::WorkspacePool;
 use crate::workspace::Workspace;
 
 /// Collapse a tool output string into a single-line preview for display.
@@ -96,6 +97,10 @@ pub struct AgentDeps {
     /// Receiver for organizer signals (passed to the organizer runner on spawn).
     /// Created in main.rs alongside the resolver; consumed once by spawn_organizer.
     pub organize_rx: Option<tokio::sync::mpsc::Receiver<crate::agent::organizer_runner::OrganizerSignal>>,
+    /// Per-user workspace pool for multi-tenant mode.
+    /// When set, the agent resolves per-user workspaces from this pool
+    /// (using the incoming message's `user_id`) instead of the single shared workspace.
+    pub workspace_pool: Option<Arc<WorkspacePool>>,
 }
 
 /// The main agent that coordinates all components.
@@ -270,6 +275,23 @@ impl Agent {
 
     pub(super) fn workspace(&self) -> Option<&Arc<Workspace>> {
         self.deps.workspace.as_ref()
+    }
+
+    /// Resolve a workspace for a specific user.
+    ///
+    /// In multi-tenant mode (workspace pool available), looks up or creates
+    /// a per-user workspace from the pool. Falls back to the single shared
+    /// workspace when no pool is configured.
+    pub(super) async fn workspace_for_user(&self, user_id: &str) -> Option<Arc<Workspace>> {
+        if let Some(ref pool) = self.deps.workspace_pool {
+            let identity = crate::channels::web::auth::UserIdentity {
+                user_id: user_id.to_string(),
+                workspace_read_scopes: Vec::new(),
+            };
+            Some(pool.get_or_create(&identity).await)
+        } else {
+            self.deps.workspace.as_ref().map(Arc::clone)
+        }
     }
 
     pub(super) fn hooks(&self) -> &Arc<HookRegistry> {
