@@ -208,4 +208,66 @@ Test prompt.
         let result = parse_skill_md(content).expect("should handle BOM");
         assert_eq!(result.manifest.name, "bom-skill");
     }
+
+    #[test]
+    fn test_activation_script_inline_source() {
+        let content = r#"---
+name: script-skill
+activation:
+  keywords: ["hours"]
+  script:
+    language: python
+    source: |
+      print("hello from script")
+---
+
+Skill with activation script.
+"#;
+        let result = parse_skill_md(content).expect("should parse");
+        let script = result
+            .manifest
+            .activation
+            .script
+            .expect("script should be present");
+        assert_eq!(script.language, "python");
+        assert!(script.source.is_some());
+        assert!(script.source_file.is_none());
+        assert_eq!(script.timeout_ms, 5000); // default
+        assert_eq!(script.max_output_bytes, 4096); // default
+    }
+
+    #[test]
+    fn test_activation_script_source_file() {
+        let content = r#"---
+name: file-script-skill
+activation:
+  keywords: ["test"]
+  script:
+    language: bash
+    source_file: compute.sh
+    timeout_ms: 10000
+    max_output_bytes: 8192
+---
+
+Skill with file-based activation script.
+"#;
+        let result = parse_skill_md(content).expect("should parse");
+        let script = result
+            .manifest
+            .activation
+            .script
+            .expect("script should be present");
+        assert_eq!(script.language, "bash");
+        assert!(script.source.is_none());
+        assert_eq!(script.source_file.as_deref(), Some("compute.sh"));
+        assert_eq!(script.timeout_ms, 10000);
+        assert_eq!(script.max_output_bytes, 8192);
+    }
+
+    #[test]
+    fn test_no_activation_script_backwards_compatible() {
+        let content = "---\nname: no-script\nactivation:\n  keywords: [\"test\"]\n---\n\nPrompt.\n";
+        let result = parse_skill_md(content).expect("should parse");
+        assert!(result.manifest.activation.script.is_none());
+    }
 }

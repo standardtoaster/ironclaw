@@ -172,6 +172,7 @@ mod tests {
                     tags: tag_vec,
                     max_context_tokens: 1000,
                     tools_prefix: None,
+                    script: None,
                 },
                 metadata: None,
             },

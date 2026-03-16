@@ -19,11 +19,13 @@ pub mod catalog;
 pub mod gating;
 pub mod parser;
 pub mod registry;
+pub mod script_runner;
 pub mod selector;
 
 pub use attenuation::{AttenuationResult, attenuate_tools, filter_tools_by_visibility};
 pub use registry::SkillRegistry;
 pub(crate) use registry::load_and_validate_skill;
+pub use script_runner::run_activation_script;
 pub use selector::prefilter_skills;
 
 use std::path::PathBuf;
@@ -92,6 +94,33 @@ pub enum SkillSource {
     Bundled(PathBuf),
 }
 
+/// Script to run at skill activation time, capturing stdout as dynamic context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivationScript {
+    /// Interpreter language: "python", "bash", or "node".
+    pub language: String,
+    /// Inline script content (mutually exclusive with `source_file`).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Script file path relative to the skill directory (mutually exclusive with `source`).
+    #[serde(default)]
+    pub source_file: Option<String>,
+    /// Script execution timeout in milliseconds.
+    #[serde(default = "default_script_timeout")]
+    pub timeout_ms: u64,
+    /// Maximum bytes to capture from stdout.
+    #[serde(default = "default_max_output")]
+    pub max_output_bytes: usize,
+}
+
+fn default_script_timeout() -> u64 {
+    5000
+}
+
+fn default_max_output() -> usize {
+    4096
+}
+
 /// Activation criteria parsed from SKILL.md frontmatter `activation` section.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActivationCriteria {
@@ -117,6 +146,9 @@ pub struct ActivationCriteria {
     /// When set, matching tools are loaded into the session automatically.
     #[serde(default)]
     pub tools_prefix: Option<String>,
+    /// Script to run at activation time; stdout is appended to prompt content.
+    #[serde(default)]
+    pub script: Option<ActivationScript>,
 }
 
 impl ActivationCriteria {
@@ -533,5 +565,52 @@ metadata:
         };
         assert_eq!(skill.name(), "test");
         assert_eq!(skill.version(), "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_activation_script_yaml() {
+        let yaml = r#"
+name: scripted-skill
+activation:
+  keywords: ["hours"]
+  script:
+    language: python
+    source: "print('hello')"
+    timeout_ms: 3000
+    max_output_bytes: 2048
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        let script = manifest.activation.script.expect("script should be present");
+        assert_eq!(script.language, "python");
+        assert_eq!(script.source.as_deref(), Some("print('hello')"));
+        assert!(script.source_file.is_none());
+        assert_eq!(script.timeout_ms, 3000);
+        assert_eq!(script.max_output_bytes, 2048);
+    }
+
+    #[test]
+    fn test_activation_script_defaults() {
+        let yaml = r#"
+name: default-script
+activation:
+  script:
+    language: bash
+    source: "echo hi"
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        let script = manifest.activation.script.expect("script should be present");
+        assert_eq!(script.timeout_ms, 5000);
+        assert_eq!(script.max_output_bytes, 4096);
+    }
+
+    #[test]
+    fn test_no_script_field_is_none() {
+        let yaml = r#"
+name: plain-skill
+activation:
+  keywords: ["test"]
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        assert!(manifest.activation.script.is_none());
     }
 }
