@@ -422,14 +422,24 @@ impl AppBuilder {
             let ws = Arc::new(ws);
             tools.register_memory_tools(Arc::clone(&ws));
 
-            // Register structured collection tools
-            let user_id = self
-                .config
-                .channels
-                .gateway
-                .as_ref()
-                .map(|g| g.user_id.as_str())
-                .unwrap_or("default");
+            // Register structured collection tools.
+            // In multi-tenant mode, scan schemas for ALL users so per-collection
+            // tools are available regardless of which user created the schema.
+            let mut user_ids: Vec<String> = Vec::new();
+            if let Some(ref gw) = self.config.channels.gateway {
+                // Add the default user
+                user_ids.push(gw.user_id.clone());
+                // Add all multi-tenant users from GATEWAY_USER_TOKENS
+                for tc in gw.user_tokens.as_ref().map(|t| t.values()).into_iter().flatten() {
+                    if !user_ids.contains(&tc.user_id) {
+                        user_ids.push(tc.user_id.clone());
+                    }
+                }
+            }
+            if user_ids.is_empty() {
+                user_ids.push("default".to_string());
+            }
+            let user_id_refs: Vec<&str> = user_ids.iter().map(|s| s.as_str()).collect();
             let skills_dir = if self.config.skills.enabled {
                 Some(self.config.skills.local_dir.clone())
             } else {
@@ -438,7 +448,7 @@ impl AppBuilder {
             tools
                 .register_collection_tools(
                     Arc::clone(db),
-                    user_id,
+                    &user_id_refs,
                     skills_dir,
                     skill_registry.clone(),
                     None,
