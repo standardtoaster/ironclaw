@@ -29,6 +29,10 @@ use crate::agent::SessionManager;
 use crate::bootstrap::ironclaw_base_dir;
 use crate::channels::IncomingMessage;
 use crate::channels::web::auth::{AuthenticatedUser, MultiAuthState, UserIdentity, auth_middleware};
+use crate::channels::web::handlers::collections::{
+    collections_delete_handler, collections_insert_handler, collections_list_handler,
+    collections_query_handler, collections_update_handler,
+};
 use crate::channels::web::handlers::events::events_ingest_handler;
 use crate::channels::web::handlers::jobs::{
     job_files_list_handler, job_files_read_handler, jobs_cancel_handler, jobs_detail_handler,
@@ -410,6 +414,17 @@ pub async fn start_server(
         .route("/api/jobs/{id}/files/read", get(job_files_read_handler))
         // Event ingest
         .route("/api/events/ingest", post(events_ingest_handler))
+        // Collections REST API
+        .route("/api/collections", get(collections_list_handler))
+        .route(
+            "/api/collections/{name}",
+            get(collections_query_handler).post(collections_insert_handler),
+        )
+        .route(
+            "/api/collections/{name}/{id}",
+            axum::routing::patch(collections_update_handler)
+                .delete(collections_delete_handler),
+        )
         // Logs
         .route("/api/logs/events", get(logs_events_handler))
         .route("/api/logs/level", get(logs_level_get_handler))
@@ -1338,10 +1353,20 @@ async fn chat_threads_handler(
             .list_conversations_all_channels(&user.user_id, 50)
             .await
         {
+            // Build conversation_id → workspace topic map
+            let workspace_topics: std::collections::HashMap<uuid::Uuid, String> = store
+                .list_agent_workspaces(&user.user_id, Some("active"))
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|ws| (ws.conversation_id, ws.topic))
+                .collect();
+
             let mut assistant_thread = None;
             let mut threads = Vec::new();
 
             for s in &summaries {
+                let topic = workspace_topics.get(&s.id).cloned();
                 let info = ThreadInfo {
                     id: s.id,
                     state: "Idle".to_string(),
@@ -1351,6 +1376,7 @@ async fn chat_threads_handler(
                     title: s.title.clone(),
                     thread_type: s.thread_type.clone(),
                     channel: Some(s.channel.clone()),
+                    workspace_topic: topic,
                 };
 
                 if s.id == assistant_id {
@@ -1371,6 +1397,7 @@ async fn chat_threads_handler(
                     title: None,
                     thread_type: Some("assistant".to_string()),
                     channel: Some("gateway".to_string()),
+                    workspace_topic: None,
                 });
             }
 
@@ -1398,6 +1425,7 @@ async fn chat_threads_handler(
             title: None,
             thread_type: None,
             channel: Some("gateway".to_string()),
+            workspace_topic: None,
         })
         .collect();
 
@@ -1431,6 +1459,7 @@ async fn chat_new_thread_handler(
             title: None,
             thread_type: Some("thread".to_string()),
             channel: Some("gateway".to_string()),
+            workspace_topic: None,
         };
         (id, info)
     };
