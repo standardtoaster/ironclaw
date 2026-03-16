@@ -76,7 +76,9 @@ impl Agent {
             &self.config.default_timezone,
         );
 
-        let system_prompt = if let Some(ws) = self.workspace() {
+        // Resolve per-user workspace (multi-tenant) or fall back to shared workspace.
+        let user_workspace = self.workspace_for_user(&message.user_id).await;
+        let system_prompt = if let Some(ref ws) = user_workspace {
             match ws
                 .system_prompt_for_context_tz(is_group_chat, user_tz)
                 .await
@@ -1246,6 +1248,11 @@ mod tests {
             document_extraction: None,
             sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
             builder: None,
+            workspace_router: None,
+            thread_resolver: None,
+            core_tools: Vec::new(),
+            organize_rx: None,
+            workspace_pool: None,
         };
 
         Agent::new(
@@ -2113,6 +2120,11 @@ mod tests {
             document_extraction: None,
             sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
             builder: None,
+            workspace_router: None,
+            thread_resolver: None,
+            core_tools: Vec::new(),
+            organize_rx: None,
+            workspace_pool: None,
         };
 
         Agent::new(
@@ -2233,6 +2245,11 @@ mod tests {
                 document_extraction: None,
                 sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
                 builder: None,
+                workspace_router: None,
+                thread_resolver: None,
+                core_tools: Vec::new(),
+                organize_rx: None,
+                workspace_pool: None,
             };
 
             Agent::new(

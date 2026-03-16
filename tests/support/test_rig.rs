@@ -769,6 +769,11 @@ impl TestRigBuilder {
             sandbox_readiness: ironclaw::agent::SandboxReadiness::Available, // tests don't use real Docker
             builder: None,
             tier_map: None,
+            workspace_router: None,
+            thread_resolver: None,
+            core_tools: Vec::new(),
+            organize_rx: None,
+            workspace_pool: None,
         };
 
         // 7. Create TestChannel and ChannelManager.
