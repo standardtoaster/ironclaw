@@ -542,6 +542,7 @@ pub async fn start_server(
         .allow_headers(AllowHeaders::list([
             header::CONTENT_TYPE,
             header::AUTHORIZATION,
+            "X-Webhook-Secret".parse().expect("valid header name"),
         ]))
         .allow_credentials(true);
 
@@ -2630,6 +2631,7 @@ struct WebhookBody {
 
 async fn webhook_fire_handler(
     State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: Option<Json<WebhookBody>>,
@@ -2643,11 +2645,18 @@ async fn webhook_fire_handler(
         "Store not available".to_string(),
     ))?;
 
+    tracing::debug!("webhook_fire: looking up routine {}", routine_id);
     let routine = store
         .get_routine(routine_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
+        .map_err(|e| {
+            tracing::error!("webhook_fire: get_routine error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?
+        .ok_or_else(|| {
+            tracing::warn!("webhook_fire: routine {} not found via get_routine", routine_id);
+            (StatusCode::NOT_FOUND, "Routine not found".to_string())
+        })?;
 
     // Validate webhook secret using constant-time comparison.
     if let crate::agent::routine::Trigger::Webhook { ref secret, .. } = routine.trigger {
@@ -2697,7 +2706,7 @@ async fn webhook_fire_handler(
     });
 
     match engine
-        .fire_webhook(routine_id, &state.default_user_id, payload_str)
+        .fire_webhook(routine_id, &user.user_id, payload_str)
         .await
     {
         Ok(run_id) => Ok(Json(serde_json::json!({
