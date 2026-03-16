@@ -1588,10 +1588,19 @@ impl Workspace {
         ];
 
         for (path, header) in identity_files {
-            if let Ok(doc) = self.read_primary(path).await
-                && !doc.content.is_empty()
-            {
-                parts.push(format!("{}\n\n{}", header, doc.content));
+            match self.read_primary(path).await {
+                Ok(doc) if !doc.content.is_empty() => {
+                    parts.push(format!("{}\n\n{}", header, doc.content));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        user_id = %self.user_id,
+                        path = path,
+                        error = %e,
+                        "Failed to load identity file for system prompt"
+                    );
+                }
             }
         }
 

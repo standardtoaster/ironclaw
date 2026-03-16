@@ -834,6 +834,11 @@ impl TestRigBuilder {
             llm_backend: "nearai".to_string(),
             tenant_rates: std::sync::Arc::new(ironclaw::tenant::TenantRateRegistry::new(4, 3)),
             tier_map: None,
+            workspace_router: None,
+            thread_resolver: None,
+            core_tools: Vec::new(),
+            organize_rx: None,
+            workspace_pool: None,
         };
 
         // 7. Create TestChannel and ChannelManager.

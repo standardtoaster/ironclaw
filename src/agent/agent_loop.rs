@@ -29,6 +29,9 @@ use crate::extensions::ExtensionManager;
 use crate::hooks::HookRegistry;
 use crate::llm::{LlmProvider, TierMap};
 use crate::tools::ToolRegistry;
+use uuid::Uuid;
+
+use crate::channels::web::server::WorkspacePool;
 use crate::workspace::Workspace;
 use ironclaw_safety::SafetyLayer;
 use ironclaw_skills::SkillRegistry;
@@ -194,6 +197,22 @@ pub struct AgentDeps {
     /// When configured with multiple tiers, `escalate`/`de_escalate` tools
     /// swap the active provider. When `None`, escalation tools are no-ops.
     pub tier_map: Option<Arc<TierMap>>,
+    /// Workspace router for automatic topic-based context switching.
+    pub workspace_router: Option<Arc<crate::agent::workspace_router::WorkspaceRouter>>,
+    /// Pluggable thread resolver for message-to-thread routing and context injection.
+    /// When set, takes priority over `workspace_router` for routing decisions.
+    pub thread_resolver: Option<Arc<dyn crate::agent::thread_resolver::ThreadResolver>>,
+    /// Tool names that are always included in LLM context.
+    /// When non-empty, only core + discovered tools are sent to the LLM.
+    /// Empty = backward compatible (all tools sent).
+    pub core_tools: Vec<String>,
+    /// Receiver for organizer signals (passed to the organizer runner on spawn).
+    /// Created in main.rs alongside the resolver; consumed once by spawn_organizer.
+    pub organize_rx: Option<tokio::sync::mpsc::Receiver<crate::agent::organizer_runner::OrganizerSignal>>,
+    /// Per-user workspace pool for multi-tenant mode.
+    /// When set, the agent resolves per-user workspaces from this pool
+    /// (using the incoming message's `user_id`) instead of the single shared workspace.
+    pub workspace_pool: Option<Arc<WorkspacePool>>,
 }
 
 /// The main agent that coordinates all components.
@@ -362,6 +381,23 @@ impl Agent {
 
     pub(crate) fn workspace(&self) -> Option<&Arc<Workspace>> {
         self.deps.workspace.as_ref()
+    }
+
+    /// Resolve a workspace for a specific user.
+    ///
+    /// In multi-tenant mode (workspace pool available), looks up or creates
+    /// a per-user workspace from the pool. Falls back to the single shared
+    /// workspace when no pool is configured.
+    pub(super) async fn workspace_for_user(&self, user_id: &str) -> Option<Arc<Workspace>> {
+        if let Some(ref pool) = self.deps.workspace_pool {
+            let identity = crate::channels::web::auth::UserIdentity {
+                user_id: user_id.to_string(),
+                workspace_read_scopes: Vec::new(),
+            };
+            Some(pool.get_or_create(&identity).await)
+        } else {
+            self.deps.workspace.as_ref().map(Arc::clone)
+        }
     }
 
     pub(crate) fn hooks(&self) -> &Arc<HookRegistry> {
