@@ -1421,6 +1421,7 @@ mod tests {
             title: None,
             thread_type: None,
             channel: Some("telegram".to_string()),
+            workspace_topic: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1438,6 +1439,7 @@ mod tests {
             title: None,
             thread_type: None,
             channel: None,
+            workspace_topic: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
