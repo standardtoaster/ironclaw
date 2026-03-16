@@ -210,6 +210,12 @@ impl Agent {
             JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
         job_ctx.http_interceptor = self.deps.http_interceptor.clone();
         job_ctx.user_timezone = user_tz.name().to_string();
+        // Propagate workspace_read_scopes from gateway metadata for cross-scope collection reads.
+        if let Some(scopes) = message.metadata.get("workspace_read_scopes")
+            && let Ok(parsed) = serde_json::from_value::<Vec<String>>(scopes.clone())
+        {
+            job_ctx.workspace_read_scopes = parsed;
+        }
 
         // Build system prompts once for this turn. Two variants: with tools
         // (normal iterations) and without (force_text final iteration).

@@ -841,7 +841,7 @@ impl ToolRegistry {
                 if !schemas.is_empty()
                     && let Some(ref dir) = skills_dir
                 {
-                    generate_router_skill(&schemas, dir);
+                    generate_router_skill(schemas, dir);
 
                     if let Some(ref sr) = skill_registry {
                         let router_path =

@@ -36,6 +36,37 @@ use crate::db::structured::{
 use crate::tools::registry::ToolRegistry;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, ToolRateLimitConfig, require_str};
 
+// ==================== Cross-scope resolution ====================
+
+/// Resolve which user_id owns a collection, checking the caller's own scope
+/// first, then each `workspace_read_scope` in order.
+///
+/// Used by read-only collection tools (query, summary) to support cross-lens
+/// access. Write tools (add, update, delete) intentionally skip this and
+/// always operate on the caller's own scope.
+async fn resolve_collection_scope(
+    db: &dyn Database,
+    caller_user_id: &str,
+    scopes: &[String],
+    collection: &str,
+) -> Option<String> {
+    // Try caller's own collections first.
+    if db
+        .get_collection_schema(caller_user_id, collection)
+        .await
+        .is_ok()
+    {
+        return Some(caller_user_id.to_string());
+    }
+    // Try each scope in order.
+    for scope in scopes {
+        if db.get_collection_schema(scope, collection).await.is_ok() {
+            return Some(scope.clone());
+        }
+    }
+    None
+}
+
 // ==================== Schema → JSON Schema conversion ====================
 
 /// Convert a `FieldType` to its JSON Schema representation.
@@ -501,14 +532,17 @@ impl Tool for CollectionListTool {
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
-        let schemas =
-            self.db.list_collections(&ctx.user_id).await.map_err(|e| {
+        // Collect from own scope + workspace_read_scopes (matching REST handler).
+        let mut user_ids = vec![ctx.user_id.clone()];
+        user_ids.extend(ctx.workspace_read_scopes.iter().cloned());
+
+        let mut all_collections: Vec<serde_json::Value> = Vec::new();
+        for uid in &user_ids {
+            let schemas = self.db.list_collections(uid).await.map_err(|e| {
                 ToolError::ExecutionFailed(format!("Failed to list collections: {e}"))
             })?;
 
-        let collections: Vec<serde_json::Value> = schemas
-            .iter()
-            .map(|s| {
+            for s in &schemas {
                 let fields: serde_json::Value = s
                     .fields
                     .iter()
@@ -523,18 +557,19 @@ impl Tool for CollectionListTool {
                     })
                     .collect::<serde_json::Map<String, serde_json::Value>>()
                     .into();
-                json!({
+                all_collections.push(json!({
                     "collection": s.collection,
                     "description": s.description,
+                    "owner": uid,
                     "fields": fields,
-                })
-            })
-            .collect();
+                }));
+            }
+        }
 
         Ok(ToolOutput::success(
             json!({
-                "collections": collections,
-                "count": collections.len(),
+                "collections": all_collections,
+                "count": all_collections.len(),
             }),
             start.elapsed(),
         ))
@@ -1555,10 +1590,20 @@ impl Tool for CollectionQueryTool {
             .unwrap_or(50)
             .min(200) as usize;
 
+        // Resolve collection owner: own scope first, then workspace_read_scopes.
+        let owner = resolve_collection_scope(
+            self.db.as_ref(),
+            &ctx.user_id,
+            &ctx.workspace_read_scopes,
+            &self.schema.collection,
+        )
+        .await
+        .unwrap_or_else(|| ctx.user_id.clone());
+
         let records = self
             .db
             .query_records(
-                &ctx.user_id,
+                &owner,
                 &self.schema.collection,
                 &filters,
                 order_by,
@@ -1734,9 +1779,19 @@ impl Tool for CollectionSummaryTool {
             filters,
         };
 
+        // Resolve collection owner: own scope first, then workspace_read_scopes.
+        let owner = resolve_collection_scope(
+            self.db.as_ref(),
+            &ctx.user_id,
+            &ctx.workspace_read_scopes,
+            &self.schema.collection,
+        )
+        .await
+        .unwrap_or_else(|| ctx.user_id.clone());
+
         let result = self
             .db
-            .aggregate(&ctx.user_id, &self.schema.collection, &aggregation)
+            .aggregate(&owner, &self.schema.collection, &aggregation)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to aggregate: {e}")))?;
 
@@ -1960,5 +2015,291 @@ mod tests {
 
         assert!(!router_path.exists(), "router SKILL.md should be removed for empty schemas");
         assert!(!router_dir.exists(), "router directory should be removed for empty schemas");
+    }
+
+    // ==================== Cross-scope resolution tests ====================
+    //
+    // These tests use the libsql in-memory backend to verify that collection
+    // tools correctly resolve cross-scope access via workspace_read_scopes.
+
+    #[cfg(feature = "libsql")]
+    mod cross_scope {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+
+        use crate::context::JobContext;
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use crate::db::structured::{CollectionSchema, FieldDef, FieldType};
+        use crate::tools::tool::Tool;
+
+        use super::{
+            CollectionAddTool, CollectionDeleteTool, CollectionQueryTool, CollectionSummaryTool,
+            CollectionUpdateTool, resolve_collection_scope,
+        };
+
+        /// Create a minimal collection schema for testing.
+        fn test_schema(name: &str) -> CollectionSchema {
+            let mut fields = BTreeMap::new();
+            fields.insert(
+                "item".to_string(),
+                FieldDef {
+                    field_type: FieldType::Text,
+                    required: true,
+                    default: None,
+                },
+            );
+            CollectionSchema {
+                collection: name.to_string(),
+                description: Some("test collection".to_string()),
+                fields,
+            }
+        }
+
+        /// Set up a file-backed db with a collection registered under `owner_id`.
+        ///
+        /// Uses `new_local` instead of `new_memory` because in-memory libsql
+        /// databases don't share state between connections.
+        async fn setup_db_with_collection(
+            owner_id: &str,
+            collection: &str,
+            tmp: &TempDir,
+        ) -> Arc<dyn Database> {
+            let db_path = tmp.path().join("test.db");
+            let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+            backend.run_migrations().await.unwrap();
+            let db: Arc<dyn Database> = Arc::new(backend);
+            db.register_collection(owner_id, &test_schema(collection))
+                .await
+                .unwrap();
+            db
+        }
+
+        #[tokio::test]
+        async fn resolve_scope_own_collection_first() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("andrew", "groceries", &tmp).await;
+            // Also register same-name collection under a scope.
+            db.register_collection("household", &test_schema("groceries"))
+                .await
+                .unwrap();
+
+            let result = resolve_collection_scope(
+                db.as_ref(),
+                "andrew",
+                &["household".to_string()],
+                "groceries",
+            )
+            .await;
+            assert_eq!(result, Some("andrew".to_string()), "should prefer own scope");
+        }
+
+        #[tokio::test]
+        async fn resolve_scope_falls_through_to_read_scope() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("household", "groceries", &tmp).await;
+
+            let result = resolve_collection_scope(
+                db.as_ref(),
+                "andrew",
+                &["household".to_string()],
+                "groceries",
+            )
+            .await;
+            assert_eq!(
+                result,
+                Some("household".to_string()),
+                "should fall through to household scope"
+            );
+        }
+
+        #[tokio::test]
+        async fn resolve_scope_returns_none_when_not_found() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("grace", "groceries", &tmp).await;
+
+            let result = resolve_collection_scope(
+                db.as_ref(),
+                "andrew",
+                &["household".to_string()],
+                "groceries",
+            )
+            .await;
+            assert_eq!(result, None, "should return None when no scope has the collection");
+        }
+
+        #[tokio::test]
+        async fn query_tool_reads_from_cross_scope() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("household", "groceries", &tmp).await;
+            // Insert a record under household.
+            db.insert_record(
+                "household",
+                "groceries",
+                serde_json::json!({"item": "milk"}),
+            )
+            .await
+            .unwrap();
+
+            let schema = test_schema("groceries");
+            let tool = CollectionQueryTool::new(schema, Arc::clone(&db));
+
+            // Andrew has workspace_read_scopes = ["household"] but no own groceries collection.
+            let mut ctx = JobContext::with_user("andrew", "test", "test");
+            ctx.workspace_read_scopes = vec!["household".to_string()];
+
+            let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+            let output = &result.result;
+            assert_eq!(output["count"], 1, "should find household's record via cross-scope");
+            assert_eq!(output["results"][0]["data"]["item"], "milk");
+        }
+
+        #[tokio::test]
+        async fn summary_tool_reads_from_cross_scope() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("household", "groceries", &tmp).await;
+            db.insert_record(
+                "household",
+                "groceries",
+                serde_json::json!({"item": "eggs"}),
+            )
+            .await
+            .unwrap();
+            db.insert_record(
+                "household",
+                "groceries",
+                serde_json::json!({"item": "bread"}),
+            )
+            .await
+            .unwrap();
+
+            let schema = test_schema("groceries");
+            let tool = CollectionSummaryTool::new(schema, Arc::clone(&db));
+
+            let mut ctx = JobContext::with_user("andrew", "test", "test");
+            ctx.workspace_read_scopes = vec!["household".to_string()];
+
+            let result = tool
+                .execute(serde_json::json!({"operation": "count"}), &ctx)
+                .await
+                .unwrap();
+            let output = &result.result;
+            // The aggregation result should reflect 2 records from household.
+            // Count returns the count directly (not wrapped in {"total": N}).
+            assert_eq!(output["aggregation"], 2, "should count household's records via cross-scope");
+        }
+
+        #[tokio::test]
+        async fn add_tool_does_not_use_cross_scope() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("household", "groceries", &tmp).await;
+
+            let schema = test_schema("groceries");
+            let tool = CollectionAddTool::new(schema, Arc::clone(&db), None);
+
+            // Andrew does NOT have his own groceries collection, only household does.
+            let mut ctx = JobContext::with_user("andrew", "test", "test");
+            ctx.workspace_read_scopes = vec!["household".to_string()];
+
+            // The add tool uses ctx.user_id directly (no scope resolution).
+            // Since "andrew" has no "groceries" collection, this should fail.
+            let result = tool
+                .execute(serde_json::json!({"item": "butter"}), &ctx)
+                .await;
+            assert!(result.is_err(), "add should fail — andrew has no own groceries collection");
+        }
+
+        #[tokio::test]
+        async fn update_tool_does_not_use_cross_scope() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("household", "groceries", &tmp).await;
+            let record_id = db
+                .insert_record(
+                    "household",
+                    "groceries",
+                    serde_json::json!({"item": "milk"}),
+                )
+                .await
+                .unwrap();
+
+            let schema = test_schema("groceries");
+            let tool = CollectionUpdateTool::new(schema, Arc::clone(&db));
+
+            let mut ctx = JobContext::with_user("andrew", "test", "test");
+            ctx.workspace_read_scopes = vec!["household".to_string()];
+
+            // Andrew tries to update a household record — should fail because
+            // update uses ctx.user_id, not scope resolution.
+            let result = tool
+                .execute(
+                    serde_json::json!({
+                        "record_id": record_id.to_string(),
+                        "item": "whole milk"
+                    }),
+                    &ctx,
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "update should fail — andrew cannot write to household's collection via tool"
+            );
+        }
+
+        #[tokio::test]
+        async fn delete_tool_does_not_use_cross_scope() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("household", "groceries", &tmp).await;
+            let record_id = db
+                .insert_record(
+                    "household",
+                    "groceries",
+                    serde_json::json!({"item": "milk"}),
+                )
+                .await
+                .unwrap();
+
+            let schema = test_schema("groceries");
+            let tool = CollectionDeleteTool::new(schema, Arc::clone(&db));
+
+            let mut ctx = JobContext::with_user("andrew", "test", "test");
+            ctx.workspace_read_scopes = vec!["household".to_string()];
+
+            let result = tool
+                .execute(serde_json::json!({"record_id": record_id.to_string()}), &ctx)
+                .await;
+            assert!(
+                result.is_err(),
+                "delete should fail — andrew cannot delete from household's collection via tool"
+            );
+        }
+
+        #[tokio::test]
+        async fn list_tool_includes_cross_scope_collections() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("household", "groceries", &tmp).await;
+            // Also register a collection under andrew.
+            db.register_collection("andrew", &test_schema("tasks"))
+                .await
+                .unwrap();
+
+            let tool = super::CollectionListTool::new(Arc::clone(&db));
+
+            let mut ctx = JobContext::with_user("andrew", "test", "test");
+            ctx.workspace_read_scopes = vec!["household".to_string()];
+
+            let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+            let output = &result.result;
+            assert_eq!(output["count"], 2, "should list both own and cross-scope collections");
+
+            let collections = output["collections"].as_array().unwrap();
+            let names: Vec<&str> = collections
+                .iter()
+                .map(|c| c["collection"].as_str().unwrap())
+                .collect();
+            assert!(names.contains(&"tasks"), "should include own collection");
+            assert!(names.contains(&"groceries"), "should include cross-scope collection");
+        }
     }
 }

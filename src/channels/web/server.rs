@@ -899,6 +899,9 @@ async fn chat_send_handler(
     if let Some(ref ws_id) = req.workspace_id {
         meta["workspace_id"] = serde_json::Value::String(ws_id.clone());
     }
+    if !user.workspace_read_scopes.is_empty() {
+        meta["workspace_read_scopes"] = serde_json::json!(user.workspace_read_scopes);
+    }
     msg = msg.with_metadata(meta);
 
     // Convert uploaded images to IncomingAttachments

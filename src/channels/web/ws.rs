@@ -121,6 +121,7 @@ pub async fn handle_ws_connection(
     });
 
     // Receiver task: read client frames and route to agent
+    let workspace_read_scopes = user.workspace_read_scopes;
     let user_id = user.user_id;
     while let Some(Ok(frame)) = ws_stream.next().await {
         match frame {
@@ -128,7 +129,14 @@ pub async fn handle_ws_connection(
                 let parsed: Result<WsClientMessage, _> = serde_json::from_str(&text);
                 match parsed {
                     Ok(client_msg) => {
-                        handle_client_message(client_msg, &state, &user_id, &direct_tx).await;
+                        handle_client_message(
+                            client_msg,
+                            &state,
+                            &user_id,
+                            &workspace_read_scopes,
+                            &direct_tx,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         let _ = direct_tx
@@ -157,6 +165,7 @@ async fn handle_client_message(
     msg: WsClientMessage,
     state: &GatewayState,
     user_id: &str,
+    workspace_read_scopes: &[String],
     direct_tx: &mpsc::Sender<WsServerMessage>,
 ) {
     match msg {
@@ -174,9 +183,22 @@ async fn handle_client_message(
             if let Some(ref tid) = thread_id {
                 incoming = incoming.with_thread(tid);
             }
+            let mut meta = serde_json::Map::new();
             if suppress_response {
+                meta.insert(
+                    "suppress_response".to_string(),
+                    serde_json::json!(true),
+                );
+            }
+            if !workspace_read_scopes.is_empty() {
+                meta.insert(
+                    "workspace_read_scopes".to_string(),
+                    serde_json::json!(workspace_read_scopes),
+                );
+            }
+            if !meta.is_empty() {
                 incoming =
-                    incoming.with_metadata(serde_json::json!({"suppress_response": true}));
+                    incoming.with_metadata(serde_json::Value::Object(meta));
             }
 
             // Convert uploaded images to IncomingAttachments
@@ -363,7 +385,7 @@ mod tests {
         let (direct_tx, mut direct_rx) = mpsc::channel(16);
         let state = make_test_state(None).await;
 
-        handle_client_message(WsClientMessage::Ping, &state, "user1", &direct_tx).await;
+        handle_client_message(WsClientMessage::Ping, &state, "user1", &[], &direct_tx).await;
 
         let response = direct_rx.recv().await.unwrap();
         assert!(matches!(response, WsServerMessage::Pong));
@@ -386,6 +408,7 @@ mod tests {
             },
             &state,
             "user1",
+            &[],
             &direct_tx,
         )
         .await;
@@ -413,6 +436,7 @@ mod tests {
             },
             &state,
             "user1",
+            &[],
             &direct_tx,
         )
         .await;
@@ -441,6 +465,7 @@ mod tests {
             },
             &state,
             "user1",
+            &[],
             &direct_tx,
         )
         .await;
@@ -465,6 +490,7 @@ mod tests {
             },
             &state,
             "user1",
+            &[],
             &direct_tx,
         )
         .await;
@@ -491,6 +517,7 @@ mod tests {
             },
             &state,
             "user1",
+            &[],
             &direct_tx,
         )
         .await;
