@@ -51,6 +51,8 @@ pub struct ThreadInfo {
     pub thread_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_topic: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1187,6 +1189,7 @@ mod tests {
             title: None,
             thread_type: None,
             channel: Some("telegram".to_string()),
+            workspace_topic: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1204,6 +1207,7 @@ mod tests {
             title: None,
             thread_type: None,
             channel: None,
+            workspace_topic: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();

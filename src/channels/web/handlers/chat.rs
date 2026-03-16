@@ -436,10 +436,20 @@ pub async fn chat_threads_handler(
             .list_conversations_all_channels(&state.default_user_id, 50)
             .await
         {
+            // Build conversation_id → workspace topic map
+            let workspace_topics: std::collections::HashMap<uuid::Uuid, String> = store
+                .list_agent_workspaces(&state.default_user_id, Some("active"))
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|ws| (ws.conversation_id, ws.topic))
+                .collect();
+
             let mut assistant_thread = None;
             let mut threads = Vec::new();
 
             for s in &summaries {
+                let topic = workspace_topics.get(&s.id).cloned();
                 let info = ThreadInfo {
                     id: s.id,
                     state: "Idle".to_string(),
@@ -449,6 +459,7 @@ pub async fn chat_threads_handler(
                     title: s.title.clone(),
                     thread_type: s.thread_type.clone(),
                     channel: Some(s.channel.clone()),
+                    workspace_topic: topic,
                 };
 
                 if s.id == assistant_id {
@@ -469,6 +480,7 @@ pub async fn chat_threads_handler(
                     title: None,
                     thread_type: Some("assistant".to_string()),
                     channel: Some("gateway".to_string()),
+                    workspace_topic: None,
                 });
             }
 
@@ -494,6 +506,7 @@ pub async fn chat_threads_handler(
             title: None,
             thread_type: None,
             channel: Some("gateway".to_string()),
+            workspace_topic: None,
         })
         .collect();
 
@@ -526,6 +539,7 @@ pub async fn chat_new_thread_handler(
             title: None,
             thread_type: Some("thread".to_string()),
             channel: Some("gateway".to_string()),
+            workspace_topic: None,
         };
         (id, info)
     };
