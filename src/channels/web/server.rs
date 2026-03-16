@@ -31,7 +31,7 @@ use crate::channels::IncomingMessage;
 use crate::channels::web::auth::{AuthenticatedUser, MultiAuthState, UserIdentity, auth_middleware};
 use crate::channels::web::handlers::collections::{
     collections_delete_handler, collections_insert_handler, collections_list_handler,
-    collections_query_handler, collections_update_handler,
+    collections_query_handler, collections_register_handler, collections_update_handler,
 };
 use crate::channels::web::handlers::events::events_ingest_handler;
 use crate::channels::web::handlers::jobs::{
@@ -415,7 +415,7 @@ pub async fn start_server(
         // Event ingest
         .route("/api/events/ingest", post(events_ingest_handler))
         // Collections REST API
-        .route("/api/collections", get(collections_list_handler))
+        .route("/api/collections", get(collections_list_handler).post(collections_register_handler))
         .route(
             "/api/collections/{name}",
             get(collections_query_handler).post(collections_insert_handler),

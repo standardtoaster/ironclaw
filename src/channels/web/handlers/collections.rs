@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
-use crate::db::structured::{Filter, FilterOp, StructuredStore};
+use crate::db::structured::{CollectionSchema, Filter, FilterOp, StructuredStore};
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -482,6 +482,42 @@ pub async fn collections_delete_handler(
             };
             (status, Json(serde_json::json!({"error": e.to_string()}))).into_response()
         }
+    }
+}
+
+/// POST /api/collections
+///
+/// Register (or update) a collection schema.
+pub async fn collections_register_handler(
+    State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Json(schema): Json<CollectionSchema>,
+) -> impl IntoResponse {
+    let db = match &state.store {
+        Some(db) => Arc::clone(db),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "database not available"})),
+            )
+                .into_response();
+        }
+    };
+
+    match db.register_collection(&user.user_id, &schema).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "registered",
+                "collection": schema.collection,
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
