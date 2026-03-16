@@ -147,8 +147,23 @@ impl Agent {
             let script_port: Option<u16> = std::env::var("GATEWAY_PORT")
                 .ok()
                 .and_then(|s| s.parse().ok());
-            let script_token: Option<String> =
-                Self::resolve_user_token_for_scripts(&message.user_id);
+            let script_token: Option<String> = {
+                // Reverse-lookup user_id → token from GATEWAY_USER_TOKENS
+                // (same approach as RoutineEngine::resolve_user_token).
+                let token = std::env::var("GATEWAY_USER_TOKENS")
+                    .ok()
+                    .and_then(|json_str| {
+                        #[derive(serde::Deserialize)]
+                        struct Entry { user_id: String }
+                        let tokens: std::collections::HashMap<String, Entry> =
+                            serde_json::from_str(&json_str).ok()?;
+                        tokens.into_iter()
+                            .find(|(_, e)| e.user_id == message.user_id)
+                            .map(|(tok, _)| tok)
+                    })
+                    .or_else(|| std::env::var("GATEWAY_AUTH_TOKEN").ok());
+                token
+            };
 
             for skill in &active_skills {
                 let trust_label = match skill.trust {
@@ -169,7 +184,14 @@ impl Agent {
                     skill.manifest.activation.script
                 {
                     if let (Some(port), Some(token)) = (script_port, &script_token) {
-                        let skill_dir = Self::skill_dir_from_source(&skill.source);
+                        // Extract the skill directory from its source path.
+                        let skill_dir = match &skill.source {
+                            crate::skills::SkillSource::Workspace(p)
+                            | crate::skills::SkillSource::User(p)
+                            | crate::skills::SkillSource::Bundled(p) => {
+                                if p.is_dir() { p.clone() } else { p.parent().unwrap_or(p).to_path_buf() }
+                            }
+                        };
                         crate::skills::run_activation_script(
                             script,
                             &skill_dir,
