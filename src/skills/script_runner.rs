@@ -393,4 +393,105 @@ mod tests {
             run_activation_script(&script, dir.path(), 3003, "test-token", "test-user").await;
         assert_eq!(result, Some("from-file".to_string()));
     }
+
+    #[tokio::test]
+    async fn test_source_preferred_over_source_file() {
+        // When both source and source_file are provided, source (inline) wins
+        // because resolve_script_path checks source first.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let script_path = dir.path().join("other.sh");
+        std::fs::write(&script_path, "#!/bin/bash\necho from-file").expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        let script = ActivationScript {
+            language: "bash".to_string(),
+            source: Some("echo from-inline".to_string()),
+            source_file: Some("other.sh".to_string()),
+            timeout_ms: 5000,
+            max_output_bytes: 4096,
+        };
+        let result =
+            run_activation_script(&script, dir.path(), 3003, "test-token", "test-user").await;
+        assert_eq!(result, Some("from-inline".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_empty_output_returns_none() {
+        // A script that produces only whitespace should return None.
+        let script = ActivationScript {
+            language: "bash".to_string(),
+            source: Some("echo '   '".to_string()),
+            source_file: None,
+            timeout_ms: 5000,
+            max_output_bytes: 4096,
+        };
+        let result =
+            run_activation_script(&script, Path::new("/tmp"), 3003, "test-token", "test-user")
+                .await;
+        assert!(result.is_none());
+    }
+
+    /// End-to-end test: parse a SKILL.md, extract the activation script,
+    /// run it, and verify the output.
+    #[tokio::test]
+    async fn test_e2e_parse_and_run_activation_script() {
+        let skill_md = r#"---
+name: e2e-script-test
+activation:
+  keywords: ["test"]
+  script:
+    language: bash
+    source: |
+      echo "HELLO_MARKER"
+---
+
+Test skill with activation script.
+"#;
+
+        let parsed =
+            crate::skills::parser::parse_skill_md(skill_md).expect("should parse SKILL.md");
+        let script = parsed
+            .manifest
+            .activation
+            .script
+            .expect("script should be present");
+        assert_eq!(script.language, "bash");
+
+        let output =
+            run_activation_script(&script, Path::new("/tmp"), 3003, "test-token", "test-user")
+                .await;
+        assert!(output.is_some(), "script should produce output");
+        assert!(
+            output.as_deref().unwrap_or("").contains("HELLO_MARKER"),
+            "output should contain HELLO_MARKER, got: {:?}",
+            output
+        );
+    }
+
+    #[tokio::test]
+    async fn test_env_vars_not_leaked() {
+        // Verify that arbitrary env vars from the parent process are NOT
+        // available in the script (env is scrubbed).
+        // SAFETY: No other thread reads this specific env var concurrently.
+        unsafe { std::env::set_var("IRONCLAW_TEST_LEAK_CHECK", "should-not-appear") };
+        let script = ActivationScript {
+            language: "bash".to_string(),
+            source: Some("echo \"val=$IRONCLAW_TEST_LEAK_CHECK\"".to_string()),
+            source_file: None,
+            timeout_ms: 5000,
+            max_output_bytes: 4096,
+        };
+        let result =
+            run_activation_script(&script, Path::new("/tmp"), 3003, "test-token", "test-user")
+                .await;
+        // SAFETY: Cleanup; same rationale as above.
+        unsafe { std::env::remove_var("IRONCLAW_TEST_LEAK_CHECK") };
+        // The output should be "val=" (empty) because the env is scrubbed
+        assert_eq!(result, Some("val=".to_string()));
+    }
 }

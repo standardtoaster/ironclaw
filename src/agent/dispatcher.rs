@@ -147,23 +147,15 @@ impl Agent {
             let script_port: Option<u16> = std::env::var("GATEWAY_PORT")
                 .ok()
                 .and_then(|s| s.parse().ok());
-            let script_token: Option<String> = {
-                // Reverse-lookup user_id → token from GATEWAY_USER_TOKENS
-                // (same approach as RoutineEngine::resolve_user_token).
-                let token = std::env::var("GATEWAY_USER_TOKENS")
-                    .ok()
-                    .and_then(|json_str| {
-                        #[derive(serde::Deserialize)]
-                        struct Entry { user_id: String }
-                        let tokens: std::collections::HashMap<String, Entry> =
-                            serde_json::from_str(&json_str).ok()?;
-                        tokens.into_iter()
-                            .find(|(_, e)| e.user_id == message.user_id)
-                            .map(|(tok, _)| tok)
-                    })
-                    .or_else(|| std::env::var("GATEWAY_AUTH_TOKEN").ok());
-                token
-            };
+            let script_token: Option<String> =
+                resolve_script_token(&message.user_id);
+
+            tracing::debug!(
+                script_port = ?script_port,
+                has_script_token = script_token.is_some(),
+                user_id = %message.user_id,
+                "Activation script connection details resolved"
+            );
 
             for skill in &active_skills {
                 let trust_label = match skill.trust {
@@ -183,26 +175,42 @@ impl Agent {
                 let script_output = if let Some(ref script) =
                     skill.manifest.activation.script
                 {
+                    tracing::debug!(
+                        skill = skill.name(),
+                        language = %script.language,
+                        has_source = script.source.is_some(),
+                        has_source_file = script.source_file.is_some(),
+                        "Activation script found on skill"
+                    );
                     if let (Some(port), Some(token)) = (script_port, &script_token) {
                         // Extract the skill directory from its source path.
-                        let skill_dir = match &skill.source {
-                            crate::skills::SkillSource::Workspace(p)
-                            | crate::skills::SkillSource::User(p)
-                            | crate::skills::SkillSource::Bundled(p) => {
-                                if p.is_dir() { p.clone() } else { p.parent().unwrap_or(p).to_path_buf() }
-                            }
-                        };
-                        crate::skills::run_activation_script(
+                        let skill_dir = skill_dir_from_source(&skill.source);
+                        tracing::debug!(
+                            skill = skill.name(),
+                            skill_dir = %skill_dir.display(),
+                            port = port,
+                            "Running activation script"
+                        );
+                        let output = crate::skills::run_activation_script(
                             script,
                             &skill_dir,
                             port,
                             token,
                             &message.user_id,
                         )
-                        .await
+                        .await;
+                        tracing::debug!(
+                            skill = skill.name(),
+                            output_len = output.as_ref().map(|o| o.len()),
+                            has_output = output.is_some(),
+                            "Activation script completed"
+                        );
+                        output
                     } else {
                         tracing::warn!(
                             skill = skill.name(),
+                            has_port = script_port.is_some(),
+                            has_token = script_token.is_some(),
                             "Skipping activation script: GATEWAY_PORT or token not available"
                         );
                         None
@@ -1022,39 +1030,6 @@ impl Agent {
         execute_chat_tool_standalone(self.tools(), self.safety(), tool_name, params, job_ctx).await
     }
 
-    /// Resolve the user's auth token from `GATEWAY_USER_TOKENS` or `GATEWAY_AUTH_TOKEN`.
-    ///
-    /// Same resolution strategy as `RoutineEngine::resolve_user_token` — checks
-    /// the multi-tenant token map first, then falls back to the single-tenant token.
-    fn resolve_user_token_for_scripts(user_id: &str) -> Option<String> {
-        // Try multi-tenant map first
-        if let Ok(json_str) = std::env::var("GATEWAY_USER_TOKENS") {
-            #[derive(serde::Deserialize)]
-            struct TokenEntry {
-                user_id: String,
-            }
-            if let Ok(map) =
-                serde_json::from_str::<std::collections::HashMap<String, TokenEntry>>(&json_str)
-            {
-                for (token, entry) in &map {
-                    if entry.user_id == user_id {
-                        return Some(token.clone());
-                    }
-                }
-            }
-        }
-        // Fall back to single-tenant token
-        std::env::var("GATEWAY_AUTH_TOKEN").ok()
-    }
-
-    /// Extract the skill directory path from a `SkillSource`.
-    fn skill_dir_from_source(source: &crate::skills::SkillSource) -> std::path::PathBuf {
-        match source {
-            crate::skills::SkillSource::Workspace(p)
-            | crate::skills::SkillSource::User(p)
-            | crate::skills::SkillSource::Bundled(p) => p.clone(),
-        }
-    }
 }
 
 /// Execute a chat tool without requiring `&Agent`.
@@ -1308,6 +1283,48 @@ fn strip_internal_tool_call_text(text: &str) -> String {
         "I wasn't able to complete that request. Could you try rephrasing or providing more details?".to_string()
     } else {
         result.to_string()
+    }
+}
+
+/// Resolve a user's auth token for activation script execution.
+///
+/// Reverse-looks up `user_id` in `GATEWAY_USER_TOKENS` JSON (same approach as
+/// `RoutineEngine::resolve_user_token`). Falls back to `GATEWAY_AUTH_TOKEN` if
+/// the multi-tenant token map is absent or the user is not found.
+fn resolve_script_token(user_id: &str) -> Option<String> {
+    std::env::var("GATEWAY_USER_TOKENS")
+        .ok()
+        .and_then(|json_str| {
+            #[derive(serde::Deserialize)]
+            struct Entry {
+                user_id: String,
+            }
+            let tokens: std::collections::HashMap<String, Entry> =
+                serde_json::from_str(&json_str).ok()?;
+            tokens
+                .into_iter()
+                .find(|(_, e)| e.user_id == user_id)
+                .map(|(tok, _)| tok)
+        })
+        .or_else(|| std::env::var("GATEWAY_AUTH_TOKEN").ok())
+}
+
+/// Extract the skill directory from a `SkillSource` path.
+///
+/// If the path is a directory, returns it directly. If it's a file (e.g. the
+/// SKILL.md path), returns the parent directory. Falls back to the path itself
+/// if there is no parent (root path).
+fn skill_dir_from_source(source: &crate::skills::SkillSource) -> std::path::PathBuf {
+    match source {
+        crate::skills::SkillSource::Workspace(p)
+        | crate::skills::SkillSource::User(p)
+        | crate::skills::SkillSource::Bundled(p) => {
+            if p.is_dir() {
+                p.clone()
+            } else {
+                p.parent().unwrap_or(p).to_path_buf()
+            }
+        }
     }
 }
 
@@ -2444,5 +2461,150 @@ mod tests {
             !data_url.is_empty(),
             "Present 'data' field should produce non-empty string"
         );
+    }
+
+    /// All token resolution scenarios in a single test to avoid env var
+    /// race conditions across parallel test threads.
+    #[test]
+    fn test_resolve_script_token_all_scenarios() {
+        // Scenario 1: Multi-tenant lookup succeeds
+        {
+            let _guard = EnvGuard::new(&[
+                ("GATEWAY_USER_TOKENS", Some(r#"{"tok-andrew":{"user_id":"andrew"},"tok-grace":{"user_id":"grace"}}"#)),
+                ("GATEWAY_AUTH_TOKEN", Some("fallback-token")),
+            ]);
+
+            let token = super::resolve_script_token("andrew");
+            assert_eq!(token, Some("tok-andrew".to_string()), "should find andrew's token");
+
+            let token = super::resolve_script_token("grace");
+            assert_eq!(token, Some("tok-grace".to_string()), "should find grace's token");
+        }
+
+        // Scenario 2: Unknown user falls back to GATEWAY_AUTH_TOKEN
+        {
+            let _guard = EnvGuard::new(&[
+                ("GATEWAY_USER_TOKENS", Some(r#"{"tok-andrew":{"user_id":"andrew"}}"#)),
+                ("GATEWAY_AUTH_TOKEN", Some("fallback-token")),
+            ]);
+
+            let token = super::resolve_script_token("unknown-user");
+            assert_eq!(token, Some("fallback-token".to_string()), "unknown user should fall back");
+        }
+
+        // Scenario 3: No env vars at all → None
+        {
+            let _guard = EnvGuard::new(&[
+                ("GATEWAY_USER_TOKENS", None),
+                ("GATEWAY_AUTH_TOKEN", None),
+            ]);
+
+            let token = super::resolve_script_token("anyone");
+            assert!(token.is_none(), "should return None when no env vars set");
+        }
+
+        // Scenario 4: Invalid JSON falls back to GATEWAY_AUTH_TOKEN
+        {
+            let _guard = EnvGuard::new(&[
+                ("GATEWAY_USER_TOKENS", Some("not valid json")),
+                ("GATEWAY_AUTH_TOKEN", Some("fallback-token")),
+            ]);
+
+            let token = super::resolve_script_token("anyone");
+            assert_eq!(token, Some("fallback-token".to_string()), "invalid JSON should fall back");
+        }
+
+        // Scenario 5: Only GATEWAY_AUTH_TOKEN set (no multi-tenant map)
+        {
+            let _guard = EnvGuard::new(&[
+                ("GATEWAY_USER_TOKENS", None),
+                ("GATEWAY_AUTH_TOKEN", Some("single-token")),
+            ]);
+
+            let token = super::resolve_script_token("anyone");
+            assert_eq!(token, Some("single-token".to_string()), "should use single-tenant token");
+        }
+    }
+
+    #[test]
+    fn test_skill_dir_from_source_file_path() {
+        use crate::skills::SkillSource;
+        use std::path::PathBuf;
+
+        // source_file paths should return the parent directory
+        let source = SkillSource::Workspace(PathBuf::from("/workspace/skills/my-skill/SKILL.md"));
+        let dir = super::skill_dir_from_source(&source);
+        assert_eq!(dir, PathBuf::from("/workspace/skills/my-skill"));
+    }
+
+    #[test]
+    fn test_skill_dir_from_source_directory() {
+        use crate::skills::SkillSource;
+
+        // Create a temp dir so is_dir() returns true
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let source = SkillSource::User(temp.path().to_path_buf());
+        let dir = super::skill_dir_from_source(&source);
+        assert_eq!(dir, temp.path().to_path_buf());
+    }
+
+    #[test]
+    fn test_skill_dir_from_all_source_variants() {
+        use crate::skills::SkillSource;
+        use std::path::PathBuf;
+
+        let variants = vec![
+            SkillSource::Workspace(PathBuf::from("/a/b/SKILL.md")),
+            SkillSource::User(PathBuf::from("/c/d/SKILL.md")),
+            SkillSource::Bundled(PathBuf::from("/e/f/SKILL.md")),
+        ];
+        let expected = vec![
+            PathBuf::from("/a/b"),
+            PathBuf::from("/c/d"),
+            PathBuf::from("/e/f"),
+        ];
+        for (source, exp) in variants.into_iter().zip(expected) {
+            let dir = super::skill_dir_from_source(&source);
+            assert_eq!(dir, exp);
+        }
+    }
+
+    /// RAII guard that sets env vars on creation and restores them on drop.
+    /// Prevents test pollution across parallel test runs.
+    struct EnvGuard {
+        originals: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn new(vars: &[(&str, Option<&str>)]) -> Self {
+            let mut originals = Vec::new();
+            for (key, value) in vars {
+                originals.push((key.to_string(), std::env::var(key).ok()));
+                // SAFETY: Tests run serially for env-mutating tests; no other
+                // threads read these specific env vars concurrently.
+                unsafe {
+                    match value {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+            EnvGuard { originals }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, original) in &self.originals {
+                // SAFETY: Restoring original values in drop; same safety
+                // rationale as construction.
+                unsafe {
+                    match original {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
     }
 }

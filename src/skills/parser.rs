@@ -270,4 +270,53 @@ Skill with file-based activation script.
         let result = parse_skill_md(content).expect("should parse");
         assert!(result.manifest.activation.script.is_none());
     }
+
+    #[test]
+    fn test_activation_script_both_source_and_file() {
+        // When both source and source_file are provided, both should be
+        // present in the parsed struct (script_runner prefers source).
+        let content = r#"---
+name: both-script
+activation:
+  keywords: ["test"]
+  script:
+    language: bash
+    source: "echo inline"
+    source_file: fallback.sh
+---
+
+Skill with both script sources.
+"#;
+        let result = parse_skill_md(content).expect("should parse");
+        let script = result
+            .manifest
+            .activation
+            .script
+            .expect("script should be present");
+        assert_eq!(script.language, "bash");
+        assert!(script.source.is_some());
+        assert!(script.source_file.is_some());
+    }
+
+    #[test]
+    fn test_activation_script_node_language() {
+        let content = r#"---
+name: node-script
+activation:
+  keywords: ["test"]
+  script:
+    language: node
+    source: "console.log('hello')"
+---
+
+Node skill.
+"#;
+        let result = parse_skill_md(content).expect("should parse");
+        let script = result
+            .manifest
+            .activation
+            .script
+            .expect("script should be present");
+        assert_eq!(script.language, "node");
+    }
 }
