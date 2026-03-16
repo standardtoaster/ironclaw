@@ -795,11 +795,6 @@ impl ToolRegistry {
                 for schema in schemas {
                     let tools = generate_collection_tools(schema, Arc::clone(&db), collection_write_tx.clone());
                     tool_count += tools.len();
-                    for tool in &tools {
-                        // Mark per-collection tools as discovered so they appear
-                        // in the LLM's tool set even with CORE_TOOLS filtering.
-                        self.mark_discovered(tool.name()).await;
-                    }
                     for tool in tools {
                         self.register(tool).await;
                     }

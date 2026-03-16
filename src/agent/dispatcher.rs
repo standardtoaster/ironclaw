@@ -119,6 +119,25 @@ impl Agent {
         // Select and prepare active skills (if skills system is enabled)
         let active_skills = self.select_active_skills(&message.content);
 
+        // Auto-discover tools referenced by active skills' tools_prefix.
+        // This ensures per-collection tools are available to the LLM when
+        // the skill activates, without loading ALL collection tools on every turn.
+        for skill in &active_skills {
+            if let Some(ref prefix) = skill.manifest.activation.tools_prefix {
+                let matches = self.deps.tools.search_tools(prefix).await;
+                for (name, _desc) in &matches {
+                    if !self.deps.tools.is_discovered(name).await {
+                        self.deps.tools.mark_discovered(name).await;
+                        tracing::info!(
+                            skill = skill.name(),
+                            tool = name,
+                            "Auto-discovered tool via skill tools_prefix"
+                        );
+                    }
+                }
+            }
+        }
+
         // Build skill context block
         let skill_context = if !active_skills.is_empty() {
             let mut context_parts = Vec::new();

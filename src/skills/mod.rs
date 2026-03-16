@@ -113,6 +113,10 @@ pub struct ActivationCriteria {
     /// Maximum context tokens this skill's prompt should consume.
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: usize,
+    /// Tool name prefix to auto-discover when this skill activates.
+    /// When set, matching tools are loaded into the session automatically.
+    #[serde(default)]
+    pub tools_prefix: Option<String>,
 }
 
 impl ActivationCriteria {

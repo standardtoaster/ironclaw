@@ -171,6 +171,7 @@ mod tests {
                     patterns: pattern_strings,
                     tags: tag_vec,
                     max_context_tokens: 1000,
+                    tools_prefix: None,
                 },
                 metadata: None,
             },
