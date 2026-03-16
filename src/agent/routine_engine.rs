@@ -10,6 +10,7 @@
 //! Lightweight routines execute inline (single LLM call, no scheduler slot).
 //! Full-job routines are delegated to the existing `Scheduler`.
 
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,8 +68,10 @@ pub struct RoutineEngine {
     tool_registry: Option<Arc<ToolRegistry>>,
     /// Gateway port for script `IRONCLAW_PORT` env var (resolved at construction).
     gateway_port: Option<u16>,
-    /// Default auth token for script `IRONCLAW_TOKEN` env var.
+    /// Default auth token for script `IRONCLAW_TOKEN` env var (single-tenant fallback).
     gateway_auth_token: Option<String>,
+    /// Reverse map from user_id → auth token, built from `GATEWAY_USER_TOKENS`.
+    user_token_map: HashMap<String, String>,
 }
 
 impl RoutineEngine {
@@ -87,6 +90,10 @@ impl RoutineEngine {
             .and_then(|s| s.parse().ok());
         let gateway_auth_token = std::env::var("GATEWAY_AUTH_TOKEN").ok();
 
+        // Build reverse map (user_id → token) from GATEWAY_USER_TOKENS for
+        // multi-tenant mode.  Falls back to gateway_auth_token in single-tenant.
+        let user_token_map = Self::build_user_token_map();
+
         Self {
             config,
             store,
@@ -100,7 +107,49 @@ impl RoutineEngine {
             tool_registry,
             gateway_port,
             gateway_auth_token,
+            user_token_map,
         }
+    }
+
+    /// Build a reverse map from `user_id` → auth token by parsing
+    /// `GATEWAY_USER_TOKENS` (JSON: `{token: {user_id: "...", ...}, ...}`).
+    fn build_user_token_map() -> HashMap<String, String> {
+        let json_str = match std::env::var("GATEWAY_USER_TOKENS") {
+            Ok(s) => s,
+            Err(_) => return HashMap::new(),
+        };
+
+        #[derive(serde::Deserialize)]
+        struct TokenEntry {
+            user_id: String,
+        }
+
+        match serde_json::from_str::<HashMap<String, TokenEntry>>(&json_str) {
+            Ok(tokens) => {
+                let map: HashMap<String, String> = tokens
+                    .into_iter()
+                    .map(|(token, entry)| (entry.user_id, token))
+                    .collect();
+                tracing::info!(
+                    count = map.len(),
+                    "Routine engine built user_id→token map for multi-tenant mode"
+                );
+                map
+            }
+            Err(e) => {
+                tracing::warn!("Failed to parse GATEWAY_USER_TOKENS for routine engine: {e}");
+                HashMap::new()
+            }
+        }
+    }
+
+    /// Resolve the auth token for a routine's user_id.
+    /// Checks multi-tenant map first, falls back to single-tenant `GATEWAY_AUTH_TOKEN`.
+    fn resolve_user_token(&self, user_id: &str) -> Option<String> {
+        self.user_token_map
+            .get(user_id)
+            .cloned()
+            .or_else(|| self.gateway_auth_token.clone())
     }
 
     /// Refresh the in-memory event trigger cache from DB.
@@ -376,7 +425,7 @@ impl RoutineEngine {
             scheduler: self.scheduler.clone(),
             tool_registry: self.tool_registry.clone(),
             gateway_port: self.gateway_port,
-            user_token: self.gateway_auth_token.clone(),
+            user_token: self.resolve_user_token(&routine.user_id),
         };
 
         tokio::spawn(async move {
@@ -454,7 +503,7 @@ impl RoutineEngine {
             scheduler: self.scheduler.clone(),
             tool_registry: self.tool_registry.clone(),
             gateway_port: self.gateway_port,
-            user_token: self.gateway_auth_token.clone(),
+            user_token: self.resolve_user_token(&routine.user_id),
         };
 
         tokio::spawn(async move {
@@ -489,7 +538,7 @@ impl RoutineEngine {
             scheduler: self.scheduler.clone(),
             tool_registry: self.tool_registry.clone(),
             gateway_port: self.gateway_port,
-            user_token: self.gateway_auth_token.clone(),
+            user_token: self.resolve_user_token(&routine.user_id),
         };
 
         // Record the run in DB, then spawn execution
