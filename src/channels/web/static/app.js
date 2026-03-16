@@ -2340,6 +2340,7 @@ function removeScrollSpinner() {
 // --- Threads ---
 
 function threadTitle(thread) {
+  if (thread.workspace_topic) return thread.workspace_topic;
   if (thread.title) return thread.title;
   const ch = thread.channel || 'gateway';
   if (thread.thread_type === 'heartbeat') return 'Heartbeat Alerts';
