@@ -119,17 +119,8 @@ impl RoutineEngine {
             Err(_) => return HashMap::new(),
         };
 
-        #[derive(serde::Deserialize)]
-        struct TokenEntry {
-            user_id: String,
-        }
-
-        match serde_json::from_str::<HashMap<String, TokenEntry>>(&json_str) {
-            Ok(tokens) => {
-                let map: HashMap<String, String> = tokens
-                    .into_iter()
-                    .map(|(token, entry)| (entry.user_id, token))
-                    .collect();
+        match Self::parse_user_token_map(&json_str) {
+            Ok(map) => {
                 tracing::info!(
                     count = map.len(),
                     "Routine engine built user_id→token map for multi-tenant mode"
@@ -141,6 +132,20 @@ impl RoutineEngine {
                 HashMap::new()
             }
         }
+    }
+
+    /// Parse a GATEWAY_USER_TOKENS JSON string into a user_id → token map.
+    fn parse_user_token_map(json_str: &str) -> Result<HashMap<String, String>, serde_json::Error> {
+        #[derive(serde::Deserialize)]
+        struct TokenEntry {
+            user_id: String,
+        }
+
+        let tokens: HashMap<String, TokenEntry> = serde_json::from_str(json_str)?;
+        Ok(tokens
+            .into_iter()
+            .map(|(token, entry)| (entry.user_id, token))
+            .collect())
     }
 
     /// Resolve the auth token for a routine's user_id.
@@ -1377,7 +1382,7 @@ async fn execute_script_inner(
 mod tests {
     use crate::agent::collection_events::CollectionWriteEvent;
     use crate::agent::routine::{NotifyConfig, Routine, RoutineAction, RoutineGuardrails, RunStatus, Trigger};
-    use super::matches_collection_write;
+    use super::{matches_collection_write, RoutineEngine};
 
     #[test]
     fn test_notification_gating() {
@@ -1695,5 +1700,32 @@ else:
         assert_eq!(result, ScriptResult::Handled);
 
         let _ = tokio::fs::remove_file(&script_path).await;
+    }
+
+    #[test]
+    fn test_parse_user_token_map_multi_tenant() {
+        let json = r#"{"tok-andrew": {"user_id": "andrew", "llm_backend": "openai"}, "tok-household": {"user_id": "household"}}"#;
+        let map = RoutineEngine::parse_user_token_map(json).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("andrew").unwrap(), "tok-andrew");
+        assert_eq!(map.get("household").unwrap(), "tok-household");
+    }
+
+    #[test]
+    fn test_parse_user_token_map_empty() {
+        let map = RoutineEngine::parse_user_token_map("{}").unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_parse_user_token_map_invalid_json() {
+        assert!(RoutineEngine::parse_user_token_map("not json").is_err());
+    }
+
+    #[test]
+    fn test_parse_user_token_map_missing_user_id() {
+        // Token entry without user_id field should fail deserialization
+        let json = r#"{"tok-bad": {"llm_backend": "openai"}}"#;
+        assert!(RoutineEngine::parse_user_token_map(json).is_err());
     }
 }
