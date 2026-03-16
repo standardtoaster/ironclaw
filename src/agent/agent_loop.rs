@@ -311,9 +311,13 @@ impl Agent {
     }
 
     /// Select active skills for a message using deterministic prefiltering.
+    ///
+    /// If `user_id` is provided, skills with a `scope` field are filtered to
+    /// only those matching the user. Skills without a scope activate for all.
     pub(super) fn select_active_skills(
         &self,
         message_content: &str,
+        user_id: Option<&str>,
     ) -> Vec<crate::skills::LoadedSkill> {
         if let Some(registry) = self.skill_registry() {
             let guard = match registry.read() {
@@ -330,6 +334,7 @@ impl Agent {
                 available,
                 skills_cfg.max_active_skills,
                 skills_cfg.max_context_tokens,
+                user_id,
             );
 
             if !selected.is_empty() {

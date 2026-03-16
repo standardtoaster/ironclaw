@@ -272,6 +272,36 @@ Skill with file-based activation script.
     }
 
     #[test]
+    fn test_scope_single_parsed() {
+        let content = "---\nname: scoped-skill\nscope: household\n---\n\nPrompt with scope.\n";
+        let result = parse_skill_md(content).expect("should parse");
+        assert_eq!(
+            result.manifest.scope,
+            Some(crate::skills::SkillScope::Single("household".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_scope_multiple_parsed() {
+        let content = "---\nname: multi-scope\nscope:\n  - andrew\n  - household\n---\n\nPrompt.\n";
+        let result = parse_skill_md(content).expect("should parse");
+        assert_eq!(
+            result.manifest.scope,
+            Some(crate::skills::SkillScope::Multiple(vec![
+                "andrew".to_string(),
+                "household".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_no_scope_backwards_compatible() {
+        let content = "---\nname: no-scope\nactivation:\n  keywords: [\"test\"]\n---\n\nPrompt.\n";
+        let result = parse_skill_md(content).expect("should parse");
+        assert!(result.manifest.scope.is_none(), "skills without scope field should parse as None");
+    }
+
+    #[test]
     fn test_activation_script_both_source_and_file() {
         // When both source and source_file are provided, both should be
         // present in the parsed struct (script_runner prefers source).

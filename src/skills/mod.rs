@@ -33,6 +33,28 @@ use std::path::PathBuf;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
+/// Optional user scope for a skill. When set, the skill only activates for
+/// matching user IDs. Supports both a single string and a list via untagged
+/// serde deserialization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum SkillScope {
+    /// Skill is scoped to a single user.
+    Single(String),
+    /// Skill is scoped to multiple users.
+    Multiple(Vec<String>),
+}
+
+impl SkillScope {
+    /// Check if the given user_id is within this scope.
+    pub fn matches(&self, user_id: &str) -> bool {
+        match self {
+            SkillScope::Single(s) => s == user_id,
+            SkillScope::Multiple(v) => v.iter().any(|s| s == user_id),
+        }
+    }
+}
+
 /// Maximum number of keywords allowed per skill to prevent scoring manipulation.
 const MAX_KEYWORDS_PER_SKILL: usize = 20;
 
@@ -189,6 +211,10 @@ pub struct SkillManifest {
     /// Optional OpenClaw metadata.
     #[serde(default)]
     pub metadata: Option<SkillMetadata>,
+    /// Optional user_id scope. If set, the skill only activates for matching users.
+    /// Can be a single user_id or a list. If empty/None, activates for all users.
+    #[serde(default)]
+    pub scope: Option<SkillScope>,
 }
 
 fn default_version() -> String {
@@ -553,6 +579,7 @@ metadata:
                 description: String::new(),
                 activation: ActivationCriteria::default(),
                 metadata: None,
+                scope: None,
             },
             prompt_content: "test prompt".to_string(),
             trust: SkillTrust::Trusted,
@@ -612,5 +639,56 @@ activation:
 "#;
         let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
         assert!(manifest.activation.script.is_none());
+    }
+
+    #[test]
+    fn test_skill_scope_single_matches() {
+        let scope = SkillScope::Single("alice".to_string());
+        assert!(scope.matches("alice"));
+        assert!(!scope.matches("bob"));
+    }
+
+    #[test]
+    fn test_skill_scope_multiple_matches() {
+        let scope = SkillScope::Multiple(vec!["alice".to_string(), "bob".to_string()]);
+        assert!(scope.matches("alice"));
+        assert!(scope.matches("bob"));
+        assert!(!scope.matches("charlie"));
+    }
+
+    #[test]
+    fn test_skill_scope_none_means_all_users() {
+        let yaml = r#"
+name: unscoped-skill
+activation:
+  keywords: ["test"]
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        assert!(manifest.scope.is_none());
+    }
+
+    #[test]
+    fn test_skill_scope_single_from_yaml() {
+        let yaml = r#"
+name: scoped-skill
+scope: alice
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        assert_eq!(manifest.scope, Some(SkillScope::Single("alice".to_string())));
+    }
+
+    #[test]
+    fn test_skill_scope_multiple_from_yaml() {
+        let yaml = r#"
+name: multi-scoped
+scope:
+  - alice
+  - bob
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        assert_eq!(
+            manifest.scope,
+            Some(SkillScope::Multiple(vec!["alice".to_string(), "bob".to_string()]))
+        );
     }
 }

@@ -117,7 +117,7 @@ impl Agent {
         };
 
         // Select and prepare active skills (if skills system is enabled)
-        let active_skills = self.select_active_skills(&message.content);
+        let active_skills = self.select_active_skills(&message.content, Some(&message.user_id));
 
         // Auto-discover tools referenced by active skills' tools_prefix.
         // This ensures per-collection tools are available to the LLM when
