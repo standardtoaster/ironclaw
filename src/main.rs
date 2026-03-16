@@ -815,6 +815,14 @@ async fn async_main() -> anyhow::Result<()> {
             _ => None,
         };
 
+    // Create per-user workspace pool for the agent (same pool the gateway uses).
+    let agent_workspace_pool = components.db.as_ref().map(|db| {
+        Arc::new(ironclaw::channels::web::server::WorkspacePool::new(
+            Arc::clone(db),
+            components.embeddings.clone(),
+        ))
+    });
+
     let deps = AgentDeps {
         store: components.db,
         llm: components.llm,
@@ -841,6 +849,7 @@ async fn async_main() -> anyhow::Result<()> {
         thread_resolver: thread_resolver_for_agent,
         core_tools: config.core_tools.clone(),
         organize_rx: Some(organize_rx),
+        workspace_pool: agent_workspace_pool,
     };
 
     let mut agent = Agent::new(
