@@ -1013,6 +1013,15 @@ impl Workspace {
             }
         }
 
+        // Current date/time — refreshed every turn so the model always knows "now".
+        {
+            let now = match tz {
+                Some(t) => Utc::now().with_timezone(&t).format("%Y-%m-%d %H:%M %Z (%A)").to_string(),
+                None => Utc::now().format("%Y-%m-%d %H:%M UTC (%A)").to_string(),
+            };
+            parts.push(format!("Current date and time: {now}"));
+        }
+
         // Tool notes: environment-specific guidance the agent or user has written.
         // TOOLS.md does not control tool availability; it is guidance only.
         if let Ok(doc) = self.read(paths::TOOLS).await
