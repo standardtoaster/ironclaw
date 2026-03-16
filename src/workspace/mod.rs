@@ -587,6 +587,22 @@ impl Workspace {
         }
     }
 
+    /// Read a file from the **primary scope only**, ignoring additional read scopes.
+    ///
+    /// Use this for identity and configuration files (AGENTS.md, SOUL.md, USER.md,
+    /// IDENTITY.md, TOOLS.md, BOOTSTRAP.md) where inheriting content from another
+    /// scope would be a correctness/security issue — the agent must never silently
+    /// present itself as the wrong user.
+    ///
+    /// For memory files that should span scopes (MEMORY.md, daily logs), use
+    /// [`read`] instead.
+    pub async fn read_primary(&self, path: &str) -> Result<MemoryDocument, WorkspaceError> {
+        let path = normalize_path(path);
+        self.storage
+            .get_document_by_path(&self.user_id, self.agent_id, &path)
+            .await
+    }
+
     /// Write (create or update) a file.
     ///
     /// Creates parent directories implicitly (they're virtual in the DB).
@@ -1019,7 +1035,14 @@ impl Workspace {
         // can delete it after onboarding. This means a prompt injection attack
         // could write to it, but the file is only injected on the next session
         // (not the current one), limiting the blast radius.
-        if let Ok(doc) = self.read(paths::BOOTSTRAP).await
+        //
+        // Identity and config files use read_primary() to prevent cross-scope
+        // bleed in multi-scope workspaces. Without this, a user with read access
+        // to other scopes could silently inherit another user's identity if their
+        // own copy is missing — the agent would present as the wrong person.
+        // Memory files (MEMORY.md, daily logs) intentionally use multi-scope
+        // read() since sharing memory across scopes is a feature.
+        if let Ok(doc) = self.read_primary(paths::BOOTSTRAP).await
             && !doc.content.is_empty()
         {
             parts.push(format!(
@@ -1030,7 +1053,8 @@ impl Workspace {
             ));
         }
 
-        // Load identity files in order of importance
+        // Load identity files in order of importance.
+        // These MUST use read_primary() — see comment above.
         let identity_files = [
             (paths::AGENTS, "## Agent Instructions"),
             (paths::SOUL, "## Core Values"),
@@ -1039,7 +1063,7 @@ impl Workspace {
         ];
 
         for (path, header) in identity_files {
-            if let Ok(doc) = self.read(path).await
+            if let Ok(doc) = self.read_primary(path).await
                 && !doc.content.is_empty()
             {
                 parts.push(format!("{}\n\n{}", header, doc.content));
@@ -1048,7 +1072,8 @@ impl Workspace {
 
         // Tool notes: environment-specific guidance the agent or user has written.
         // TOOLS.md does not control tool availability; it is guidance only.
-        if let Ok(doc) = self.read(paths::TOOLS).await
+        // Uses read_primary() — tool config is per-user, not inherited.
+        if let Ok(doc) = self.read_primary(paths::TOOLS).await
             && !doc.content.is_empty()
         {
             parts.push(format!("## Tool Notes\n\n{}", doc.content));
