@@ -2,8 +2,8 @@
 //!
 //! Provides full CRUD access to structured collections with cross-lens support.
 //! Cross-lens access uses `workspace_read_scopes` from the authenticated user's
-//! identity — if a user has scope "household", they can read and write to
-//! household's collections.
+//! identity — if a user has a read scope for another user, they can read
+//! that user's collections.
 
 use std::collections::HashMap;
 use std::sync::Arc;

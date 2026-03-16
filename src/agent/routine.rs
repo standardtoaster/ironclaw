@@ -770,7 +770,7 @@ mod tests {
     #[test]
     fn test_collection_write_trigger_db_roundtrip() {
         let trigger = Trigger::CollectionWrite {
-            collection: "nanny_shifts".to_string(),
+            collection: "time_entries".to_string(),
         };
         let tag = trigger.type_tag();
         let config_json = trigger.to_config_json();
@@ -779,7 +779,7 @@ mod tests {
 
         let restored = Trigger::from_db(tag, config_json).unwrap();
         match restored {
-            Trigger::CollectionWrite { collection } => assert_eq!(collection, "nanny_shifts"),
+            Trigger::CollectionWrite { collection } => assert_eq!(collection, "time_entries"),
             _ => panic!("Expected CollectionWrite"),
         }
     }

@@ -2470,21 +2470,21 @@ mod tests {
         // Scenario 1: Multi-tenant lookup succeeds
         {
             let _guard = EnvGuard::new(&[
-                ("GATEWAY_USER_TOKENS", Some(r#"{"tok-andrew":{"user_id":"andrew"},"tok-grace":{"user_id":"grace"}}"#)),
+                ("GATEWAY_USER_TOKENS", Some(r#"{"tok-alice":{"user_id":"alice"},"tok-bob":{"user_id":"bob"}}"#)),
                 ("GATEWAY_AUTH_TOKEN", Some("fallback-token")),
             ]);
 
-            let token = super::resolve_script_token("andrew");
-            assert_eq!(token, Some("tok-andrew".to_string()), "should find andrew's token");
+            let token = super::resolve_script_token("alice");
+            assert_eq!(token, Some("tok-alice".to_string()), "should find alice's token");
 
-            let token = super::resolve_script_token("grace");
-            assert_eq!(token, Some("tok-grace".to_string()), "should find grace's token");
+            let token = super::resolve_script_token("bob");
+            assert_eq!(token, Some("tok-bob".to_string()), "should find bob's token");
         }
 
         // Scenario 2: Unknown user falls back to GATEWAY_AUTH_TOKEN
         {
             let _guard = EnvGuard::new(&[
-                ("GATEWAY_USER_TOKENS", Some(r#"{"tok-andrew":{"user_id":"andrew"}}"#)),
+                ("GATEWAY_USER_TOKENS", Some(r#"{"tok-alice":{"user_id":"alice"}}"#)),
                 ("GATEWAY_AUTH_TOKEN", Some("fallback-token")),
             ]);
 

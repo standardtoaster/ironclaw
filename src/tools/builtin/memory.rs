@@ -166,7 +166,7 @@ impl Tool for MemoryWriteTool {
                 },
                 "layer": {
                     "type": "string",
-                    "description": "Memory layer to write to (e.g. 'private', 'household', 'finance'). When omitted, writes to the workspace's default scope."
+                    "description": "Memory layer to write to (e.g. 'private', 'shared', 'finance'). When omitted, writes to the workspace's default scope."
                 }
             },
             "required": ["content"]

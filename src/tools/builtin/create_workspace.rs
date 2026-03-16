@@ -52,7 +52,7 @@ impl Tool for CreateWorkspaceTool {
             "properties": {
                 "topic": {
                     "type": "string",
-                    "description": "Short topic label for the workspace (e.g. 'home assistant setup', 'US expat taxes', 'nanny schedule')"
+                    "description": "Short topic label for the workspace (e.g. 'home assistant setup', 'travel planning', 'project tracker')"
                 },
                 "description": {
                     "type": "string",

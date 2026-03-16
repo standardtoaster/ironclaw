@@ -1456,7 +1456,7 @@ mod tests {
         let routine = make_collection_write_routine("presence-handler", "wifi_presence", "test-user");
         let event = CollectionWriteEvent {
             user_id: "test-user".to_string(),
-            collection: "nanny_shifts".to_string(),
+            collection: "time_entries".to_string(),
             record_id: uuid::Uuid::new_v4(),
             data: serde_json::json!({}),
         };
@@ -1704,11 +1704,11 @@ else:
 
     #[test]
     fn test_parse_user_token_map_multi_tenant() {
-        let json = r#"{"tok-andrew": {"user_id": "andrew", "llm_backend": "openai"}, "tok-household": {"user_id": "household"}}"#;
+        let json = r#"{"tok-alice": {"user_id": "alice", "llm_backend": "openai"}, "tok-shared": {"user_id": "shared"}}"#;
         let map = RoutineEngine::parse_user_token_map(json).unwrap();
         assert_eq!(map.len(), 2);
-        assert_eq!(map.get("andrew").unwrap(), "tok-andrew");
-        assert_eq!(map.get("household").unwrap(), "tok-household");
+        assert_eq!(map.get("alice").unwrap(), "tok-alice");
+        assert_eq!(map.get("shared").unwrap(), "tok-shared");
     }
 
     #[test]
