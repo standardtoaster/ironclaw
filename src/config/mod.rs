@@ -21,6 +21,7 @@ mod secrets;
 mod skills;
 mod tunnel;
 mod wasm;
+mod workspace;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -47,6 +48,7 @@ pub use self::secrets::SecretsConfig;
 pub use self::skills::SkillsConfig;
 pub use self::tunnel::TunnelConfig;
 pub use self::wasm::WasmConfig;
+pub use self::workspace::WorkspaceConfig;
 
 /// Thread-safe overlay for injected env vars (secrets loaded from DB).
 ///
@@ -74,6 +76,7 @@ pub struct Config {
     pub sandbox: SandboxModeConfig,
     pub claude_code: ClaudeCodeConfig,
     pub skills: SkillsConfig,
+    pub workspace: WorkspaceConfig,
     pub observability: crate::observability::ObservabilityConfig,
 }
 
@@ -181,12 +184,18 @@ impl Config {
 
     /// Build config from settings (shared by from_env and from_db).
     async fn build(settings: &Settings) -> Result<Self, ConfigError> {
+        let channels = ChannelsConfig::resolve(settings)?;
+        let workspace_user_id = channels
+            .gateway
+            .as_ref()
+            .map(|gw| gw.user_id.clone())
+            .unwrap_or_else(|| "default".to_string());
         Ok(Self {
             database: DatabaseConfig::resolve()?,
             llm: LlmConfig::resolve(settings)?,
             embeddings: EmbeddingsConfig::resolve(settings)?,
             tunnel: TunnelConfig::resolve(settings)?,
-            channels: ChannelsConfig::resolve(settings)?,
+            channels,
             agent: AgentConfig::resolve(settings)?,
             safety: SafetyConfig::resolve()?,
             wasm: WasmConfig::resolve()?,
@@ -198,6 +207,7 @@ impl Config {
             sandbox: SandboxModeConfig::resolve()?,
             claude_code: ClaudeCodeConfig::resolve()?,
             skills: SkillsConfig::resolve()?,
+            workspace: WorkspaceConfig::resolve(&workspace_user_id)?,
             observability: crate::observability::ObservabilityConfig {
                 backend: std::env::var("OBSERVABILITY_BACKEND").unwrap_or_else(|_| "none".into()),
             },
