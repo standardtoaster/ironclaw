@@ -61,6 +61,7 @@ fn time_entry_schema() -> CollectionSchema {
         collection: "time_entries".to_string(),
         description: Some("Work time entry tracking".to_string()),
         fields,
+        source_scope: None,
     }
 }
 
@@ -137,6 +138,7 @@ fn grocery_schema() -> CollectionSchema {
         collection: "grocery_items".to_string(),
         description: Some("Grocery list items".to_string()),
         fields,
+        source_scope: None,
     }
 }
 
@@ -336,6 +338,7 @@ fn bool_string_coercion() {
         collection: "test".to_string(),
         description: None,
         fields,
+        source_scope: None,
     };
     let data = serde_json::json!({"active": "true"});
     let result = schema.validate_record(&data).unwrap();

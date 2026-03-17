@@ -1915,6 +1915,7 @@ mod tests {
             collection: "todo_items".to_string(),
             description: Some("Track todo items and tasks".to_string()),
             fields,
+            source_scope: None,
         };
 
         generate_collection_skill(&schema, skills_dir);
@@ -1967,6 +1968,7 @@ mod tests {
             collection: "contacts".to_string(),
             description: None,
             fields,
+        source_scope: None,
         };
 
         generate_collection_skill(&schema, tmp.path());
@@ -1991,11 +1993,13 @@ mod tests {
                 collection: "groceries".to_string(),
                 description: Some("Grocery shopping list".to_string()),
                 fields: BTreeMap::new(),
+            source_scope: None,
             },
             crate::db::structured::CollectionSchema {
                 collection: "time_entries".to_string(),
                 description: Some("Track work time entries".to_string()),
                 fields: BTreeMap::new(),
+            source_scope: None,
             },
         ];
 
@@ -2023,6 +2027,7 @@ mod tests {
             collection: "groceries".to_string(),
             description: Some("Grocery shopping list".to_string()),
             fields: BTreeMap::new(),
+        source_scope: None,
         }];
 
         generate_router_skill(&schemas, tmp.path());
@@ -2077,6 +2082,7 @@ mod tests {
                 collection: "groceries".to_string(),
                 description: Some("test".to_string()),
                 fields,
+            source_scope: None,
             }
         }
 
@@ -2320,6 +2326,7 @@ mod tests {
                 collection: name.to_string(),
                 description: Some("test collection".to_string()),
                 fields,
+            source_scope: None,
             }
         }
 
