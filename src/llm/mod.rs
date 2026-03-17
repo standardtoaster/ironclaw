@@ -436,6 +436,165 @@ pub fn build_provider_chain(
     Ok((llm, cheap_llm))
 }
 
+/// Create an LLM provider from a per-user LLM config.
+///
+/// This builds a minimal provider (no retry, failover, smart routing, or cache)
+/// for per-user overrides. The user config specifies the backend, model, and
+/// optional API key / base URL.
+pub fn create_provider_from_user_config(
+    user_config: &crate::config::UserLlmConfig,
+) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    use secrecy::ExposeSecret;
+
+    match user_config.backend {
+        LlmBackend::Anthropic => {
+            let api_key = user_config.api_key.as_ref().ok_or_else(|| LlmError::AuthFailed {
+                provider: "anthropic".to_string(),
+            })?;
+
+            use rig::providers::anthropic;
+
+            let client: anthropic::Client = if let Some(ref base_url) = user_config.base_url {
+                anthropic::Client::builder()
+                    .api_key(api_key.expose_secret())
+                    .base_url(base_url)
+                    .build()
+            } else {
+                anthropic::Client::new(api_key.expose_secret())
+            }
+            .map_err(|e| LlmError::RequestFailed {
+                provider: "anthropic".to_string(),
+                reason: format!("Failed to create Anthropic client: {e}"),
+            })?;
+
+            let model = client.completion_model(&user_config.model);
+            tracing::info!(
+                user_model = %user_config.model,
+                "Per-user Anthropic provider created"
+            );
+            Ok(Arc::new(RigAdapter::new(model, &user_config.model)))
+        }
+        LlmBackend::OpenAi => {
+            let api_key = user_config.api_key.as_ref().ok_or_else(|| LlmError::AuthFailed {
+                provider: "openai".to_string(),
+            })?;
+
+            use rig::providers::openai;
+
+            let client: openai::CompletionsClient = if let Some(ref base_url) = user_config.base_url {
+                openai::Client::builder()
+                    .base_url(base_url)
+                    .api_key(api_key.expose_secret())
+                    .build()
+            } else {
+                openai::Client::new(api_key.expose_secret())
+            }
+            .map_err(|e| LlmError::RequestFailed {
+                provider: "openai".to_string(),
+                reason: format!("Failed to create OpenAI client: {e}"),
+            })?
+            .completions_api();
+
+            let model = client.completion_model(&user_config.model);
+            tracing::info!(
+                user_model = %user_config.model,
+                "Per-user OpenAI provider created"
+            );
+            Ok(Arc::new(RigAdapter::new(model, &user_config.model)))
+        }
+        LlmBackend::Ollama => {
+            use rig::client::Nothing;
+            use rig::providers::ollama;
+
+            let base_url = user_config
+                .base_url
+                .as_deref()
+                .unwrap_or("http://localhost:11434");
+
+            let client: ollama::Client = ollama::Client::builder()
+                .base_url(base_url)
+                .api_key(Nothing)
+                .build()
+                .map_err(|e| LlmError::RequestFailed {
+                    provider: "ollama".to_string(),
+                    reason: format!("Failed to create Ollama client: {e}"),
+                })?;
+
+            let model = client.completion_model(&user_config.model);
+            tracing::info!(
+                user_model = %user_config.model,
+                "Per-user Ollama provider created"
+            );
+            Ok(Arc::new(RigAdapter::new(model, &user_config.model)))
+        }
+        LlmBackend::OpenAiCompatible => {
+            use rig::providers::openai;
+
+            let base_url = user_config.base_url.as_deref().ok_or_else(|| LlmError::RequestFailed {
+                provider: "openai_compatible".to_string(),
+                reason: "llm_base_url is required for openai_compatible backend".to_string(),
+            })?;
+
+            let client: openai::CompletionsClient = openai::Client::builder()
+                .base_url(base_url)
+                .api_key(
+                    user_config
+                        .api_key
+                        .as_ref()
+                        .map(|k| k.expose_secret().to_string())
+                        .unwrap_or_else(|| "no-key".to_string()),
+                )
+                .build()
+                .map_err(|e| LlmError::RequestFailed {
+                    provider: "openai_compatible".to_string(),
+                    reason: format!("Failed to create OpenAI-compatible client: {e}"),
+                })?
+                .completions_api();
+
+            let model = client.completion_model(&user_config.model);
+            tracing::info!(
+                user_model = %user_config.model,
+                "Per-user OpenAI-compatible provider created"
+            );
+            Ok(Arc::new(RigAdapter::new(model, &user_config.model)))
+        }
+        LlmBackend::Tinfoil => {
+            let api_key = user_config.api_key.as_ref().ok_or_else(|| LlmError::AuthFailed {
+                provider: "tinfoil".to_string(),
+            })?;
+
+            use rig::providers::openai;
+
+            let client: openai::CompletionsClient = openai::Client::builder()
+                .base_url(TINFOIL_BASE_URL)
+                .api_key(api_key.expose_secret())
+                .build()
+                .map_err(|e| LlmError::RequestFailed {
+                    provider: "tinfoil".to_string(),
+                    reason: format!("Failed to create Tinfoil client: {e}"),
+                })?
+                .completions_api();
+
+            let model = client.completion_model(&user_config.model);
+            tracing::info!(
+                user_model = %user_config.model,
+                "Per-user Tinfoil provider created"
+            );
+            Ok(Arc::new(RigAdapter::new(model, &user_config.model)))
+        }
+        LlmBackend::NearAi => {
+            // NearAi requires a session manager which we don't have in per-user context.
+            // Users wanting NearAi should use the global provider.
+            Err(LlmError::RequestFailed {
+                provider: "nearai".to_string(),
+                reason: "NearAI backend is not supported for per-user LLM config; \
+                         use anthropic, openai, ollama, openai_compatible, or tinfoil"
+                    .to_string(),
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
