@@ -1915,6 +1915,7 @@ mod tests {
             collection: "todo_items".to_string(),
             description: Some("Track todo items and tasks".to_string()),
             fields,
+            source_scope: None,
         };
 
         generate_collection_skill(&schema, skills_dir);
@@ -1967,6 +1968,7 @@ mod tests {
             collection: "contacts".to_string(),
             description: None,
             fields,
+            source_scope: None,
         };
 
         generate_collection_skill(&schema, tmp.path());
@@ -1991,11 +1993,13 @@ mod tests {
                 collection: "groceries".to_string(),
                 description: Some("Grocery shopping list".to_string()),
                 fields: BTreeMap::new(),
+                source_scope: None,
             },
             crate::db::structured::CollectionSchema {
                 collection: "time_entries".to_string(),
                 description: Some("Track work time entries".to_string()),
                 fields: BTreeMap::new(),
+                source_scope: None,
             },
         ];
 
@@ -2023,6 +2027,7 @@ mod tests {
             collection: "groceries".to_string(),
             description: Some("Grocery shopping list".to_string()),
             fields: BTreeMap::new(),
+            source_scope: None,
         }];
 
         generate_router_skill(&schemas, tmp.path());
@@ -2077,6 +2082,7 @@ mod tests {
                 collection: "groceries".to_string(),
                 description: Some("test".to_string()),
                 fields,
+                source_scope: None,
             }
         }
 
@@ -2320,6 +2326,7 @@ mod tests {
                 collection: name.to_string(),
                 description: Some("test collection".to_string()),
                 fields,
+                source_scope: None,
             }
         }
 
@@ -2641,8 +2648,7 @@ mod tests {
             let retrieved = db
                 .get_collection_schema("andrew", "tasks")
                 .await
-                .unwrap()
-                .expect("schema should exist");
+                .unwrap();
             assert_eq!(
                 retrieved.source_scope,
                 Some("household".to_string()),
@@ -2662,8 +2668,7 @@ mod tests {
             let retrieved = db
                 .get_collection_schema("andrew", "personal_tasks")
                 .await
-                .unwrap()
-                .expect("schema should exist");
+                .unwrap();
             assert_eq!(
                 retrieved.source_scope, None,
                 "own-scope collection should have source_scope = None"
@@ -2685,8 +2690,7 @@ mod tests {
             let retrieved = db
                 .get_collection_schema("andrew", "tasks")
                 .await
-                .unwrap()
-                .expect("schema should exist after re-registration");
+                .unwrap();
             assert_eq!(
                 retrieved.source_scope,
                 Some("household".to_string()),
@@ -2722,7 +2726,7 @@ mod tests {
 
             // The record should be in household's scope, not andrew's.
             let household_records = db
-                .query_records("household", "tasks", &[], None, None)
+                .query_records("household", "tasks", &[], None, 100)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2732,7 +2736,7 @@ mod tests {
             );
 
             let andrew_records = db
-                .query_records("andrew", "tasks", &[], None, None)
+                .query_records("andrew", "tasks", &[], None, 100)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2759,7 +2763,7 @@ mod tests {
             assert_eq!(result.result["status"], "created");
 
             let records = db
-                .query_records("andrew", "personal_tasks", &[], None, None)
+                .query_records("andrew", "personal_tasks", &[], None, 100)
                 .await
                 .unwrap();
             assert_eq!(records.len(), 1, "record should be in andrew's own scope");
@@ -2805,7 +2809,7 @@ mod tests {
 
             // Verify the household record was updated.
             let records = db
-                .query_records("household", "tasks", &[], None, None)
+                .query_records("household", "tasks", &[], None, 100)
                 .await
                 .unwrap();
             assert_eq!(records.len(), 1);
@@ -2846,7 +2850,7 @@ mod tests {
             assert_eq!(result.result["status"], "deleted");
 
             let records = db
-                .query_records("household", "tasks", &[], None, None)
+                .query_records("household", "tasks", &[], None, 100)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2914,7 +2918,7 @@ mod tests {
 
             // Household should have zero records.
             let household_records = db
-                .query_records("household", "tasks", &[], None, None)
+                .query_records("household", "tasks", &[], None, 100)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2925,7 +2929,7 @@ mod tests {
 
             // Andrew should have the record.
             let andrew_records = db
-                .query_records("andrew", "tasks", &[], None, None)
+                .query_records("andrew", "tasks", &[], None, 100)
                 .await
                 .unwrap();
             assert_eq!(andrew_records.len(), 1);
@@ -2955,7 +2959,7 @@ mod tests {
 
             // Andrew's own scope should be empty.
             let andrew_records = db
-                .query_records("andrew", "tasks", &[], None, None)
+                .query_records("andrew", "tasks", &[], None, 100)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2966,7 +2970,7 @@ mod tests {
 
             // Household should have the record.
             let household_records = db
-                .query_records("household", "tasks", &[], None, None)
+                .query_records("household", "tasks", &[], None, 100)
                 .await
                 .unwrap();
             assert_eq!(household_records.len(), 1);
@@ -3061,7 +3065,7 @@ mod tests {
                 // Even if the tool returns success, the record should still exist
                 // in household's scope (it must not have been deleted).
                 let records = db
-                    .query_records("household", "tasks", &[], None, None)
+                    .query_records("household", "tasks", &[], None, 100)
                     .await
                     .unwrap();
                 assert_eq!(
@@ -3112,7 +3116,7 @@ mod tests {
             // The update should fail or be a no-op.
             if result.is_ok() {
                 let records = db
-                    .query_records("household", "tasks", &[], None, None)
+                    .query_records("household", "tasks", &[], None, 100)
                     .await
                     .unwrap();
                 assert_eq!(
@@ -3164,7 +3168,7 @@ mod tests {
                 ("family", "family task"),
             ] {
                 let records = db
-                    .query_records(scope, "tasks", &[], None, None)
+                    .query_records(scope, "tasks", &[], None, 100)
                     .await
                     .unwrap();
                 assert_eq!(records.len(), 1, "{scope} should have exactly 1 record");

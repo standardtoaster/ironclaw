@@ -52,6 +52,11 @@ pub struct CollectionSchema {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub fields: BTreeMap<String, FieldDef>,
+    /// When set, this collection is a cross-scope reference. Tools operate on
+    /// the source scope's data, not the registering user's. Tool names are
+    /// prefixed with `{source_scope}_`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_scope: Option<String>,
 }
 
 // ==================== Record ====================
