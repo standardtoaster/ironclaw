@@ -37,6 +37,17 @@ use crate::db::structured::{
 use crate::tools::registry::ToolRegistry;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, ToolRateLimitConfig, require_str};
 
+// ==================== Scoped tool naming ====================
+
+/// Build the tool name for a collection, prefixing with `{source_scope}_` when
+/// the schema carries a cross-scope reference.
+fn tool_name_for(schema: &CollectionSchema, suffix: &str) -> String {
+    match &schema.source_scope {
+        Some(scope) => format!("{}_{}_{}", scope, schema.collection, suffix),
+        None => format!("{}_{}", schema.collection, suffix),
+    }
+}
+
 // ==================== Cross-scope resolution ====================
 
 /// Resolve which user_id owns a collection, checking the caller's own scope
@@ -422,10 +433,10 @@ async fn refresh_collection_tools(
     collection_write_tx: Option<&broadcast::Sender<CollectionWriteEvent>>,
 ) -> Vec<String> {
     // Unregister old per-collection tools (if they exist)
-    let suffixes = ["_add", "_update", "_delete", "_query", "_summary"];
+    let suffixes = ["add", "update", "delete", "query", "summary"];
     for suffix in &suffixes {
-        let tool_name = format!("{}{suffix}", schema.collection);
-        registry.unregister(&tool_name).await;
+        let name = tool_name_for(schema, suffix);
+        registry.unregister(&name).await;
     }
 
     // Generate and register new per-collection tools
@@ -558,12 +569,16 @@ impl Tool for CollectionListTool {
                     })
                     .collect::<serde_json::Map<String, serde_json::Value>>()
                     .into();
-                all_collections.push(json!({
+                let mut entry = json!({
                     "collection": s.collection,
                     "description": s.description,
                     "owner": uid,
                     "fields": fields,
-                }));
+                });
+                if let Some(scope) = &s.source_scope {
+                    entry["source_scope"] = json!(scope);
+                }
+                all_collections.push(entry);
             }
         }
 
@@ -1156,13 +1171,18 @@ impl CollectionAddTool {
         db: Arc<dyn Database>,
         collection_write_tx: Option<broadcast::Sender<CollectionWriteEvent>>,
     ) -> Self {
-        let tool_name = format!("{}_add", schema.collection);
+        let tool_name = tool_name_for(&schema, "add");
         Self {
             tool_name,
             schema,
             db,
             collection_write_tx,
         }
+    }
+
+    /// The user_id that owns the data: `source_scope` if set, else the caller.
+    fn owner_scope<'a>(&'a self, ctx: &'a JobContext) -> &'a str {
+        self.schema.source_scope.as_deref().unwrap_or(&ctx.user_id)
     }
 }
 
@@ -1233,14 +1253,14 @@ impl Tool for CollectionAddTool {
 
         let id = self
             .db
-            .insert_record(&ctx.user_id, &self.schema.collection, data)
+            .insert_record(self.owner_scope(ctx), &self.schema.collection, data)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to insert record: {e}")))?;
 
         // Fire collection write triggers.
         if let Some(tx) = &self.collection_write_tx {
             let _ = tx.send(CollectionWriteEvent {
-                user_id: ctx.user_id.clone(),
+                user_id: self.owner_scope(ctx).to_string(),
                 collection: self.schema.collection.clone(),
                 record_id: id,
                 data: data_for_event,
@@ -1275,12 +1295,16 @@ pub struct CollectionUpdateTool {
 
 impl CollectionUpdateTool {
     pub fn new(schema: CollectionSchema, db: Arc<dyn Database>) -> Self {
-        let tool_name = format!("{}_update", schema.collection);
+        let tool_name = tool_name_for(&schema, "update");
         Self {
             tool_name,
             schema,
             db,
         }
+    }
+
+    fn owner_scope<'a>(&'a self, ctx: &'a JobContext) -> &'a str {
+        self.schema.source_scope.as_deref().unwrap_or(&ctx.user_id)
     }
 }
 
@@ -1351,7 +1375,7 @@ impl Tool for CollectionUpdateTool {
         // Fetch existing record to get current _history, then append update entry.
         let existing = self
             .db
-            .get_record(&ctx.user_id, record_id)
+            .get_record(self.owner_scope(ctx), record_id)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to fetch record: {e}")))?;
 
@@ -1366,7 +1390,7 @@ impl Tool for CollectionUpdateTool {
         }
 
         self.db
-            .update_record(&ctx.user_id, record_id, serde_json::Value::Object(updates))
+            .update_record(self.owner_scope(ctx), record_id, serde_json::Value::Object(updates))
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to update record: {e}")))?;
 
@@ -1392,18 +1416,22 @@ impl Tool for CollectionUpdateTool {
 /// Tool for deleting a record from a specific collection.
 pub struct CollectionDeleteTool {
     tool_name: String,
-    collection_name: String,
+    schema: CollectionSchema,
     db: Arc<dyn Database>,
 }
 
 impl CollectionDeleteTool {
     pub fn new(schema: CollectionSchema, db: Arc<dyn Database>) -> Self {
-        let tool_name = format!("{}_delete", schema.collection);
+        let tool_name = tool_name_for(&schema, "delete");
         Self {
             tool_name,
-            collection_name: schema.collection,
+            schema,
             db,
         }
+    }
+
+    fn owner_scope<'a>(&'a self, ctx: &'a JobContext) -> &'a str {
+        self.schema.source_scope.as_deref().unwrap_or(&ctx.user_id)
     }
 }
 
@@ -1442,7 +1470,7 @@ impl Tool for CollectionDeleteTool {
             .map_err(|e| ToolError::InvalidParameters(format!("Invalid record_id: {e}")))?;
 
         self.db
-            .delete_record(&ctx.user_id, record_id)
+            .delete_record(self.owner_scope(ctx), record_id)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to delete record: {e}")))?;
 
@@ -1450,7 +1478,7 @@ impl Tool for CollectionDeleteTool {
             json!({
                 "status": "deleted",
                 "record_id": record_id_str,
-                "collection": self.collection_name,
+                "collection": self.schema.collection,
             }),
             start.elapsed(),
         ))
@@ -1474,12 +1502,16 @@ pub struct CollectionQueryTool {
 
 impl CollectionQueryTool {
     pub fn new(schema: CollectionSchema, db: Arc<dyn Database>) -> Self {
-        let tool_name = format!("{}_query", schema.collection);
+        let tool_name = tool_name_for(&schema, "query");
         Self {
             tool_name,
             schema,
             db,
         }
+    }
+
+    fn owner_scope<'a>(&'a self, ctx: &'a JobContext) -> &'a str {
+        self.schema.source_scope.as_deref().unwrap_or(&ctx.user_id)
     }
 }
 
@@ -1611,15 +1643,20 @@ impl Tool for CollectionQueryTool {
             .unwrap_or(50)
             .min(200) as usize;
 
-        // Resolve collection owner: own scope first, then workspace_read_scopes.
-        let owner = resolve_collection_scope(
-            self.db.as_ref(),
-            &ctx.user_id,
-            &ctx.workspace_read_scopes,
-            &self.schema.collection,
-        )
-        .await
-        .unwrap_or_else(|| ctx.user_id.clone());
+        // When a source_scope is set, always use it. Otherwise fall back to
+        // cross-scope resolution (own scope first, then workspace_read_scopes).
+        let owner = if self.schema.source_scope.is_some() {
+            self.owner_scope(ctx).to_string()
+        } else {
+            resolve_collection_scope(
+                self.db.as_ref(),
+                &ctx.user_id,
+                &ctx.workspace_read_scopes,
+                &self.schema.collection,
+            )
+            .await
+            .unwrap_or_else(|| ctx.user_id.clone())
+        };
 
         let records = self
             .db
@@ -1669,12 +1706,16 @@ pub struct CollectionSummaryTool {
 
 impl CollectionSummaryTool {
     pub fn new(schema: CollectionSchema, db: Arc<dyn Database>) -> Self {
-        let tool_name = format!("{}_summary", schema.collection);
+        let tool_name = tool_name_for(&schema, "summary");
         Self {
             tool_name,
             schema,
             db,
         }
+    }
+
+    fn owner_scope<'a>(&'a self, ctx: &'a JobContext) -> &'a str {
+        self.schema.source_scope.as_deref().unwrap_or(&ctx.user_id)
     }
 }
 
@@ -1800,15 +1841,18 @@ impl Tool for CollectionSummaryTool {
             filters,
         };
 
-        // Resolve collection owner: own scope first, then workspace_read_scopes.
-        let owner = resolve_collection_scope(
-            self.db.as_ref(),
-            &ctx.user_id,
-            &ctx.workspace_read_scopes,
-            &self.schema.collection,
-        )
-        .await
-        .unwrap_or_else(|| ctx.user_id.clone());
+        let owner = if self.schema.source_scope.is_some() {
+            self.owner_scope(ctx).to_string()
+        } else {
+            resolve_collection_scope(
+                self.db.as_ref(),
+                &ctx.user_id,
+                &ctx.workspace_read_scopes,
+                &self.schema.collection,
+            )
+            .await
+            .unwrap_or_else(|| ctx.user_id.clone())
+        };
 
         let result = self
             .db
