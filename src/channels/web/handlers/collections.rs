@@ -19,7 +19,9 @@ use uuid::Uuid;
 
 use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
-use crate::db::structured::{CollectionSchema, Filter, FilterOp, StructuredStore};
+use crate::db::structured::{
+    CollectionSchema, Filter, FilterOp, StructuredStore, append_history, init_history,
+};
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -317,6 +319,9 @@ pub async fn collections_insert_handler(
         }
     }
 
+    // Inject _history for audit trail.
+    init_history(&mut data, &req.source);
+
     let data_for_event = data.clone();
 
     match db.insert_record(&owner, &name, data).await {
@@ -390,7 +395,31 @@ pub async fn collections_update_handler(
         }
     };
 
-    match db.update_record(&owner, id, req.data).await {
+    // Fetch existing record to append _history before the update.
+    let mut update_data = req.data;
+    match db.get_record(&owner, id).await {
+        Ok(existing) => {
+            let mut existing_data = existing.data;
+            append_history(&mut existing_data, &update_data, "rest_api");
+            // Carry the updated _history into the update payload so the DB merge
+            // replaces the old _history with the appended version.
+            if let Some(history) = existing_data.get("_history")
+                && let Some(obj) = update_data.as_object_mut()
+            {
+                obj.insert("_history".to_string(), history.clone());
+            }
+        }
+        Err(e) => {
+            let status = if e.to_string().contains("NotFound") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return (status, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+        }
+    }
+
+    match db.update_record(&owner, id, update_data).await {
         Ok(()) => {
             // Fire collection write event for updates too.
             if let Some(tx) = &state.collection_write_tx {

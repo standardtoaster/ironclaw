@@ -32,6 +32,7 @@ use crate::context::JobContext;
 use crate::db::Database;
 use crate::db::structured::{
     AggOp, Aggregation, AlterOperation, Alteration, CollectionSchema, FieldType, Filter,
+    append_history, init_history,
 };
 use crate::tools::registry::ToolRegistry;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, ToolRateLimitConfig, require_str};
@@ -1224,6 +1225,9 @@ impl Tool for CollectionAddTool {
             );
         }
 
+        // Inject _history for audit trail.
+        init_history(&mut data, "conversation");
+
         // Clone before insert_record consumes `data`.
         let data_for_event = data.clone();
 
@@ -1342,6 +1346,23 @@ impl Tool for CollectionUpdateTool {
             return Err(ToolError::InvalidParameters(
                 "No fields to update provided".to_string(),
             ));
+        }
+
+        // Fetch existing record to get current _history, then append update entry.
+        let existing = self
+            .db
+            .get_record(&ctx.user_id, record_id)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to fetch record: {e}")))?;
+
+        let changed_fields = serde_json::Value::Object(updates.clone());
+        let mut existing_data = existing.data;
+        append_history(&mut existing_data, &changed_fields, "conversation");
+
+        // Carry the updated _history into the update payload so the DB merge
+        // replaces the old _history with the appended version.
+        if let Some(history) = existing_data.get("_history") {
+            updates.insert("_history".to_string(), history.clone());
         }
 
         self.db
@@ -2015,6 +2036,250 @@ mod tests {
 
         assert!(!router_path.exists(), "router SKILL.md should be removed for empty schemas");
         assert!(!router_dir.exists(), "router directory should be removed for empty schemas");
+    }
+
+    // ==================== History tracking tests ====================
+
+    #[cfg(feature = "libsql")]
+    mod history {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+
+        use crate::context::JobContext;
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use crate::db::structured::{CollectionSchema, FieldDef, FieldType};
+        use crate::tools::tool::Tool;
+
+        use super::{CollectionAddTool, CollectionUpdateTool};
+
+        fn test_schema() -> CollectionSchema {
+            let mut fields = BTreeMap::new();
+            fields.insert(
+                "item".to_string(),
+                FieldDef {
+                    field_type: FieldType::Text,
+                    required: true,
+                    default: None,
+                },
+            );
+            fields.insert(
+                "quantity".to_string(),
+                FieldDef {
+                    field_type: FieldType::Number,
+                    required: false,
+                    default: None,
+                },
+            );
+            CollectionSchema {
+                collection: "groceries".to_string(),
+                description: Some("test".to_string()),
+                fields,
+            }
+        }
+
+        async fn setup_db(tmp: &TempDir) -> Arc<dyn Database> {
+            let db_path = tmp.path().join("test.db");
+            let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+            backend.run_migrations().await.unwrap();
+            let db: Arc<dyn Database> = Arc::new(backend);
+            db.register_collection("alice", &test_schema())
+                .await
+                .unwrap();
+            db
+        }
+
+        #[tokio::test]
+        async fn insert_creates_history_with_one_entry() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db(&tmp).await;
+            let schema = test_schema();
+            let tool = CollectionAddTool::new(schema, Arc::clone(&db), None);
+            let ctx = JobContext::with_user("alice", "test", "test");
+
+            let result = tool
+                .execute(serde_json::json!({"item": "milk", "quantity": 2}), &ctx)
+                .await
+                .unwrap();
+            let record_id: uuid::Uuid = result.result["record_id"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+
+            let record = db.get_record("alice", record_id).await.unwrap();
+            let history = record.data["_history"].as_array().unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0]["op"], "insert");
+            assert_eq!(history[0]["source"], "conversation");
+            assert_eq!(history[0]["fields"]["item"], "milk");
+            assert_eq!(history[0]["fields"]["quantity"], 2);
+            // System fields should not appear in history fields.
+            assert!(history[0]["fields"].get("_lineage").is_none());
+            assert!(history[0]["fields"].get("_history").is_none());
+            // Time should be present.
+            assert!(history[0]["time"].as_str().is_some());
+        }
+
+        #[tokio::test]
+        async fn update_appends_to_history() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db(&tmp).await;
+            let schema = test_schema();
+            let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db), None);
+            let update_tool = CollectionUpdateTool::new(schema, Arc::clone(&db));
+            let ctx = JobContext::with_user("alice", "test", "test");
+
+            // Insert.
+            let result = add_tool
+                .execute(serde_json::json!({"item": "milk", "quantity": 1}), &ctx)
+                .await
+                .unwrap();
+            let record_id_str = result.result["record_id"].as_str().unwrap();
+            let record_id: uuid::Uuid = record_id_str.parse().unwrap();
+
+            // Update.
+            update_tool
+                .execute(
+                    serde_json::json!({"record_id": record_id_str, "quantity": 3}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+
+            let record = db.get_record("alice", record_id).await.unwrap();
+            let history = record.data["_history"].as_array().unwrap();
+            assert_eq!(history.len(), 2);
+            assert_eq!(history[0]["op"], "insert");
+            assert_eq!(history[1]["op"], "update");
+            assert_eq!(history[1]["source"], "conversation");
+            assert_eq!(history[1]["fields"]["quantity"], 3);
+            // Update should only contain changed fields, not all fields.
+            assert!(
+                history[1]["fields"].get("item").is_none(),
+                "update history should only contain changed fields"
+            );
+        }
+
+        #[tokio::test]
+        async fn multiple_updates_produce_multiple_history_entries() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db(&tmp).await;
+            let schema = test_schema();
+            let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db), None);
+            let update_tool = CollectionUpdateTool::new(schema, Arc::clone(&db));
+            let ctx = JobContext::with_user("alice", "test", "test");
+
+            let result = add_tool
+                .execute(serde_json::json!({"item": "eggs"}), &ctx)
+                .await
+                .unwrap();
+            let rid = result.result["record_id"].as_str().unwrap().to_string();
+            let record_id: uuid::Uuid = rid.parse().unwrap();
+
+            // Three sequential updates.
+            for qty in [6, 12, 24] {
+                update_tool
+                    .execute(
+                        serde_json::json!({"record_id": rid, "quantity": qty}),
+                        &ctx,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let record = db.get_record("alice", record_id).await.unwrap();
+            let history = record.data["_history"].as_array().unwrap();
+            assert_eq!(history.len(), 4, "1 insert + 3 updates = 4 entries");
+            assert_eq!(history[0]["op"], "insert");
+            assert_eq!(history[1]["fields"]["quantity"], 6);
+            assert_eq!(history[2]["fields"]["quantity"], 12);
+            assert_eq!(history[3]["fields"]["quantity"], 24);
+        }
+
+        #[tokio::test]
+        async fn history_preserves_existing_entries() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db(&tmp).await;
+            let schema = test_schema();
+            let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db), None);
+            let update_tool = CollectionUpdateTool::new(schema, Arc::clone(&db));
+            let ctx = JobContext::with_user("alice", "test", "test");
+
+            let result = add_tool
+                .execute(serde_json::json!({"item": "bread"}), &ctx)
+                .await
+                .unwrap();
+            let rid = result.result["record_id"].as_str().unwrap().to_string();
+            let record_id: uuid::Uuid = rid.parse().unwrap();
+
+            // First update.
+            update_tool
+                .execute(
+                    serde_json::json!({"record_id": rid, "quantity": 2}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+
+            // Snapshot the history after first update.
+            let record_after_first = db.get_record("alice", record_id).await.unwrap();
+            let history_after_first = record_after_first.data["_history"]
+                .as_array()
+                .unwrap()
+                .clone();
+            assert_eq!(history_after_first.len(), 2);
+
+            // Second update.
+            update_tool
+                .execute(
+                    serde_json::json!({"record_id": rid, "item": "sourdough bread"}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+
+            let record_after_second = db.get_record("alice", record_id).await.unwrap();
+            let history_after_second = record_after_second.data["_history"]
+                .as_array()
+                .unwrap();
+            assert_eq!(history_after_second.len(), 3);
+
+            // Previous entries must be identical.
+            assert_eq!(history_after_second[0], history_after_first[0]);
+            assert_eq!(history_after_second[1], history_after_first[1]);
+            // New entry.
+            assert_eq!(history_after_second[2]["op"], "update");
+            assert_eq!(history_after_second[2]["fields"]["item"], "sourdough bread");
+        }
+
+        #[tokio::test]
+        async fn history_source_from_lineage() {
+            // When inserting via the REST handler path, source comes from
+            // the lineage/request. For tools, it's "conversation". This test
+            // verifies the tool path sets source correctly.
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db(&tmp).await;
+            let schema = test_schema();
+            let tool = CollectionAddTool::new(schema, Arc::clone(&db), None);
+            let ctx = JobContext::with_user("alice", "test", "test");
+
+            let result = tool
+                .execute(serde_json::json!({"item": "butter"}), &ctx)
+                .await
+                .unwrap();
+            let record_id: uuid::Uuid = result.result["record_id"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+
+            let record = db.get_record("alice", record_id).await.unwrap();
+            let history = record.data["_history"].as_array().unwrap();
+            assert_eq!(history[0]["source"], "conversation");
+        }
     }
 
     // ==================== Cross-scope resolution tests ====================

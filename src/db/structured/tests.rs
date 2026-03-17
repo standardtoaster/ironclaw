@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::db::structured::{
     AlterOperation, Alteration, CollectionSchema, FieldDef, FieldType, ValidationError,
-    is_system_field, validate_field_name,
+    append_history, init_history, is_system_field, validate_field_name,
 };
 
 // ==================== Fixture Schemas ====================
@@ -806,4 +806,87 @@ fn lineage_with_full_provenance() {
     assert_eq!(result["_lineage"]["source"], "webhook");
     assert_eq!(result["_lineage"]["source_id"], "evt-123");
     assert_eq!(result["_lineage"]["context"], "Grocery restock webhook");
+}
+
+// ==================== History Helper Tests ====================
+
+#[test]
+fn init_history_creates_single_insert_entry() {
+    let mut data = serde_json::json!({
+        "item": "milk",
+        "quantity": 2,
+        "_lineage": {"source": "conversation"}
+    });
+    init_history(&mut data, "conversation");
+
+    let history = data["_history"].as_array().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["op"], "insert");
+    assert_eq!(history[0]["source"], "conversation");
+    assert_eq!(history[0]["fields"]["item"], "milk");
+    assert_eq!(history[0]["fields"]["quantity"], 2);
+    // System fields must not appear in the fields snapshot.
+    assert!(history[0]["fields"].get("_lineage").is_none());
+    assert!(history[0]["fields"].get("_history").is_none());
+    assert!(history[0]["time"].as_str().is_some());
+}
+
+#[test]
+fn append_history_adds_update_entry() {
+    let mut data = serde_json::json!({
+        "item": "milk",
+        "_history": [
+            {"op": "insert", "time": "2026-01-01T00:00:00Z", "source": "api", "fields": {"item": "milk"}}
+        ]
+    });
+    let changed = serde_json::json!({"item": "oat milk"});
+    append_history(&mut data, &changed, "rest_api");
+
+    let history = data["_history"].as_array().unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1]["op"], "update");
+    assert_eq!(history[1]["source"], "rest_api");
+    assert_eq!(history[1]["fields"]["item"], "oat milk");
+}
+
+#[test]
+fn append_history_creates_array_if_missing() {
+    let mut data = serde_json::json!({"item": "old record"});
+    let changed = serde_json::json!({"item": "updated"});
+    append_history(&mut data, &changed, "api");
+
+    let history = data["_history"].as_array().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["op"], "update");
+}
+
+#[test]
+fn append_history_filters_system_fields_from_changed() {
+    let mut data = serde_json::json!({
+        "_history": [
+            {"op": "insert", "time": "t", "source": "x", "fields": {}}
+        ]
+    });
+    let changed = serde_json::json!({"quantity": 5, "_lineage": {"source": "api"}});
+    append_history(&mut data, &changed, "api");
+
+    let history = data["_history"].as_array().unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1]["fields"]["quantity"], 5);
+    assert!(
+        history[1]["fields"].get("_lineage").is_none(),
+        "system fields should not appear in history fields"
+    );
+}
+
+#[test]
+fn validate_partial_passes_system_fields_through() {
+    let schema = grocery_schema();
+    let data = serde_json::json!({
+        "name": "bread",
+        "_history": [{"op": "insert"}]
+    });
+    let result = schema.validate_partial(&data).unwrap();
+    assert_eq!(result["name"], "bread");
+    assert_eq!(result["_history"][0]["op"], "insert");
 }
