@@ -48,6 +48,19 @@ fn tool_name_for(schema: &CollectionSchema, suffix: &str) -> String {
     }
 }
 
+/// Build a tool description, prepending scope context for cross-scope tools.
+fn scoped_description(schema: &CollectionSchema, base: &str) -> String {
+    match &schema.source_scope {
+        Some(scope) => format!(
+            "[Operates on {scope}'s {collection}] {base}",
+            scope = scope,
+            collection = schema.collection,
+            base = base,
+        ),
+        None => base.to_string(),
+    }
+}
+
 // ==================== Cross-scope resolution ====================
 
 /// Resolve which user_id owns a collection, checking the caller's own scope
@@ -1160,6 +1173,7 @@ impl Tool for CollectionsAlterTool {
 /// sees typed fields (not a generic "data" blob).
 pub struct CollectionAddTool {
     tool_name: String,
+    tool_description: String,
     schema: CollectionSchema,
     db: Arc<dyn Database>,
     collection_write_tx: Option<broadcast::Sender<CollectionWriteEvent>>,
@@ -1172,8 +1186,16 @@ impl CollectionAddTool {
         collection_write_tx: Option<broadcast::Sender<CollectionWriteEvent>>,
     ) -> Self {
         let tool_name = tool_name_for(&schema, "add");
+        let tool_description = scoped_description(
+            &schema,
+            "Add a new record to this collection. \
+             Call this when the user wants to track, remember, save, create, or log something new. \
+             Example triggers: 'I need to...', 'Add...', 'Don't forget...', 'Put X on my list', \
+             '[person] needs to...'. Fields are validated against the schema.",
+        );
         Self {
             tool_name,
+            tool_description,
             schema,
             db,
             collection_write_tx,
@@ -1193,12 +1215,7 @@ impl Tool for CollectionAddTool {
     }
 
     fn description(&self) -> &str {
-        // Can't return dynamic string from &str, so use a static prefix.
-        // The tool name already encodes the collection.
-        "Add a new record to this collection. \
-         Call this when the user wants to track, remember, save, create, or log something new. \
-         Example triggers: 'I need to...', 'Add...', 'Don't forget...', 'Put X on my list', \
-         '[person] needs to...'. Fields are validated against the schema."
+        &self.tool_description
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1289,6 +1306,7 @@ impl Tool for CollectionAddTool {
 /// Tool for updating a record in a specific collection.
 pub struct CollectionUpdateTool {
     tool_name: String,
+    tool_description: String,
     schema: CollectionSchema,
     db: Arc<dyn Database>,
 }
@@ -1296,8 +1314,13 @@ pub struct CollectionUpdateTool {
 impl CollectionUpdateTool {
     pub fn new(schema: CollectionSchema, db: Arc<dyn Database>) -> Self {
         let tool_name = tool_name_for(&schema, "update");
+        let tool_description = scoped_description(
+            &schema,
+            "Update an existing record. Provide the record_id and only the fields you want to change.",
+        );
         Self {
             tool_name,
+            tool_description,
             schema,
             db,
         }
@@ -1315,7 +1338,7 @@ impl Tool for CollectionUpdateTool {
     }
 
     fn description(&self) -> &str {
-        "Update an existing record. Provide the record_id and only the fields you want to change."
+        &self.tool_description
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1416,6 +1439,7 @@ impl Tool for CollectionUpdateTool {
 /// Tool for deleting a record from a specific collection.
 pub struct CollectionDeleteTool {
     tool_name: String,
+    tool_description: String,
     schema: CollectionSchema,
     db: Arc<dyn Database>,
 }
@@ -1423,8 +1447,13 @@ pub struct CollectionDeleteTool {
 impl CollectionDeleteTool {
     pub fn new(schema: CollectionSchema, db: Arc<dyn Database>) -> Self {
         let tool_name = tool_name_for(&schema, "delete");
+        let tool_description = scoped_description(
+            &schema,
+            "Delete a record by its ID. This action cannot be undone.",
+        );
         Self {
             tool_name,
+            tool_description,
             schema,
             db,
         }
@@ -1442,7 +1471,7 @@ impl Tool for CollectionDeleteTool {
     }
 
     fn description(&self) -> &str {
-        "Delete a record by its ID. This action cannot be undone."
+        &self.tool_description
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1496,6 +1525,7 @@ impl Tool for CollectionDeleteTool {
 /// Tool for querying records from a specific collection.
 pub struct CollectionQueryTool {
     tool_name: String,
+    tool_description: String,
     schema: CollectionSchema,
     db: Arc<dyn Database>,
 }
@@ -1503,8 +1533,16 @@ pub struct CollectionQueryTool {
 impl CollectionQueryTool {
     pub fn new(schema: CollectionSchema, db: Arc<dyn Database>) -> Self {
         let tool_name = tool_name_for(&schema, "query");
+        let tool_description = scoped_description(
+            &schema,
+            "Query records with optional filters, ordering, and limit. \
+             Returns matching records sorted by the specified field or by creation date. \
+             You can filter on 'created_at' or 'updated_at' (record timestamps) and \
+             nested system fields like '_lineage.source' using dot notation.",
+        );
         Self {
             tool_name,
+            tool_description,
             schema,
             db,
         }
@@ -1522,10 +1560,7 @@ impl Tool for CollectionQueryTool {
     }
 
     fn description(&self) -> &str {
-        "Query records with optional filters, ordering, and limit. \
-         Returns matching records sorted by the specified field or by creation date. \
-         You can filter on 'created_at' or 'updated_at' (record timestamps) and \
-         nested system fields like '_lineage.source' using dot notation."
+        &self.tool_description
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1700,6 +1735,7 @@ impl Tool for CollectionQueryTool {
 /// Tool for running aggregation queries on a specific collection.
 pub struct CollectionSummaryTool {
     tool_name: String,
+    tool_description: String,
     schema: CollectionSchema,
     db: Arc<dyn Database>,
 }
@@ -1707,8 +1743,15 @@ pub struct CollectionSummaryTool {
 impl CollectionSummaryTool {
     pub fn new(schema: CollectionSchema, db: Arc<dyn Database>) -> Self {
         let tool_name = tool_name_for(&schema, "summary");
+        let tool_description = scoped_description(
+            &schema,
+            "Summarize records with aggregation operations like sum, count, average, \
+             min, or max. Optionally group results by a field and filter before aggregating. \
+             Filters support 'created_at', 'updated_at', and dot-notation system fields like '_lineage.source'.",
+        );
         Self {
             tool_name,
+            tool_description,
             schema,
             db,
         }
@@ -1726,9 +1769,7 @@ impl Tool for CollectionSummaryTool {
     }
 
     fn description(&self) -> &str {
-        "Summarize records with aggregation operations like sum, count, average, \
-         min, or max. Optionally group results by a field and filter before aggregating. \
-         Filters support 'created_at', 'updated_at', and dot-notation system fields like '_lineage.source'."
+        &self.tool_description
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -3221,6 +3262,91 @@ mod tests {
                     "{scope} should have its own data"
                 );
             }
+        }
+
+        #[tokio::test]
+        async fn collection_write_event_carries_source_scope() {
+            // When writing to a scoped collection, the CollectionWriteEvent should
+            // carry the source scope's user_id, not the caller's.
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            db.register_collection("household", &test_schema("tasks"))
+                .await
+                .unwrap();
+
+            let (tx, mut rx) =
+                tokio::sync::broadcast::channel::<crate::agent::collection_events::CollectionWriteEvent>(10);
+
+            let mut schema = test_schema("tasks");
+            schema.source_scope = Some("household".to_string());
+
+            let tool = CollectionAddTool::new(schema, Arc::clone(&db), Some(tx));
+            let ctx = JobContext::with_user("andrew", "test", "test");
+            tool.execute(serde_json::json!({"item": "test event"}), &ctx)
+                .await
+                .unwrap();
+
+            let event = rx.try_recv().unwrap();
+            assert_eq!(
+                event.user_id, "household",
+                "event should carry source scope, not caller"
+            );
+            assert_eq!(event.collection, "tasks");
+        }
+
+        #[tokio::test]
+        async fn cross_scope_tools_have_prefixed_names() {
+            let mut schema = test_schema("tasks");
+            schema.source_scope = Some("household".to_string());
+
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            let add = CollectionAddTool::new(schema.clone(), Arc::clone(&db), None);
+            assert_eq!(add.name(), "household_tasks_add");
+
+            let query = CollectionQueryTool::new(schema.clone(), Arc::clone(&db));
+            assert_eq!(query.name(), "household_tasks_query");
+
+            let update = CollectionUpdateTool::new(schema.clone(), Arc::clone(&db));
+            assert_eq!(update.name(), "household_tasks_update");
+
+            let delete = CollectionDeleteTool::new(schema.clone(), Arc::clone(&db));
+            assert_eq!(delete.name(), "household_tasks_delete");
+        }
+
+        #[tokio::test]
+        async fn scoped_description_includes_scope_context() {
+            // Cross-scope tools should have descriptions mentioning the scope.
+            let mut schema = test_schema("tasks");
+            schema.source_scope = Some("household".to_string());
+
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            let add = CollectionAddTool::new(schema.clone(), Arc::clone(&db), None);
+            let desc = add.description();
+            assert!(
+                desc.contains("household"),
+                "scoped tool description should mention scope, got: {desc}"
+            );
+        }
+
+        #[tokio::test]
+        async fn own_scope_description_does_not_mention_scope() {
+            let schema = test_schema("tasks");
+
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            let add = CollectionAddTool::new(schema, Arc::clone(&db), None);
+            let desc = add.description();
+            // Own-scope description should not mention any specific scope prefix
+            assert!(
+                !desc.contains("[household]") && !desc.contains("[andrew]"),
+                "own-scope tool should not mention a scope prefix, got: {desc}"
+            );
         }
 
         #[tokio::test]
