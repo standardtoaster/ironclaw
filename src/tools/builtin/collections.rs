@@ -2574,4 +2574,660 @@ mod tests {
             assert!(names.contains(&"inventory"), "should include cross-scope collection");
         }
     }
+
+    #[cfg(feature = "libsql")]
+    mod scoped_access {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+
+        use crate::context::JobContext;
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use crate::db::structured::{CollectionSchema, FieldDef, FieldType};
+        use crate::tools::tool::Tool;
+
+        use super::{
+            CollectionAddTool, CollectionDeleteTool, CollectionListTool, CollectionQueryTool,
+            CollectionUpdateTool,
+        };
+
+        /// Create a minimal collection schema for testing.
+        fn test_schema(name: &str) -> CollectionSchema {
+            let mut fields = BTreeMap::new();
+            fields.insert(
+                "item".to_string(),
+                FieldDef {
+                    field_type: FieldType::Text,
+                    required: true,
+                    default: None,
+                },
+            );
+            CollectionSchema {
+                collection: name.to_string(),
+                description: Some("test collection".to_string()),
+                fields,
+                source_scope: None,
+            }
+        }
+
+        /// Set up a file-backed db without registering any collection.
+        async fn test_db(tmp: &TempDir) -> Arc<dyn Database> {
+            let db_path = tmp.path().join("test.db");
+            let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+            backend.run_migrations().await.unwrap();
+            Arc::new(backend)
+        }
+
+        /// Set up a file-backed db with a collection registered under `owner_id`.
+        async fn setup_db_with_collection(
+            owner_id: &str,
+            collection: &str,
+            tmp: &TempDir,
+        ) -> Arc<dyn Database> {
+            let db = test_db(tmp).await;
+            db.register_collection(owner_id, &test_schema(collection))
+                .await
+                .unwrap();
+            db
+        }
+
+        // ── Schema persistence tests ────────────────────────────────────
+
+        #[tokio::test]
+        async fn source_scope_persists_through_register_and_retrieve() {
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            let mut schema = test_schema("tasks");
+            schema.source_scope = Some("household".to_string());
+
+            db.register_collection("andrew", &schema).await.unwrap();
+
+            let retrieved = db
+                .get_collection_schema("andrew", "tasks")
+                .await
+                .unwrap()
+                .expect("schema should exist");
+            assert_eq!(
+                retrieved.source_scope,
+                Some("household".to_string()),
+                "source_scope should survive register + retrieve round-trip"
+            );
+        }
+
+        #[tokio::test]
+        async fn source_scope_none_for_own_collection() {
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            let schema = test_schema("personal_tasks");
+            // source_scope is None by default from test_schema
+            db.register_collection("andrew", &schema).await.unwrap();
+
+            let retrieved = db
+                .get_collection_schema("andrew", "personal_tasks")
+                .await
+                .unwrap()
+                .expect("schema should exist");
+            assert_eq!(
+                retrieved.source_scope, None,
+                "own-scope collection should have source_scope = None"
+            );
+        }
+
+        #[tokio::test]
+        async fn source_scope_survives_re_registration() {
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            let mut schema = test_schema("tasks");
+            schema.source_scope = Some("household".to_string());
+
+            db.register_collection("andrew", &schema).await.unwrap();
+            // Re-register the same schema.
+            db.register_collection("andrew", &schema).await.unwrap();
+
+            let retrieved = db
+                .get_collection_schema("andrew", "tasks")
+                .await
+                .unwrap()
+                .expect("schema should exist after re-registration");
+            assert_eq!(
+                retrieved.source_scope,
+                Some("household".to_string()),
+                "source_scope should survive re-registration"
+            );
+        }
+
+        // ── Write isolation tests ───────────────────────────────────────
+
+        #[tokio::test]
+        async fn scoped_add_writes_to_source_scope_not_caller() {
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            // Register the collection under household (the actual data owner).
+            db.register_collection("household", &test_schema("tasks"))
+                .await
+                .unwrap();
+
+            // Andrew has a scoped schema pointing at household.
+            let mut schema = test_schema("tasks");
+            schema.source_scope = Some("household".to_string());
+
+            let tool = CollectionAddTool::new(schema, Arc::clone(&db), None);
+
+            // Andrew calls the tool.
+            let ctx = JobContext::with_user("andrew", "test", "test");
+            let result = tool
+                .execute(serde_json::json!({"item": "buy milk"}), &ctx)
+                .await
+                .unwrap();
+            assert_eq!(result.result["status"], "created");
+
+            // The record should be in household's scope, not andrew's.
+            let household_records = db
+                .query_records("household", "tasks", &[], None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                household_records.len(),
+                1,
+                "record should be written to household scope"
+            );
+
+            let andrew_records = db
+                .query_records("andrew", "tasks", &[], None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                andrew_records.len(),
+                0,
+                "record should NOT be in andrew's scope"
+            );
+        }
+
+        #[tokio::test]
+        async fn own_scope_add_writes_to_caller() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("andrew", "personal_tasks", &tmp).await;
+
+            // No source_scope — writes to caller's scope.
+            let schema = test_schema("personal_tasks");
+            let tool = CollectionAddTool::new(schema, Arc::clone(&db), None);
+
+            let ctx = JobContext::with_user("andrew", "test", "test");
+            let result = tool
+                .execute(serde_json::json!({"item": "read a book"}), &ctx)
+                .await
+                .unwrap();
+            assert_eq!(result.result["status"], "created");
+
+            let records = db
+                .query_records("andrew", "personal_tasks", &[], None, None)
+                .await
+                .unwrap();
+            assert_eq!(records.len(), 1, "record should be in andrew's own scope");
+        }
+
+        #[tokio::test]
+        async fn scoped_update_modifies_source_scope() {
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            db.register_collection("household", &test_schema("tasks"))
+                .await
+                .unwrap();
+
+            // Insert a record directly into household.
+            let record_id = db
+                .insert_record(
+                    "household",
+                    "tasks",
+                    serde_json::json!({"item": "buy milk"}),
+                )
+                .await
+                .unwrap();
+
+            // Andrew's scoped update tool.
+            let mut schema = test_schema("tasks");
+            schema.source_scope = Some("household".to_string());
+
+            let tool = CollectionUpdateTool::new(schema, Arc::clone(&db));
+
+            let ctx = JobContext::with_user("andrew", "test", "test");
+            let result = tool
+                .execute(
+                    serde_json::json!({
+                        "record_id": record_id.to_string(),
+                        "item": "buy oat milk"
+                    }),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.result["status"], "updated");
+
+            // Verify the household record was updated.
+            let records = db
+                .query_records("household", "tasks", &[], None, None)
+                .await
+                .unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].data["item"], "buy oat milk");
+        }
+
+        #[tokio::test]
+        async fn scoped_delete_removes_from_source_scope() {
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            db.register_collection("household", &test_schema("tasks"))
+                .await
+                .unwrap();
+
+            let record_id = db
+                .insert_record(
+                    "household",
+                    "tasks",
+                    serde_json::json!({"item": "buy milk"}),
+                )
+                .await
+                .unwrap();
+
+            let mut schema = test_schema("tasks");
+            schema.source_scope = Some("household".to_string());
+
+            let tool = CollectionDeleteTool::new(schema, Arc::clone(&db));
+
+            let ctx = JobContext::with_user("andrew", "test", "test");
+            let result = tool
+                .execute(
+                    serde_json::json!({"record_id": record_id.to_string()}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.result["status"], "deleted");
+
+            let records = db
+                .query_records("household", "tasks", &[], None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                records.len(),
+                0,
+                "record should be deleted from household scope"
+            );
+        }
+
+        #[tokio::test]
+        async fn scoped_query_reads_from_source_scope() {
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            db.register_collection("household", &test_schema("tasks"))
+                .await
+                .unwrap();
+
+            db.insert_record(
+                "household",
+                "tasks",
+                serde_json::json!({"item": "vacuum living room"}),
+            )
+            .await
+            .unwrap();
+
+            let mut schema = test_schema("tasks");
+            schema.source_scope = Some("household".to_string());
+
+            let tool = CollectionQueryTool::new(schema, Arc::clone(&db));
+
+            // Andrew queries via his scoped tool — should read household data.
+            let ctx = JobContext::with_user("andrew", "test", "test");
+            let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+            assert_eq!(
+                result.result["count"], 1,
+                "scoped query should read from household"
+            );
+            assert_eq!(result.result["results"][0]["data"]["item"], "vacuum living room");
+        }
+
+        // ── Privacy boundary tests ──────────────────────────────────────
+
+        #[tokio::test]
+        async fn personal_item_does_not_leak_to_household() {
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            // Set up both scopes.
+            db.register_collection("andrew", &test_schema("tasks"))
+                .await
+                .unwrap();
+            db.register_collection("household", &test_schema("tasks"))
+                .await
+                .unwrap();
+
+            // Andrew's personal tasks tool (no source_scope).
+            let personal_schema = test_schema("tasks");
+            let tool = CollectionAddTool::new(personal_schema, Arc::clone(&db), None);
+
+            let ctx = JobContext::with_user("andrew", "test", "test");
+            tool.execute(serde_json::json!({"item": "buy butt cream"}), &ctx)
+                .await
+                .unwrap();
+
+            // Household should have zero records.
+            let household_records = db
+                .query_records("household", "tasks", &[], None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                household_records.len(),
+                0,
+                "personal item must not leak to household"
+            );
+
+            // Andrew should have the record.
+            let andrew_records = db
+                .query_records("andrew", "tasks", &[], None, None)
+                .await
+                .unwrap();
+            assert_eq!(andrew_records.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn household_item_does_not_leak_to_personal() {
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            db.register_collection("andrew", &test_schema("tasks"))
+                .await
+                .unwrap();
+            db.register_collection("household", &test_schema("tasks"))
+                .await
+                .unwrap();
+
+            // Andrew's household-scoped tool.
+            let mut household_schema = test_schema("tasks");
+            household_schema.source_scope = Some("household".to_string());
+            let tool = CollectionAddTool::new(household_schema, Arc::clone(&db), None);
+
+            let ctx = JobContext::with_user("andrew", "test", "test");
+            tool.execute(serde_json::json!({"item": "clean gutters"}), &ctx)
+                .await
+                .unwrap();
+
+            // Andrew's own scope should be empty.
+            let andrew_records = db
+                .query_records("andrew", "tasks", &[], None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                andrew_records.len(),
+                0,
+                "household item must not leak to andrew's personal scope"
+            );
+
+            // Household should have the record.
+            let household_records = db
+                .query_records("household", "tasks", &[], None, None)
+                .await
+                .unwrap();
+            assert_eq!(household_records.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn own_scope_lens_gets_no_cross_scope_tools() {
+            // When source_scope is None, the tool name should NOT have a
+            // scope prefix — it's just "{collection}_{op}".
+            let schema = test_schema("tasks");
+            assert!(
+                schema.source_scope.is_none(),
+                "own-scope schema should have no source_scope"
+            );
+
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("andrew", "tasks", &tmp).await;
+
+            let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db), None);
+            assert_eq!(add_tool.name(), "tasks_add", "tool name should have no prefix");
+
+            let query_tool = CollectionQueryTool::new(schema.clone(), Arc::clone(&db));
+            assert_eq!(query_tool.name(), "tasks_query");
+
+            let update_tool = CollectionUpdateTool::new(schema.clone(), Arc::clone(&db));
+            assert_eq!(update_tool.name(), "tasks_update");
+
+            let delete_tool = CollectionDeleteTool::new(schema, Arc::clone(&db));
+            assert_eq!(delete_tool.name(), "tasks_delete");
+        }
+
+        // ── Edge case tests ─────────────────────────────────────────────
+
+        #[tokio::test]
+        async fn scoped_write_to_nonexistent_source_scope_fails_gracefully() {
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            // No collection registered for "nonexistent" scope.
+            let mut schema = test_schema("tasks");
+            schema.source_scope = Some("nonexistent".to_string());
+
+            let tool = CollectionAddTool::new(schema, Arc::clone(&db), None);
+            let ctx = JobContext::with_user("andrew", "test", "test");
+
+            let result = tool
+                .execute(serde_json::json!({"item": "should fail"}), &ctx)
+                .await;
+            assert!(
+                result.is_err(),
+                "writing to a nonexistent source scope should fail"
+            );
+        }
+
+        #[tokio::test]
+        async fn scoped_delete_wrong_scope_record_fails() {
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            db.register_collection("household", &test_schema("tasks"))
+                .await
+                .unwrap();
+            db.register_collection("andrew", &test_schema("tasks"))
+                .await
+                .unwrap();
+
+            // Insert a record in household's scope.
+            let household_record_id = db
+                .insert_record(
+                    "household",
+                    "tasks",
+                    serde_json::json!({"item": "household chore"}),
+                )
+                .await
+                .unwrap();
+
+            // Andrew's personal delete tool (no source_scope).
+            let schema = test_schema("tasks");
+            let tool = CollectionDeleteTool::new(schema, Arc::clone(&db));
+
+            let ctx = JobContext::with_user("andrew", "test", "test");
+            let result = tool
+                .execute(
+                    serde_json::json!({"record_id": household_record_id.to_string()}),
+                    &ctx,
+                )
+                .await;
+
+            // The delete should fail or be a no-op because andrew's scope
+            // doesn't own the household record.
+            if result.is_ok() {
+                // Even if the tool returns success, the record should still exist
+                // in household's scope (it must not have been deleted).
+                let records = db
+                    .query_records("household", "tasks", &[], None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    records.len(),
+                    1,
+                    "personal delete tool must not delete household records"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn scoped_update_wrong_scope_record_fails() {
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            db.register_collection("household", &test_schema("tasks"))
+                .await
+                .unwrap();
+            db.register_collection("andrew", &test_schema("tasks"))
+                .await
+                .unwrap();
+
+            // Insert a record in household's scope.
+            let household_record_id = db
+                .insert_record(
+                    "household",
+                    "tasks",
+                    serde_json::json!({"item": "household chore"}),
+                )
+                .await
+                .unwrap();
+
+            // Andrew's personal update tool (no source_scope).
+            let schema = test_schema("tasks");
+            let tool = CollectionUpdateTool::new(schema, Arc::clone(&db));
+
+            let ctx = JobContext::with_user("andrew", "test", "test");
+            let result = tool
+                .execute(
+                    serde_json::json!({
+                        "record_id": household_record_id.to_string(),
+                        "item": "hijacked"
+                    }),
+                    &ctx,
+                )
+                .await;
+
+            // The update should fail or be a no-op.
+            if result.is_ok() {
+                let records = db
+                    .query_records("household", "tasks", &[], None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    records[0].data["item"], "household chore",
+                    "personal update tool must not modify household records"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn multiple_scopes_same_collection_independent_data() {
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            // Three scopes, same collection name.
+            for scope in &["andrew", "household", "family"] {
+                db.register_collection(scope, &test_schema("tasks"))
+                    .await
+                    .unwrap();
+            }
+
+            // Insert different data in each scope.
+            db.insert_record(
+                "andrew",
+                "tasks",
+                serde_json::json!({"item": "andrew's task"}),
+            )
+            .await
+            .unwrap();
+            db.insert_record(
+                "household",
+                "tasks",
+                serde_json::json!({"item": "household task"}),
+            )
+            .await
+            .unwrap();
+            db.insert_record(
+                "family",
+                "tasks",
+                serde_json::json!({"item": "family task"}),
+            )
+            .await
+            .unwrap();
+
+            // Each scope should see only its own data.
+            for (scope, expected_item) in &[
+                ("andrew", "andrew's task"),
+                ("household", "household task"),
+                ("family", "family task"),
+            ] {
+                let records = db
+                    .query_records(scope, "tasks", &[], None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(records.len(), 1, "{scope} should have exactly 1 record");
+                assert_eq!(
+                    records[0].data["item"], *expected_item,
+                    "{scope} should have its own data"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn list_collections_includes_scoped_with_source_scope() {
+            let tmp = TempDir::new().unwrap();
+            let db = test_db(&tmp).await;
+
+            // Register a personal collection under andrew.
+            db.register_collection("andrew", &test_schema("notes"))
+                .await
+                .unwrap();
+
+            // Register a scoped collection under andrew pointing at household.
+            let mut scoped_schema = test_schema("tasks");
+            scoped_schema.source_scope = Some("household".to_string());
+            db.register_collection("andrew", &scoped_schema)
+                .await
+                .unwrap();
+
+            let tool = CollectionListTool::new(Arc::clone(&db));
+            let ctx = JobContext::with_user("andrew", "test", "test");
+
+            let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+            let collections = result.result["collections"].as_array().unwrap();
+
+            assert_eq!(collections.len(), 2, "should list both collections");
+
+            // Find the scoped collection and verify source_scope is exposed.
+            let tasks_entry = collections
+                .iter()
+                .find(|c| c["collection"].as_str() == Some("tasks"))
+                .expect("tasks collection should be listed");
+            assert_eq!(
+                tasks_entry["source_scope"].as_str(),
+                Some("household"),
+                "list_collections should expose source_scope for scoped collections"
+            );
+
+            // Personal collection should have no source_scope (null).
+            let notes_entry = collections
+                .iter()
+                .find(|c| c["collection"].as_str() == Some("notes"))
+                .expect("notes collection should be listed");
+            assert!(
+                notes_entry.get("source_scope").is_none()
+                    || notes_entry["source_scope"].is_null(),
+                "personal collection should have no source_scope"
+            );
+        }
+    }
 }
