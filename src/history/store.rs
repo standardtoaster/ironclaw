@@ -247,6 +247,7 @@ impl Store {
                     // TODO(#661): persist user_timezone in agent_jobs table so
                     // background/routine jobs retain the session's timezone context.
                     user_timezone: "UTC".to_string(),
+                    workspace_read_scopes: Vec::new(),
                 }))
             }
             None => Ok(None),

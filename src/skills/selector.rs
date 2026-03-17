@@ -37,11 +37,16 @@ pub struct ScoredSkill<'a> {
 ///
 /// Returns skills sorted by score (highest first), limited by `max_candidates`
 /// and total context budget. No LLM is involved in this selection.
+///
+/// If `user_id` is provided, skills with a `scope` field are filtered: only
+/// skills whose scope matches the user_id (or skills without a scope) are
+/// considered. If `user_id` is `None`, scope filtering is skipped.
 pub fn prefilter_skills<'a>(
     message: &str,
     available_skills: &'a [LoadedSkill],
     max_candidates: usize,
     max_context_tokens: usize,
+    user_id: Option<&str>,
 ) -> Vec<&'a LoadedSkill> {
     if available_skills.is_empty() || message.is_empty() {
         return vec![];
@@ -51,6 +56,15 @@ pub fn prefilter_skills<'a>(
 
     let mut scored: Vec<ScoredSkill<'a>> = available_skills
         .iter()
+        .filter(|skill| {
+            // Scope check: if the skill has a scope and we have a user_id,
+            // skip skills that don't match this user.
+            if let (Some(scope), Some(uid)) = (&skill.manifest.scope, user_id) {
+                scope.matches(uid)
+            } else {
+                true
+            }
+        })
         .filter_map(|skill| {
             let score = score_skill(skill, &message_lower, message);
             if score > 0 {
@@ -171,8 +185,11 @@ mod tests {
                     patterns: pattern_strings,
                     tags: tag_vec,
                     max_context_tokens: 1000,
+                    tools_prefix: None,
+                    script: None,
                 },
                 metadata: None,
+                scope: None,
             },
             prompt_content: "Test prompt".to_string(),
             trust: SkillTrust::Trusted,
@@ -188,7 +205,7 @@ mod tests {
     #[test]
     fn test_empty_message_returns_nothing() {
         let skills = vec![make_skill("test", &["write"], &[], &[])];
-        let result = prefilter_skills("", &skills, 3, MAX_SKILL_CONTEXT_TOKENS);
+        let result = prefilter_skills("", &skills, 3, MAX_SKILL_CONTEXT_TOKENS, None);
         assert!(result.is_empty());
     }
 
@@ -200,6 +217,7 @@ mod tests {
             &skills,
             3,
             MAX_SKILL_CONTEXT_TOKENS,
+            None,
         );
         assert!(result.is_empty());
     }
@@ -212,6 +230,7 @@ mod tests {
             &skills,
             3,
             MAX_SKILL_CONTEXT_TOKENS,
+            None,
         );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name(), "writing");
@@ -225,6 +244,7 @@ mod tests {
             &skills,
             3,
             MAX_SKILL_CONTEXT_TOKENS,
+            None,
         );
         assert_eq!(result.len(), 1);
     }
@@ -237,6 +257,7 @@ mod tests {
             &skills,
             3,
             MAX_SKILL_CONTEXT_TOKENS,
+            None,
         );
         assert_eq!(result.len(), 1);
     }
@@ -254,6 +275,7 @@ mod tests {
             &skills,
             3,
             MAX_SKILL_CONTEXT_TOKENS,
+            None,
         );
         assert_eq!(result.len(), 1);
     }
@@ -274,6 +296,7 @@ mod tests {
             &skills,
             3,
             MAX_SKILL_CONTEXT_TOKENS,
+            None,
         );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name(), "writing");
@@ -286,7 +309,7 @@ mod tests {
             make_skill("b", &["test"], &[], &[]),
             make_skill("c", &["test"], &[], &[]),
         ];
-        let result = prefilter_skills("test", &skills, 2, MAX_SKILL_CONTEXT_TOKENS);
+        let result = prefilter_skills("test", &skills, 2, MAX_SKILL_CONTEXT_TOKENS, None);
         assert_eq!(result.len(), 2);
     }
 
@@ -299,14 +322,14 @@ mod tests {
 
         let skills = vec![skill, skill2];
         // Budget of 4000 can only fit one 3000-token skill
-        let result = prefilter_skills("test", &skills, 5, 4000);
+        let result = prefilter_skills("test", &skills, 5, 4000, None);
         assert_eq!(result.len(), 1);
     }
 
     #[test]
     fn test_invalid_regex_handled_gracefully() {
         let skills = vec![make_skill("bad", &["test"], &[], &["[invalid regex"])];
-        let result = prefilter_skills("test", &skills, 3, MAX_SKILL_CONTEXT_TOKENS);
+        let result = prefilter_skills("test", &skills, 3, MAX_SKILL_CONTEXT_TOKENS, None);
         assert_eq!(result.len(), 1);
     }
 
@@ -322,6 +345,7 @@ mod tests {
             &skills,
             3,
             MAX_SKILL_CONTEXT_TOKENS,
+            None,
         );
         assert_eq!(result.len(), 1);
     }
@@ -338,6 +362,7 @@ mod tests {
             &skills,
             3,
             MAX_SKILL_CONTEXT_TOKENS,
+            None,
         );
         assert_eq!(result.len(), 1);
     }
@@ -362,6 +387,7 @@ mod tests {
             &skills,
             3,
             MAX_SKILL_CONTEXT_TOKENS,
+            None,
         );
         assert_eq!(result.len(), 1);
     }
@@ -376,7 +402,7 @@ mod tests {
         skill2.prompt_content = String::new();
 
         let skills = vec![skill, skill2];
-        let result = prefilter_skills("test", &skills, 5, 1);
+        let result = prefilter_skills("test", &skills, 5, 1, None);
         assert_eq!(result.len(), 1);
     }
 
@@ -412,6 +438,7 @@ mod tests {
             &skills,
             3,
             MAX_SKILL_CONTEXT_TOKENS,
+            None,
         );
         assert!(
             result.is_empty(),
@@ -434,6 +461,7 @@ mod tests {
             &skills,
             3,
             MAX_SKILL_CONTEXT_TOKENS,
+            None,
         );
         assert_eq!(
             result.len(),
@@ -458,6 +486,7 @@ mod tests {
             &skills,
             3,
             MAX_SKILL_CONTEXT_TOKENS,
+            None,
         );
         assert!(
             result.is_empty(),
@@ -480,10 +509,123 @@ mod tests {
             &skills,
             3,
             MAX_SKILL_CONTEXT_TOKENS,
+            None,
         );
         assert!(
             result.is_empty(),
             "exclude_keyword veto should be case-insensitive"
         );
+    }
+
+    // --- scope tests ---
+
+    fn make_scoped_skill(
+        name: &str,
+        keywords: &[&str],
+        scope: Option<crate::skills::SkillScope>,
+    ) -> LoadedSkill {
+        let mut skill = make_skill(name, keywords, &[], &[]);
+        skill.manifest.scope = scope;
+        skill
+    }
+
+    #[test]
+    fn test_scope_single_activates_for_matching_user() {
+        let skills = vec![make_scoped_skill(
+            "alice-skill",
+            &["test"],
+            Some(crate::skills::SkillScope::Single("alice".to_string())),
+        )];
+        let result = prefilter_skills(
+            "test",
+            &skills,
+            3,
+            MAX_SKILL_CONTEXT_TOKENS,
+            Some("alice"),
+        );
+        assert_eq!(result.len(), 1, "skill should activate for matching user");
+    }
+
+    #[test]
+    fn test_scope_single_skips_non_matching_user() {
+        let skills = vec![make_scoped_skill(
+            "alice-skill",
+            &["test"],
+            Some(crate::skills::SkillScope::Single("alice".to_string())),
+        )];
+        let result = prefilter_skills(
+            "test",
+            &skills,
+            3,
+            MAX_SKILL_CONTEXT_TOKENS,
+            Some("bob"),
+        );
+        assert!(result.is_empty(), "skill should not activate for non-matching user");
+    }
+
+    #[test]
+    fn test_scope_multiple_activates_for_listed_users() {
+        let skills = vec![make_scoped_skill(
+            "shared-skill",
+            &["test"],
+            Some(crate::skills::SkillScope::Multiple(vec![
+                "alice".to_string(),
+                "bob".to_string(),
+            ])),
+        )];
+        let result_alice = prefilter_skills(
+            "test",
+            &skills,
+            3,
+            MAX_SKILL_CONTEXT_TOKENS,
+            Some("alice"),
+        );
+        let result_bob = prefilter_skills(
+            "test",
+            &skills,
+            3,
+            MAX_SKILL_CONTEXT_TOKENS,
+            Some("bob"),
+        );
+        let result_charlie = prefilter_skills(
+            "test",
+            &skills,
+            3,
+            MAX_SKILL_CONTEXT_TOKENS,
+            Some("charlie"),
+        );
+        assert_eq!(result_alice.len(), 1);
+        assert_eq!(result_bob.len(), 1);
+        assert!(result_charlie.is_empty());
+    }
+
+    #[test]
+    fn test_no_scope_activates_for_everyone() {
+        let skills = vec![make_scoped_skill("global-skill", &["test"], None)];
+        let result = prefilter_skills(
+            "test",
+            &skills,
+            3,
+            MAX_SKILL_CONTEXT_TOKENS,
+            Some("anyone"),
+        );
+        assert_eq!(result.len(), 1, "unscoped skill should activate for any user");
+    }
+
+    #[test]
+    fn test_scope_ignored_when_no_user_id() {
+        let skills = vec![make_scoped_skill(
+            "scoped-skill",
+            &["test"],
+            Some(crate::skills::SkillScope::Single("alice".to_string())),
+        )];
+        let result = prefilter_skills(
+            "test",
+            &skills,
+            3,
+            MAX_SKILL_CONTEXT_TOKENS,
+            None,
+        );
+        assert_eq!(result.len(), 1, "scope should be ignored when user_id is None");
     }
 }

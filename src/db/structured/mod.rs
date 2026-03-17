@@ -52,6 +52,10 @@ pub struct CollectionSchema {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub fields: BTreeMap<String, FieldDef>,
+    /// When set, all tools for this collection operate on the source scope's data
+    /// instead of the caller's. Used for cross-lens collection access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_scope: Option<String>,
 }
 
 // ==================== Record ====================
@@ -188,6 +192,71 @@ pub enum ValidationError {
 /// ingest API and bypass schema validation.
 pub fn is_system_field(name: &str) -> bool {
     name.starts_with('_')
+}
+
+// ==================== History Tracking ====================
+
+/// Initialize the `_history` array on a newly inserted record.
+///
+/// Creates a single "insert" entry containing all user-visible fields
+/// (those not prefixed with `_`).
+pub fn init_history(data: &mut serde_json::Value, source: &str) {
+    let fields: serde_json::Value = data
+        .as_object()
+        .map(|obj| {
+            let user_fields: serde_json::Map<String, serde_json::Value> = obj
+                .iter()
+                .filter(|(k, _)| !k.starts_with('_'))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            serde_json::Value::Object(user_fields)
+        })
+        .unwrap_or(serde_json::Value::Null);
+
+    let entry = serde_json::json!({
+        "op": "insert",
+        "time": chrono::Utc::now().to_rfc3339(),
+        "source": source,
+        "fields": fields,
+    });
+    data["_history"] = serde_json::json!([entry]);
+}
+
+/// Append an "update" entry to an existing record's `_history` array.
+///
+/// `changed_fields` should contain only the fields being modified (not
+/// system fields). If the record has no `_history` yet (e.g., pre-existing
+/// records), a new array is created.
+pub fn append_history(
+    data: &mut serde_json::Value,
+    changed_fields: &serde_json::Value,
+    source: &str,
+) {
+    // Filter out system fields from changed_fields for the history entry.
+    let user_fields: serde_json::Value = changed_fields
+        .as_object()
+        .map(|obj| {
+            let filtered: serde_json::Map<String, serde_json::Value> = obj
+                .iter()
+                .filter(|(k, _)| !k.starts_with('_'))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            serde_json::Value::Object(filtered)
+        })
+        .unwrap_or(serde_json::Value::Null);
+
+    let entry = serde_json::json!({
+        "op": "update",
+        "time": chrono::Utc::now().to_rfc3339(),
+        "source": source,
+        "fields": user_fields,
+    });
+
+    if let Some(history) = data.get_mut("_history").and_then(|h| h.as_array_mut()) {
+        history.push(entry);
+    } else {
+        data["_history"] = serde_json::json!([entry]);
+    }
 }
 
 // ==================== Name Validation ====================
@@ -428,7 +497,8 @@ impl CollectionSchema {
 
     /// Validate a partial update against this schema. Does not check for
     /// missing required fields (since this is a partial update), but does
-    /// validate types and reject unknown fields.
+    /// validate types and reject unknown fields. System fields (prefixed
+    /// with `_`) pass through without validation.
     pub fn validate_partial(
         &self,
         data: &serde_json::Value,
@@ -441,16 +511,26 @@ impl CollectionSchema {
                 got: json_type_name(data).to_string(),
             })?;
 
-        // Reject unknown fields.
+        // Reject unknown fields (system fields pass through).
         for key in obj.keys() {
-            if !self.fields.contains_key(key) {
+            if !self.fields.contains_key(key) && !is_system_field(key) {
                 return Err(ValidationError::UnknownField { field: key.clone() });
             }
         }
 
         let mut result = serde_json::Map::new();
 
+        // Pass through system fields without validation.
+        for (key, value) in obj {
+            if is_system_field(key) {
+                result.insert(key.clone(), value.clone());
+            }
+        }
+
         for (field_name, value) in obj {
+            if is_system_field(field_name) {
+                continue; // Already handled above.
+            }
             if let Some(field_def) = self.fields.get(field_name) {
                 if value.is_null() {
                     // Reject null for required fields — would leave the record

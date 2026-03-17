@@ -149,6 +149,12 @@ impl Trigger {
                     .get("secret")
                     .and_then(|v| v.as_str())
                     .map(String::from);
+                if secret.is_none() {
+                    return Err(RoutineError::MissingField {
+                        context: "webhook trigger".into(),
+                        field: "secret".into(),
+                    });
+                }
                 Ok(Trigger::Webhook { path, secret })
             }
             "manual" => Ok(Trigger::Manual),
@@ -764,7 +770,7 @@ mod tests {
     #[test]
     fn test_collection_write_trigger_db_roundtrip() {
         let trigger = Trigger::CollectionWrite {
-            collection: "nanny_shifts".to_string(),
+            collection: "time_entries".to_string(),
         };
         let tag = trigger.type_tag();
         let config_json = trigger.to_config_json();
@@ -773,7 +779,7 @@ mod tests {
 
         let restored = Trigger::from_db(tag, config_json).unwrap();
         match restored {
-            Trigger::CollectionWrite { collection } => assert_eq!(collection, "nanny_shifts"),
+            Trigger::CollectionWrite { collection } => assert_eq!(collection, "time_entries"),
             _ => panic!("Expected CollectionWrite"),
         }
     }
@@ -922,16 +928,28 @@ mod tests {
     }
 
     #[test]
-    fn test_webhook_trigger_roundtrip_no_optional_fields() {
+    fn test_webhook_trigger_roundtrip_no_optional_path() {
         let trigger = Trigger::Webhook {
             path: None,
-            secret: None,
+            secret: Some("my-secret".to_string()),
         };
         let json = trigger.to_config_json();
         let parsed = Trigger::from_db("webhook", json).expect("parse webhook");
         assert!(matches!(
             parsed,
-            Trigger::Webhook { path: None, secret: None }
+            Trigger::Webhook { path: None, secret: Some(s) } if s == "my-secret"
         ));
+    }
+
+    #[test]
+    fn test_webhook_trigger_requires_secret() {
+        let json = serde_json::json!({"path": "/my-hook"});
+        let result = Trigger::from_db("webhook", json);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("secret"),
+            "Error should mention 'secret': {err}"
+        );
     }
 }

@@ -166,6 +166,10 @@ pub struct JobContext {
     pub tool_output_stash: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     /// User's preferred timezone (IANA name, e.g. "America/New_York"). Defaults to "UTC".
     pub user_timezone: String,
+    /// Additional user scopes this user can read from (e.g. other lenses' collections).
+    /// Used by collection tools for cross-scope reads.
+    #[serde(default)]
+    pub workspace_read_scopes: Vec<String>,
 }
 
 impl JobContext {
@@ -206,6 +210,7 @@ impl JobContext {
             metadata: serde_json::Value::Null,
             tool_output_stash: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             user_timezone: "UTC".to_string(),
+            workspace_read_scopes: Vec::new(),
         }
     }
 

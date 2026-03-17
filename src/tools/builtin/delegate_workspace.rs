@@ -71,7 +71,7 @@ impl Tool for DelegateToWorkspaceTool {
                 },
                 "workspace_hint": {
                     "type": "string",
-                    "description": "Optional topic hint for routing (e.g. 'grocery list', 'nanny schedule'). Helps match the right workspace when multiple exist."
+                    "description": "Optional topic hint for routing (e.g. 'grocery list', 'project tracker'). Helps match the right workspace when multiple exist."
                 },
                 "workspace_id": {
                     "type": "string",

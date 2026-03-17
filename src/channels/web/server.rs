@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Query, State, WebSocketUpgrade},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware,
     response::{
         IntoResponse,
@@ -29,6 +29,10 @@ use crate::agent::SessionManager;
 use crate::bootstrap::ironclaw_base_dir;
 use crate::channels::IncomingMessage;
 use crate::channels::web::auth::{AuthenticatedUser, MultiAuthState, UserIdentity, auth_middleware};
+use crate::channels::web::handlers::collections::{
+    collections_delete_handler, collections_insert_handler, collections_list_handler,
+    collections_query_handler, collections_register_handler, collections_update_handler,
+};
 use crate::channels::web::handlers::events::events_ingest_handler;
 use crate::channels::web::handlers::jobs::{
     job_files_list_handler, job_files_read_handler, jobs_cancel_handler, jobs_detail_handler,
@@ -410,6 +414,17 @@ pub async fn start_server(
         .route("/api/jobs/{id}/files/read", get(job_files_read_handler))
         // Event ingest
         .route("/api/events/ingest", post(events_ingest_handler))
+        // Collections REST API
+        .route("/api/collections", get(collections_list_handler).post(collections_register_handler))
+        .route(
+            "/api/collections/{name}",
+            get(collections_query_handler).post(collections_insert_handler),
+        )
+        .route(
+            "/api/collections/{name}/{id}",
+            axum::routing::patch(collections_update_handler)
+                .delete(collections_delete_handler),
+        )
         // Logs
         .route("/api/logs/events", get(logs_events_handler))
         .route("/api/logs/level", get(logs_level_get_handler))
@@ -441,7 +456,7 @@ pub async fn start_server(
             post(pairing_approve_handler),
         )
         // Routines
-        .route("/api/routines", get(routines_list_handler))
+        .route("/api/routines", get(routines_list_handler).post(crate::channels::web::handlers::routines::routines_create_handler))
         .route("/api/routines/summary", get(routines_summary_handler))
         .route("/api/routines/{id}", get(routines_detail_handler))
         .route("/api/routines/{id}/trigger", post(routines_trigger_handler))
@@ -527,6 +542,7 @@ pub async fn start_server(
         .allow_headers(AllowHeaders::list([
             header::CONTENT_TYPE,
             header::AUTHORIZATION,
+            "X-Webhook-Secret".parse().expect("valid header name"),
         ]))
         .allow_credentials(true);
 
@@ -882,6 +898,9 @@ async fn chat_send_handler(
     }
     if let Some(ref ws_id) = req.workspace_id {
         meta["workspace_id"] = serde_json::Value::String(ws_id.clone());
+    }
+    if !user.workspace_read_scopes.is_empty() {
+        meta["workspace_read_scopes"] = serde_json::json!(user.workspace_read_scopes);
     }
     msg = msg.with_metadata(meta);
 
@@ -1338,10 +1357,20 @@ async fn chat_threads_handler(
             .list_conversations_all_channels(&user.user_id, 50)
             .await
         {
+            // Build conversation_id → workspace topic map
+            let workspace_topics: std::collections::HashMap<uuid::Uuid, String> = store
+                .list_agent_workspaces(&user.user_id, Some("active"))
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|ws| (ws.conversation_id, ws.topic))
+                .collect();
+
             let mut assistant_thread = None;
             let mut threads = Vec::new();
 
             for s in &summaries {
+                let topic = workspace_topics.get(&s.id).cloned();
                 let info = ThreadInfo {
                     id: s.id,
                     state: "Idle".to_string(),
@@ -1351,7 +1380,7 @@ async fn chat_threads_handler(
                     title: s.title.clone(),
                     thread_type: s.thread_type.clone(),
                     channel: Some(s.channel.clone()),
-                    workspace_topic: None,
+                    workspace_topic: topic,
                 };
 
                 if s.id == assistant_id {
@@ -2605,17 +2634,69 @@ struct WebhookBody {
 
 async fn webhook_fire_handler(
     State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
     Path(id): Path<String>,
+    headers: HeaderMap,
     body: Option<Json<WebhookBody>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let routine_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
+
+    // Look up the routine to validate the webhook secret before firing.
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Store not available".to_string(),
+    ))?;
+
+    tracing::debug!("webhook_fire: looking up routine {}", routine_id);
+    let routine = store
+        .get_routine(routine_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("webhook_fire: get_routine error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?
+        .ok_or_else(|| {
+            tracing::warn!("webhook_fire: routine {} not found via get_routine", routine_id);
+            (StatusCode::NOT_FOUND, "Routine not found".to_string())
+        })?;
+
+    // Validate webhook secret using constant-time comparison.
+    if let crate::agent::routine::Trigger::Webhook { ref secret, .. } = routine.trigger {
+        let expected = secret.as_deref().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Routine webhook has no secret configured".to_string(),
+        ))?;
+        let provided = headers
+            .get("X-Webhook-Secret")
+            .and_then(|v| v.to_str().ok())
+            .ok_or((
+                StatusCode::UNAUTHORIZED,
+                "Missing X-Webhook-Secret header".to_string(),
+            ))?;
+        if !bool::from(
+            subtle::ConstantTimeEq::ct_eq(provided.as_bytes(), expected.as_bytes()),
+        ) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "Invalid webhook secret".to_string(),
+            ));
+        }
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Routine has trigger type '{}', not 'webhook'",
+                routine.trigger.type_tag()
+            ),
+        ));
+    }
+
     let engine_guard = state.routine_engine.read().await;
     let engine = engine_guard.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Routine engine not available".to_string(),
     ))?;
-
-    let routine_id = Uuid::parse_str(&id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
 
     let payload_str = body.and_then(|Json(b)| {
         b.payload.map(|v| {
@@ -2628,7 +2709,7 @@ async fn webhook_fire_handler(
     });
 
     match engine
-        .fire_webhook(routine_id, &state.default_user_id, payload_str)
+        .fire_webhook(routine_id, &user.user_id, payload_str)
         .await
     {
         Ok(run_id) => Ok(Json(serde_json::json!({

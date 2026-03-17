@@ -10,6 +10,7 @@
 //! Lightweight routines execute inline (single LLM call, no scheduler slot).
 //! Full-job routines are delegated to the existing `Scheduler`.
 
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,8 +68,10 @@ pub struct RoutineEngine {
     tool_registry: Option<Arc<ToolRegistry>>,
     /// Gateway port for script `IRONCLAW_PORT` env var (resolved at construction).
     gateway_port: Option<u16>,
-    /// Default auth token for script `IRONCLAW_TOKEN` env var.
+    /// Default auth token for script `IRONCLAW_TOKEN` env var (single-tenant fallback).
     gateway_auth_token: Option<String>,
+    /// Reverse map from user_id → auth token, built from `GATEWAY_USER_TOKENS`.
+    user_token_map: HashMap<String, String>,
 }
 
 impl RoutineEngine {
@@ -87,6 +90,10 @@ impl RoutineEngine {
             .and_then(|s| s.parse().ok());
         let gateway_auth_token = std::env::var("GATEWAY_AUTH_TOKEN").ok();
 
+        // Build reverse map (user_id → token) from GATEWAY_USER_TOKENS for
+        // multi-tenant mode.  Falls back to gateway_auth_token in single-tenant.
+        let user_token_map = Self::build_user_token_map();
+
         Self {
             config,
             store,
@@ -100,7 +107,54 @@ impl RoutineEngine {
             tool_registry,
             gateway_port,
             gateway_auth_token,
+            user_token_map,
         }
+    }
+
+    /// Build a reverse map from `user_id` → auth token by parsing
+    /// `GATEWAY_USER_TOKENS` (JSON: `{token: {user_id: "...", ...}, ...}`).
+    fn build_user_token_map() -> HashMap<String, String> {
+        let json_str = match std::env::var("GATEWAY_USER_TOKENS") {
+            Ok(s) => s,
+            Err(_) => return HashMap::new(),
+        };
+
+        match Self::parse_user_token_map(&json_str) {
+            Ok(map) => {
+                tracing::info!(
+                    count = map.len(),
+                    "Routine engine built user_id→token map for multi-tenant mode"
+                );
+                map
+            }
+            Err(e) => {
+                tracing::warn!("Failed to parse GATEWAY_USER_TOKENS for routine engine: {e}");
+                HashMap::new()
+            }
+        }
+    }
+
+    /// Parse a GATEWAY_USER_TOKENS JSON string into a user_id → token map.
+    fn parse_user_token_map(json_str: &str) -> Result<HashMap<String, String>, serde_json::Error> {
+        #[derive(serde::Deserialize)]
+        struct TokenEntry {
+            user_id: String,
+        }
+
+        let tokens: HashMap<String, TokenEntry> = serde_json::from_str(json_str)?;
+        Ok(tokens
+            .into_iter()
+            .map(|(token, entry)| (entry.user_id, token))
+            .collect())
+    }
+
+    /// Resolve the auth token for a routine's user_id.
+    /// Checks multi-tenant map first, falls back to single-tenant `GATEWAY_AUTH_TOKEN`.
+    fn resolve_user_token(&self, user_id: &str) -> Option<String> {
+        self.user_token_map
+            .get(user_id)
+            .cloned()
+            .or_else(|| self.gateway_auth_token.clone())
     }
 
     /// Refresh the in-memory event trigger cache from DB.
@@ -376,7 +430,7 @@ impl RoutineEngine {
             scheduler: self.scheduler.clone(),
             tool_registry: self.tool_registry.clone(),
             gateway_port: self.gateway_port,
-            user_token: self.gateway_auth_token.clone(),
+            user_token: self.resolve_user_token(&routine.user_id),
         };
 
         tokio::spawn(async move {
@@ -454,7 +508,7 @@ impl RoutineEngine {
             scheduler: self.scheduler.clone(),
             tool_registry: self.tool_registry.clone(),
             gateway_port: self.gateway_port,
-            user_token: self.gateway_auth_token.clone(),
+            user_token: self.resolve_user_token(&routine.user_id),
         };
 
         tokio::spawn(async move {
@@ -489,7 +543,7 @@ impl RoutineEngine {
             scheduler: self.scheduler.clone(),
             tool_registry: self.tool_registry.clone(),
             gateway_port: self.gateway_port,
-            user_token: self.gateway_auth_token.clone(),
+            user_token: self.resolve_user_token(&routine.user_id),
         };
 
         // Record the run in DB, then spawn execution
@@ -1328,7 +1382,7 @@ async fn execute_script_inner(
 mod tests {
     use crate::agent::collection_events::CollectionWriteEvent;
     use crate::agent::routine::{NotifyConfig, Routine, RoutineAction, RoutineGuardrails, RunStatus, Trigger};
-    use super::matches_collection_write;
+    use super::{matches_collection_write, RoutineEngine};
 
     #[test]
     fn test_notification_gating() {
@@ -1402,7 +1456,7 @@ mod tests {
         let routine = make_collection_write_routine("presence-handler", "wifi_presence", "test-user");
         let event = CollectionWriteEvent {
             user_id: "test-user".to_string(),
-            collection: "nanny_shifts".to_string(),
+            collection: "time_entries".to_string(),
             record_id: uuid::Uuid::new_v4(),
             data: serde_json::json!({}),
         };
@@ -1646,5 +1700,32 @@ else:
         assert_eq!(result, ScriptResult::Handled);
 
         let _ = tokio::fs::remove_file(&script_path).await;
+    }
+
+    #[test]
+    fn test_parse_user_token_map_multi_tenant() {
+        let json = r#"{"tok-alice": {"user_id": "alice", "llm_backend": "openai"}, "tok-shared": {"user_id": "shared"}}"#;
+        let map = RoutineEngine::parse_user_token_map(json).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("alice").unwrap(), "tok-alice");
+        assert_eq!(map.get("shared").unwrap(), "tok-shared");
+    }
+
+    #[test]
+    fn test_parse_user_token_map_empty() {
+        let map = RoutineEngine::parse_user_token_map("{}").unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_parse_user_token_map_invalid_json() {
+        assert!(RoutineEngine::parse_user_token_map("not json").is_err());
+    }
+
+    #[test]
+    fn test_parse_user_token_map_missing_user_id() {
+        // Token entry without user_id field should fail deserialization
+        let json = r#"{"tok-bad": {"llm_backend": "openai"}}"#;
+        assert!(RoutineEngine::parse_user_token_map(json).is_err());
     }
 }

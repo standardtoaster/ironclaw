@@ -208,4 +208,145 @@ Test prompt.
         let result = parse_skill_md(content).expect("should handle BOM");
         assert_eq!(result.manifest.name, "bom-skill");
     }
+
+    #[test]
+    fn test_activation_script_inline_source() {
+        let content = r#"---
+name: script-skill
+activation:
+  keywords: ["hours"]
+  script:
+    language: python
+    source: |
+      print("hello from script")
+---
+
+Skill with activation script.
+"#;
+        let result = parse_skill_md(content).expect("should parse");
+        let script = result
+            .manifest
+            .activation
+            .script
+            .expect("script should be present");
+        assert_eq!(script.language, "python");
+        assert!(script.source.is_some());
+        assert!(script.source_file.is_none());
+        assert_eq!(script.timeout_ms, 5000); // default
+        assert_eq!(script.max_output_bytes, 4096); // default
+    }
+
+    #[test]
+    fn test_activation_script_source_file() {
+        let content = r#"---
+name: file-script-skill
+activation:
+  keywords: ["test"]
+  script:
+    language: bash
+    source_file: compute.sh
+    timeout_ms: 10000
+    max_output_bytes: 8192
+---
+
+Skill with file-based activation script.
+"#;
+        let result = parse_skill_md(content).expect("should parse");
+        let script = result
+            .manifest
+            .activation
+            .script
+            .expect("script should be present");
+        assert_eq!(script.language, "bash");
+        assert!(script.source.is_none());
+        assert_eq!(script.source_file.as_deref(), Some("compute.sh"));
+        assert_eq!(script.timeout_ms, 10000);
+        assert_eq!(script.max_output_bytes, 8192);
+    }
+
+    #[test]
+    fn test_no_activation_script_backwards_compatible() {
+        let content = "---\nname: no-script\nactivation:\n  keywords: [\"test\"]\n---\n\nPrompt.\n";
+        let result = parse_skill_md(content).expect("should parse");
+        assert!(result.manifest.activation.script.is_none());
+    }
+
+    #[test]
+    fn test_scope_single_parsed() {
+        let content = "---\nname: scoped-skill\nscope: household\n---\n\nPrompt with scope.\n";
+        let result = parse_skill_md(content).expect("should parse");
+        assert_eq!(
+            result.manifest.scope,
+            Some(crate::skills::SkillScope::Single("household".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_scope_multiple_parsed() {
+        let content = "---\nname: multi-scope\nscope:\n  - andrew\n  - household\n---\n\nPrompt.\n";
+        let result = parse_skill_md(content).expect("should parse");
+        assert_eq!(
+            result.manifest.scope,
+            Some(crate::skills::SkillScope::Multiple(vec![
+                "andrew".to_string(),
+                "household".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_no_scope_backwards_compatible() {
+        let content = "---\nname: no-scope\nactivation:\n  keywords: [\"test\"]\n---\n\nPrompt.\n";
+        let result = parse_skill_md(content).expect("should parse");
+        assert!(result.manifest.scope.is_none(), "skills without scope field should parse as None");
+    }
+
+    #[test]
+    fn test_activation_script_both_source_and_file() {
+        // When both source and source_file are provided, both should be
+        // present in the parsed struct (script_runner prefers source).
+        let content = r#"---
+name: both-script
+activation:
+  keywords: ["test"]
+  script:
+    language: bash
+    source: "echo inline"
+    source_file: fallback.sh
+---
+
+Skill with both script sources.
+"#;
+        let result = parse_skill_md(content).expect("should parse");
+        let script = result
+            .manifest
+            .activation
+            .script
+            .expect("script should be present");
+        assert_eq!(script.language, "bash");
+        assert!(script.source.is_some());
+        assert!(script.source_file.is_some());
+    }
+
+    #[test]
+    fn test_activation_script_node_language() {
+        let content = r#"---
+name: node-script
+activation:
+  keywords: ["test"]
+  script:
+    language: node
+    source: "console.log('hello')"
+---
+
+Node skill.
+"#;
+        let result = parse_skill_md(content).expect("should parse");
+        let script = result
+            .manifest
+            .activation
+            .script
+            .expect("script should be present");
+        assert_eq!(script.language, "node");
+    }
 }

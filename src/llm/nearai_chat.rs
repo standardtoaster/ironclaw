@@ -474,6 +474,7 @@ impl LlmProvider for NearAiChatProvider {
             max_tokens: req.max_tokens,
             tools: None,
             tool_choice: None,
+            reasoning: None,
         };
 
         let response: ChatCompletionResponse = self.send_request(&request).await?;
@@ -541,7 +542,7 @@ impl LlmProvider for NearAiChatProvider {
                 function: ChatCompletionFunction {
                     name: t.name,
                     description: Some(t.description),
-                    parameters: Some(t.parameters),
+                    parameters: Some(sanitize_tool_schema(&t.parameters)),
                 },
             })
             .collect();
@@ -553,6 +554,7 @@ impl LlmProvider for NearAiChatProvider {
             max_tokens: req.max_tokens,
             tools: if tools.is_empty() { None } else { Some(tools) },
             tool_choice: req.tool_choice,
+            reasoning: None,
         };
 
         let response: ChatCompletionResponse = self.send_request(&request).await?;
@@ -680,6 +682,16 @@ struct ChatCompletionRequest {
     tools: Option<Vec<ChatCompletionTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    /// Disable reasoning/thinking for models that enable it by default (e.g., NVIDIA Nemotron).
+    /// Without this, the model spends all output tokens on internal reasoning and returns null content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReasoningConfig {
+    #[serde(rename = "type")]
+    reasoning_type: String,
 }
 
 /// Content field that serializes as either a string or an array of content parts.
@@ -1081,6 +1093,68 @@ fn parse_usage(usage: Option<&ChatCompletionUsage>) -> (u32, u32) {
         }
     });
     (input, output)
+}
+
+/// Sanitize a tool parameter schema for strict JSON Schema validators (e.g. NVIDIA NIM).
+///
+/// Some providers reject schemas where properties lack a `"type"` field, interpreting
+/// the `"description"` as a regex pattern. This function walks the schema tree and adds
+/// `"type": "string"` to any property object that has no `"type"`, `"anyOf"`, `"oneOf"`,
+/// `"allOf"`, or `"$ref"` — i.e., it's truly untyped.
+fn sanitize_tool_schema(schema: &serde_json::Value) -> serde_json::Value {
+    let mut schema = schema.clone();
+    sanitize_schema_recursive(&mut schema);
+    schema
+}
+
+fn sanitize_schema_recursive(schema: &mut serde_json::Value) {
+    let obj = match schema.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+
+    // Recurse into combinators: anyOf, oneOf, allOf
+    for key in &["anyOf", "oneOf", "allOf"] {
+        if let Some(serde_json::Value::Array(variants)) = obj.get_mut(*key) {
+            for variant in variants.iter_mut() {
+                sanitize_schema_recursive(variant);
+            }
+        }
+    }
+
+    // Recurse into array items
+    if let Some(items) = obj.get_mut("items") {
+        sanitize_schema_recursive(items);
+    }
+
+    // Recurse into nested object properties
+    if let Some(serde_json::Value::Object(props)) = obj.get_mut("properties") {
+        for prop_schema in props.values_mut() {
+            sanitize_schema_recursive(prop_schema);
+
+            // If a property has no type indicator at all, default to "string"
+            if let Some(prop_obj) = prop_schema.as_object_mut() {
+                let has_type = prop_obj.contains_key("type")
+                    || prop_obj.contains_key("anyOf")
+                    || prop_obj.contains_key("oneOf")
+                    || prop_obj.contains_key("allOf")
+                    || prop_obj.contains_key("$ref");
+                if !has_type {
+                    prop_obj.insert(
+                        "type".to_string(),
+                        serde_json::Value::String("string".to_string()),
+                    );
+                }
+            }
+        }
+    }
+
+    // Recurse into `not`, `if`, `then`, `else`
+    for key in &["not", "if", "then", "else"] {
+        if let Some(sub) = obj.get_mut(*key) {
+            sanitize_schema_recursive(sub);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1665,6 +1739,7 @@ mod tests {
             max_tokens: None,
             tools: None,
             tool_choice: None,
+            reasoning: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["model"], "gpt-4o");
@@ -1698,6 +1773,7 @@ mod tests {
                 },
             }]),
             tool_choice: Some("auto".to_string()),
+            reasoning: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         // f32 precision: 0.7f32 serializes as 0.699999988... in JSON
@@ -2206,5 +2282,75 @@ mod tests {
             provider.api_url("chat/completions"),
             "http://example.com/api/proxy/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn test_sanitize_tool_schema_adds_type_to_untyped_property() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "A name" },
+                "default": { "description": "Default value for the field" }
+            },
+            "required": ["name"]
+        });
+        let sanitized = sanitize_tool_schema(&schema);
+        // "name" already has a type — should be unchanged
+        assert_eq!(sanitized["properties"]["name"]["type"], "string");
+        // "default" was missing type — should get "string"
+        assert_eq!(sanitized["properties"]["default"]["type"], "string");
+        assert_eq!(
+            sanitized["properties"]["default"]["description"],
+            "Default value for the field"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_tool_schema_preserves_typed_properties() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "integer", "description": "A count" },
+                "tags": { "type": "array", "items": { "type": "string" } }
+            }
+        });
+        let sanitized = sanitize_tool_schema(&schema);
+        assert_eq!(sanitized["properties"]["count"]["type"], "integer");
+        assert_eq!(sanitized["properties"]["tags"]["type"], "array");
+    }
+
+    #[test]
+    fn test_sanitize_tool_schema_handles_nested_objects() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "config": {
+                    "type": "object",
+                    "properties": {
+                        "untyped": { "description": "No type here" }
+                    }
+                }
+            }
+        });
+        let sanitized = sanitize_tool_schema(&schema);
+        assert_eq!(
+            sanitized["properties"]["config"]["properties"]["untyped"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_tool_schema_skips_ref_and_combinators() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "with_ref": { "$ref": "#/definitions/Foo" },
+                "with_any_of": { "anyOf": [{ "type": "string" }, { "type": "integer" }] }
+            }
+        });
+        let sanitized = sanitize_tool_schema(&schema);
+        // Should NOT add type when $ref or anyOf is present
+        assert!(sanitized["properties"]["with_ref"].get("type").is_none());
+        assert!(sanitized["properties"]["with_any_of"].get("type").is_none());
     }
 }

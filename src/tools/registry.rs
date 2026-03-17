@@ -721,7 +721,7 @@ impl ToolRegistry {
     pub async fn register_collection_tools(
         self: &Arc<Self>,
         db: Arc<dyn Database>,
-        user_id: &str,
+        user_ids: &[&str],
         skills_dir: Option<std::path::PathBuf>,
         skill_registry: Option<Arc<std::sync::RwLock<SkillRegistry>>>,
         collection_write_tx: Option<tokio::sync::broadcast::Sender<crate::agent::collection_events::CollectionWriteEvent>>,
@@ -767,11 +767,32 @@ impl ToolRegistry {
         }
         self.register_sync(Arc::new(alter_tool));
 
-        // Load existing schemas and generate per-collection tools + skills
-        match db.list_collections(user_id).await {
-            Ok(schemas) => {
+        // Load existing schemas and generate per-collection tools + skills.
+        // In multi-tenant mode, iterate all user IDs to register tools for
+        // every tenant's collections (tool names are globally unique by
+        // collection name, so different users with the same collection name
+        // share the same tool — the tool resolves the correct user at runtime).
+        let mut all_schemas = Vec::new();
+        let mut seen_collections = std::collections::HashSet::new();
+        for uid in user_ids {
+            match db.list_collections(uid).await {
+                Ok(schemas) => {
+                    for s in schemas {
+                        if seen_collections.insert(s.collection.clone()) {
+                            all_schemas.push(s);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load collection schemas for user {uid}: {e}");
+                }
+            }
+        }
+        {
+            let schemas = &all_schemas;
+            if !schemas.is_empty() {
                 let mut tool_count = 0;
-                for schema in &schemas {
+                for schema in schemas {
                     let tools = generate_collection_tools(schema, Arc::clone(&db), collection_write_tx.clone());
                     tool_count += tools.len();
                     for tool in tools {
@@ -820,7 +841,7 @@ impl ToolRegistry {
                 if !schemas.is_empty()
                     && let Some(ref dir) = skills_dir
                 {
-                    generate_router_skill(&schemas, dir);
+                    generate_router_skill(schemas, dir);
 
                     if let Some(ref sr) = skill_registry {
                         let router_path =
@@ -854,15 +875,15 @@ impl ToolRegistry {
                 }
 
                 tracing::info!(
-                    "Registered 4 collection management tools + {} per-collection tools for {} schemas",
+                    "Registered 4 collection management tools + {} per-collection tools for {} schemas (across {} users)",
                     tool_count,
-                    schemas.len()
+                    schemas.len(),
+                    user_ids.len()
                 );
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load collection schemas: {e}");
+            } else {
                 tracing::info!(
-                    "Registered 4 collection management tools (no existing schemas loaded)"
+                    "Registered 4 collection management tools (no existing schemas found across {} users)",
+                    user_ids.len()
                 );
             }
         }

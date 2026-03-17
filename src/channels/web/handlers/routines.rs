@@ -10,6 +10,10 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::agent::routine::{
+    NotifyConfig, Routine, RoutineAction, RoutineGuardrails, Trigger,
+};
+use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
 use crate::channels::web::types::*;
 use crate::error::RoutineError;
@@ -30,6 +34,91 @@ pub async fn routines_list_handler(
     let items: Vec<RoutineInfo> = routines.iter().map(routine_to_info).collect();
 
     Ok(Json(RoutineListResponse { routines: items }))
+}
+
+/// Request body for POST /api/routines — create a new routine.
+#[derive(Debug, Deserialize)]
+pub struct CreateRoutineRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub user_id: Option<String>,
+    pub trigger_type: String,
+    pub trigger_config: serde_json::Value,
+    pub action_type: String,
+    pub action_config: serde_json::Value,
+    #[serde(default = "default_cooldown")]
+    pub cooldown_secs: u64,
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: u32,
+    #[serde(default)]
+    pub notify_on_failure: bool,
+    #[serde(default)]
+    pub notify_on_success: bool,
+    #[serde(default)]
+    pub notify_on_attention: bool,
+}
+
+fn default_cooldown() -> u64 { 300 }
+fn default_max_concurrent() -> u32 { 1 }
+
+pub async fn routines_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Json(req): Json<CreateRoutineRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let user_id = req.user_id.unwrap_or(user.user_id);
+
+    let trigger = Trigger::from_db(&req.trigger_type, req.trigger_config)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid trigger: {e}")))?;
+
+    let action = RoutineAction::from_db(&req.action_type, req.action_config)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid action: {e}")))?;
+
+    let routine = Routine {
+        id: Uuid::new_v4(),
+        name: req.name,
+        description: req.description.unwrap_or_default(),
+        user_id,
+        enabled: true,
+        trigger,
+        action,
+        guardrails: RoutineGuardrails {
+            cooldown: std::time::Duration::from_secs(req.cooldown_secs),
+            max_concurrent: req.max_concurrent,
+            dedup_window: None,
+            max_execution_time: None,
+        },
+        notify: NotifyConfig {
+            channel: None,
+            user: "default".to_string(),
+            on_success: req.notify_on_success,
+            on_failure: req.notify_on_failure,
+            on_attention: req.notify_on_attention,
+        },
+        last_run_at: None,
+        next_fire_at: None,
+        run_count: 0,
+        consecutive_failures: 0,
+        state: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    let routine_id = routine.id;
+    store
+        .create_routine(&routine)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "created",
+        "routine_id": routine_id,
+    })))
 }
 
 pub async fn routines_summary_handler(

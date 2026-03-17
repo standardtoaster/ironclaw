@@ -93,6 +93,7 @@ fn nanny_schema() -> CollectionSchema {
         collection: "nanny_shifts".to_string(),
         description: Some("Nanny shift tracking".to_string()),
         fields,
+        source_scope: None,
     }
 }
 
@@ -162,6 +163,7 @@ fn grocery_schema() -> CollectionSchema {
         collection: "grocery_items".to_string(),
         description: Some("Grocery list items".to_string()),
         fields,
+        source_scope: None,
     }
 }
 
@@ -774,4 +776,166 @@ async fn aggregate_with_group_by() {
         (feb24 - 9.0).abs() < 0.001,
         "expected Feb 24 sum ~9.0, got {feb24}"
     );
+}
+
+// ==================== Scoped Collection Access Tests ====================
+//
+// Tests for cross-scope collection access via source_scope field.
+// Andrew can read/write household's collections through scoped tools.
+
+/// Helper: create a simple schema with a single text field.
+fn simple_schema(name: &str) -> CollectionSchema {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "item".to_string(),
+        FieldDef {
+            field_type: FieldType::Text,
+            required: true,
+            default: None,
+        },
+    );
+    CollectionSchema {
+        collection: name.to_string(),
+        description: Some("test collection".to_string()),
+        fields,
+        source_scope: None,
+    }
+}
+
+#[tokio::test]
+async fn scoped_collection_source_scope_persists() {
+    let (db, _dir) = setup().await;
+
+    let mut schema = simple_schema("tasks");
+    schema.source_scope = Some("household".to_string());
+
+    db.register_collection("andrew", &schema).await.unwrap();
+
+    let retrieved = db
+        .get_collection_schema("andrew", "tasks")
+        .await
+        .unwrap();
+    assert_eq!(retrieved.source_scope, Some("household".to_string()));
+}
+
+#[tokio::test]
+async fn scoped_collection_write_isolation() {
+    let (db, _dir) = setup().await;
+
+    // Register collection in both scopes
+    db.register_collection("household", &simple_schema("tasks"))
+        .await
+        .unwrap();
+    db.register_collection("andrew", &simple_schema("tasks"))
+        .await
+        .unwrap();
+
+    // Insert into household scope
+    db.insert_record("household", "tasks", json!({"item": "clean gutters"}))
+        .await
+        .unwrap();
+
+    // Insert into andrew scope
+    db.insert_record("andrew", "tasks", json!({"item": "buy butt cream"}))
+        .await
+        .unwrap();
+
+    // Each scope should only see its own data
+    let household = db
+        .query_records("household", "tasks", &[], None, 100)
+        .await
+        .unwrap();
+    assert_eq!(household.len(), 1);
+    assert_eq!(household[0].data["item"], "clean gutters");
+
+    let andrew = db
+        .query_records("andrew", "tasks", &[], None, 100)
+        .await
+        .unwrap();
+    assert_eq!(andrew.len(), 1);
+    assert_eq!(andrew[0].data["item"], "buy butt cream");
+}
+
+#[tokio::test]
+async fn scoped_collection_cross_scope_query() {
+    let (db, _dir) = setup().await;
+
+    // household owns the collection
+    db.register_collection("household", &simple_schema("tasks"))
+        .await
+        .unwrap();
+
+    db.insert_record("household", "tasks", json!({"item": "vacuum"}))
+        .await
+        .unwrap();
+
+    // Andrew queries household's scope directly (this is what the tool does)
+    let results = db
+        .query_records("household", "tasks", &[], None, 100)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].data["item"], "vacuum");
+
+    // Andrew's own scope should be empty
+    let andrew = db
+        .query_records("andrew", "tasks", &[], None, 100)
+        .await
+        .unwrap();
+    assert!(andrew.is_empty());
+}
+
+#[tokio::test]
+async fn scoped_collection_list_includes_source_scope() {
+    let (db, _dir) = setup().await;
+
+    // Andrew's own collection
+    db.register_collection("andrew", &simple_schema("notes"))
+        .await
+        .unwrap();
+
+    // Cross-scope collection registered under andrew
+    let mut scoped = simple_schema("childcare_hours");
+    scoped.source_scope = Some("household".to_string());
+    db.register_collection("andrew", &scoped).await.unwrap();
+
+    let schemas = db.list_collections("andrew").await.unwrap();
+    assert_eq!(schemas.len(), 2);
+
+    let own = schemas
+        .iter()
+        .find(|s| s.collection == "notes")
+        .unwrap();
+    assert_eq!(own.source_scope, None);
+
+    let cross = schemas
+        .iter()
+        .find(|s| s.collection == "childcare_hours")
+        .unwrap();
+    assert_eq!(cross.source_scope, Some("household".to_string()));
+}
+
+#[tokio::test]
+async fn scoped_collection_history_tracking() {
+    let (db, _dir) = setup().await;
+
+    db.register_collection("andrew", &simple_schema("tasks"))
+        .await
+        .unwrap();
+
+    // Insert a record and check _history is present
+    let id = db
+        .insert_record("andrew", "tasks", json!({"item": "test history"}))
+        .await
+        .unwrap();
+
+    let records = db
+        .query_records("andrew", "tasks", &[], None, 100)
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+
+    // The record should have the item field
+    assert_eq!(records[0].data["item"], "test history");
+    assert_eq!(records[0].id, id);
 }

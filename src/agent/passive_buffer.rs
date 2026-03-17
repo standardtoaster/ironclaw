@@ -149,7 +149,7 @@ mod tests {
         BufferKey {
             channel: "whatsapp".to_string(),
             source_id: source.to_string(),
-            user_id: "andrew".to_string(),
+            user_id: "user_a".to_string(),
         }
     }
 
@@ -207,11 +207,11 @@ mod tests {
 
     #[test]
     fn test_format_batch() {
-        let key = test_key("nanny-group");
-        let msgs = vec![test_msg("we need eggs"), test_msg("oh wait I got them")];
+        let key = test_key("team-chat");
+        let msgs = vec![test_msg("we need supplies"), test_msg("oh wait I got them")];
         let formatted = PassiveBuffer::format_batch(&key, &msgs);
-        assert!(formatted.contains("nanny-group"));
-        assert!(formatted.contains("we need eggs"));
+        assert!(formatted.contains("team-chat"));
+        assert!(formatted.contains("we need supplies"));
         assert!(formatted.contains("oh wait I got them"));
         assert!(formatted.contains("Process this batch"));
     }

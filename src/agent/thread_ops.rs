@@ -780,6 +780,12 @@ impl Agent {
             if let Some(tz) = tz_candidate {
                 job_ctx.user_timezone = tz.to_string();
             }
+            // Propagate workspace_read_scopes from gateway metadata.
+            if let Some(scopes) = message.metadata.get("workspace_read_scopes")
+                && let Ok(parsed) = serde_json::from_value::<Vec<String>>(scopes.clone())
+            {
+                job_ctx.workspace_read_scopes = parsed;
+            }
 
             let _ = self
                 .channels

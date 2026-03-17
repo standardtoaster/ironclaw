@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 
 use crate::db::structured::{
     AlterOperation, Alteration, CollectionSchema, FieldDef, FieldType, ValidationError,
-    is_system_field, validate_field_name,
+    append_history, init_history, is_system_field, validate_field_name,
 };
 
 // ==================== Fixture Schemas ====================
 
-fn nanny_schema() -> CollectionSchema {
+fn time_entry_schema() -> CollectionSchema {
     let mut fields = BTreeMap::new();
 
     fields.insert(
@@ -58,9 +58,10 @@ fn nanny_schema() -> CollectionSchema {
     );
 
     CollectionSchema {
-        collection: "nanny_shifts".to_string(),
-        description: Some("Nanny shift tracking".to_string()),
+        collection: "time_entries".to_string(),
+        description: Some("Work time entry tracking".to_string()),
         fields,
+        source_scope: None,
     }
 }
 
@@ -137,6 +138,7 @@ fn grocery_schema() -> CollectionSchema {
         collection: "grocery_items".to_string(),
         description: Some("Grocery list items".to_string()),
         fields,
+        source_scope: None,
     }
 }
 
@@ -145,7 +147,7 @@ fn grocery_schema() -> CollectionSchema {
 #[test]
 fn valid_collection_names() {
     let long_name = "x".repeat(64);
-    let names = ["nanny_shifts", "grocery_items", "a", "A1_b2_c3", &long_name];
+    let names = ["time_entries", "grocery_items", "a", "A1_b2_c3", &long_name];
     for name in names {
         assert!(
             CollectionSchema::validate_name(name).is_ok(),
@@ -206,11 +208,11 @@ fn field_name_rejects_sql_injection() {
 
 #[test]
 fn schema_round_trip() {
-    let schema = nanny_schema();
+    let schema = time_entry_schema();
     let json = serde_json::to_string(&schema).unwrap();
     let deserialized: CollectionSchema = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(deserialized.collection, "nanny_shifts");
+    assert_eq!(deserialized.collection, "time_entries");
     assert_eq!(deserialized.fields.len(), 5);
     assert!(deserialized.fields.contains_key("date"));
     assert!(deserialized.fields.contains_key("start_time"));
@@ -232,8 +234,8 @@ fn schema_round_trip() {
 // ==================== Record Validation ====================
 
 #[test]
-fn valid_nanny_record() {
-    let schema = nanny_schema();
+fn valid_time_entry_record() {
+    let schema = time_entry_schema();
     let data = serde_json::json!({
         "date": "2026-02-22",
         "start_time": "2026-02-22T09:00:00+00:00",
@@ -250,7 +252,7 @@ fn valid_nanny_record() {
 
 #[test]
 fn missing_required_field() {
-    let schema = nanny_schema();
+    let schema = time_entry_schema();
     let data = serde_json::json!({
         "start_time": "2026-02-22T09:00:00+00:00",
         "end_time": "2026-02-22T17:00:00+00:00"
@@ -264,7 +266,7 @@ fn missing_required_field() {
 
 #[test]
 fn unknown_field_rejected() {
-    let schema = nanny_schema();
+    let schema = time_entry_schema();
     let data = serde_json::json!({
         "date": "2026-02-22",
         "start_time": "2026-02-22T09:00:00+00:00",
@@ -336,6 +338,7 @@ fn bool_string_coercion() {
         collection: "test".to_string(),
         description: None,
         fields,
+        source_scope: None,
     };
     let data = serde_json::json!({"active": "true"});
     let result = schema.validate_record(&data).unwrap();
@@ -352,7 +355,7 @@ fn bool_string_coercion() {
 
 #[test]
 fn invalid_enum_value() {
-    let schema = nanny_schema();
+    let schema = time_entry_schema();
     let data = serde_json::json!({
         "date": "2026-02-22",
         "start_time": "2026-02-22T09:00:00+00:00",
@@ -376,7 +379,7 @@ fn invalid_enum_value() {
 
 #[test]
 fn invalid_date_format() {
-    let schema = nanny_schema();
+    let schema = time_entry_schema();
     let data = serde_json::json!({
         "date": "22/02/2026",
         "start_time": "2026-02-22T09:00:00+00:00",
@@ -391,7 +394,7 @@ fn invalid_date_format() {
 
 #[test]
 fn invalid_datetime_format() {
-    let schema = nanny_schema();
+    let schema = time_entry_schema();
     let data = serde_json::json!({
         "date": "2026-02-22",
         "start_time": "not-a-datetime",
@@ -454,7 +457,7 @@ fn defaults_applied() {
 
 #[test]
 fn partial_update_valid() {
-    let schema = nanny_schema();
+    let schema = time_entry_schema();
     let updates = serde_json::json!({
         "status": "completed",
         "notes": "Ended early"
@@ -466,7 +469,7 @@ fn partial_update_valid() {
 
 #[test]
 fn partial_update_unknown_field() {
-    let schema = nanny_schema();
+    let schema = time_entry_schema();
     let updates = serde_json::json!({
         "nonexistent": "value"
     });
@@ -479,7 +482,7 @@ fn partial_update_unknown_field() {
 
 #[test]
 fn partial_update_skips_required_check() {
-    let schema = nanny_schema();
+    let schema = time_entry_schema();
     // Only updating notes -- should not complain about missing date/start_time/end_time.
     let updates = serde_json::json!({
         "notes": "Updated note"
@@ -490,7 +493,7 @@ fn partial_update_skips_required_check() {
 
 #[test]
 fn partial_update_rejects_null_on_required_field() {
-    let schema = nanny_schema();
+    let schema = time_entry_schema();
     // Setting a required field to null should fail.
     let updates = serde_json::json!({
         "date": null
@@ -504,7 +507,7 @@ fn partial_update_rejects_null_on_required_field() {
 
 #[test]
 fn partial_update_allows_null_on_optional_field() {
-    let schema = nanny_schema();
+    let schema = time_entry_schema();
     // Setting an optional field to null should pass.
     let updates = serde_json::json!({
         "notes": null
@@ -527,7 +530,7 @@ fn is_system_field_detection() {
 
 #[test]
 fn system_fields_pass_through_validation() {
-    let schema = nanny_schema();
+    let schema = time_entry_schema();
     let data = serde_json::json!({
         "date": "2026-02-22",
         "start_time": "2026-02-22T09:00:00+00:00",
@@ -761,7 +764,7 @@ fn lineage_is_system_field() {
 
 #[test]
 fn lineage_passes_through_validation() {
-    let schema = nanny_schema();
+    let schema = time_entry_schema();
     let data = serde_json::json!({
         "date": "2026-02-22",
         "start_time": "2026-02-22T09:00:00+00:00",
@@ -806,4 +809,87 @@ fn lineage_with_full_provenance() {
     assert_eq!(result["_lineage"]["source"], "webhook");
     assert_eq!(result["_lineage"]["source_id"], "evt-123");
     assert_eq!(result["_lineage"]["context"], "Grocery restock webhook");
+}
+
+// ==================== History Helper Tests ====================
+
+#[test]
+fn init_history_creates_single_insert_entry() {
+    let mut data = serde_json::json!({
+        "item": "milk",
+        "quantity": 2,
+        "_lineage": {"source": "conversation"}
+    });
+    init_history(&mut data, "conversation");
+
+    let history = data["_history"].as_array().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["op"], "insert");
+    assert_eq!(history[0]["source"], "conversation");
+    assert_eq!(history[0]["fields"]["item"], "milk");
+    assert_eq!(history[0]["fields"]["quantity"], 2);
+    // System fields must not appear in the fields snapshot.
+    assert!(history[0]["fields"].get("_lineage").is_none());
+    assert!(history[0]["fields"].get("_history").is_none());
+    assert!(history[0]["time"].as_str().is_some());
+}
+
+#[test]
+fn append_history_adds_update_entry() {
+    let mut data = serde_json::json!({
+        "item": "milk",
+        "_history": [
+            {"op": "insert", "time": "2026-01-01T00:00:00Z", "source": "api", "fields": {"item": "milk"}}
+        ]
+    });
+    let changed = serde_json::json!({"item": "oat milk"});
+    append_history(&mut data, &changed, "rest_api");
+
+    let history = data["_history"].as_array().unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1]["op"], "update");
+    assert_eq!(history[1]["source"], "rest_api");
+    assert_eq!(history[1]["fields"]["item"], "oat milk");
+}
+
+#[test]
+fn append_history_creates_array_if_missing() {
+    let mut data = serde_json::json!({"item": "old record"});
+    let changed = serde_json::json!({"item": "updated"});
+    append_history(&mut data, &changed, "api");
+
+    let history = data["_history"].as_array().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["op"], "update");
+}
+
+#[test]
+fn append_history_filters_system_fields_from_changed() {
+    let mut data = serde_json::json!({
+        "_history": [
+            {"op": "insert", "time": "t", "source": "x", "fields": {}}
+        ]
+    });
+    let changed = serde_json::json!({"quantity": 5, "_lineage": {"source": "api"}});
+    append_history(&mut data, &changed, "api");
+
+    let history = data["_history"].as_array().unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1]["fields"]["quantity"], 5);
+    assert!(
+        history[1]["fields"].get("_lineage").is_none(),
+        "system fields should not appear in history fields"
+    );
+}
+
+#[test]
+fn validate_partial_passes_system_fields_through() {
+    let schema = grocery_schema();
+    let data = serde_json::json!({
+        "name": "bread",
+        "_history": [{"op": "insert"}]
+    });
+    let result = schema.validate_partial(&data).unwrap();
+    assert_eq!(result["name"], "bread");
+    assert_eq!(result["_history"][0]["op"], "insert");
 }
