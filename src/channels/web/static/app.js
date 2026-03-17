@@ -5,6 +5,7 @@ let eventSource = null;
 let logEventSource = null;
 let currentTab = 'chat';
 let currentThreadId = null;
+let currentThreadIsReadOnly = false;
 let assistantThreadId = null;
 let hasMore = false;
 let oldestTimestamp = null;
@@ -13,8 +14,11 @@ let sseHasConnectedBefore = false;
 let jobEvents = new Map(); // job_id -> Array of events
 let jobListRefreshTimer = null;
 let pairingPollInterval = null;
+let unreadThreads = new Map(); // thread_id -> unread count
+let _loadThreadsTimer = null;
 const JOB_EVENTS_CAP = 500;
 const MEMORY_SEARCH_QUERY_MAX_LENGTH = 100;
+let stagedImages = [];
 
 // --- Slash Commands ---
 
@@ -133,6 +137,94 @@ function apiFetch(path, options) {
   });
 }
 
+// --- Restart Feature ---
+
+let isRestarting = false; // Track if we're currently restarting
+let restartEnabled = false; // Track if restart is available in this deployment
+
+function triggerRestart() {
+  if (!currentThreadId) {
+    alert('Please start a conversation first');
+    return;
+  }
+
+  // Show the confirmation modal
+  const confirmModal = document.getElementById('restart-confirm-modal');
+  confirmModal.style.display = 'flex';
+}
+
+function confirmRestart() {
+  if (!currentThreadId) {
+    alert('Please start a conversation first');
+    return;
+  }
+
+  // Hide confirmation modal
+  const confirmModal = document.getElementById('restart-confirm-modal');
+  confirmModal.style.display = 'none';
+
+  const restartBtn = document.getElementById('restart-btn');
+  const restartIcon = document.getElementById('restart-icon');
+
+  // Mark as restarting
+  isRestarting = true;
+  restartBtn.disabled = true;
+  if (restartIcon) restartIcon.classList.add('spinning');
+
+  // Show progress modal
+  const loaderEl = document.getElementById('restart-loader');
+  loaderEl.style.display = 'flex';
+
+  // Send restart command via chat
+  console.log('[confirmRestart] Sending /restart command to server');
+  apiFetch('/api/chat/send', {
+    method: 'POST',
+    body: {
+      content: '/restart',
+      thread_id: currentThreadId,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    },
+  })
+    .then((response) => {
+      console.log('[confirmRestart] API call succeeded, response:', response);
+    })
+    .catch((err) => {
+      console.error('[confirmRestart] Restart request failed:', err);
+      addMessage('system', 'Restart failed: ' + err.message);
+      isRestarting = false;
+      restartBtn.disabled = false;
+      if (restartIcon) restartIcon.classList.remove('spinning');
+      loaderEl.style.display = 'none';
+    });
+}
+
+function cancelRestart() {
+  const confirmModal = document.getElementById('restart-confirm-modal');
+  confirmModal.style.display = 'none';
+}
+
+function tryShowRestartModal() {
+  // Defensive callback for when restart is detected in messages.
+  if (!isRestarting) {
+    isRestarting = true;
+    const restartBtn = document.getElementById('restart-btn');
+    const restartIcon = document.getElementById('restart-icon');
+    restartBtn.disabled = true;
+    if (restartIcon) restartIcon.classList.add('spinning');
+
+    // Show progress modal
+    const loaderEl = document.getElementById('restart-loader');
+    loaderEl.style.display = 'flex';
+  }
+}
+
+function updateRestartButtonVisibility() {
+  const restartBtn = document.getElementById('restart-btn');
+  if (restartBtn) {
+    restartBtn.style.display = restartEnabled ? 'block' : 'none';
+  }
+}
+
 // --- SSE ---
 
 function connectSSE() {
@@ -143,6 +235,18 @@ function connectSSE() {
   eventSource.onopen = () => {
     document.getElementById('sse-dot').classList.remove('disconnected');
     document.getElementById('sse-status').textContent = 'Connected';
+
+    // If we were restarting, close the modal and reset button now that server is back
+    if (isRestarting) {
+      const loaderEl = document.getElementById('restart-loader');
+      if (loaderEl) loaderEl.style.display = 'none';
+      const restartBtn = document.getElementById('restart-btn');
+      const restartIcon = document.getElementById('restart-icon');
+      if (restartBtn) restartBtn.disabled = false;
+      if (restartIcon) restartIcon.classList.remove('spinning');
+      isRestarting = false;
+    }
+
     if (sseHasConnectedBefore && currentThreadId) {
       finalizeActivityGroup();
       loadHistory();
@@ -157,17 +261,31 @@ function connectSSE() {
 
   eventSource.addEventListener('response', (e) => {
     const data = JSON.parse(e.data);
-    if (!isCurrentThread(data.thread_id)) return;
+    if (!isCurrentThread(data.thread_id)) {
+      if (data.thread_id) {
+        unreadThreads.set(data.thread_id, (unreadThreads.get(data.thread_id) || 0) + 1);
+        debouncedLoadThreads();
+      }
+      return;
+    }
     finalizeActivityGroup();
     addMessage('assistant', data.content);
     enableChatInput();
     // Refresh thread list so new titles appear after first message
     loadThreads();
+
+    // Show restart modal if the response indicates restart was initiated
+    if (data.content && data.content.toLowerCase().includes('restart initiated')) {
+      setTimeout(() => tryShowRestartModal(), 500);
+    }
   });
 
   eventSource.addEventListener('thinking', (e) => {
     const data = JSON.parse(e.data);
-    if (!isCurrentThread(data.thread_id)) return;
+    if (!isCurrentThread(data.thread_id)) {
+      if (data.thread_id) debouncedLoadThreads();
+      return;
+    }
     showActivityThinking(data.message);
   });
 
@@ -180,7 +298,12 @@ function connectSSE() {
   eventSource.addEventListener('tool_completed', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
-    completeToolCard(data.name, data.success);
+    completeToolCard(data.name, data.success, data.error, data.parameters);
+
+    // Show restart modal only when the restart tool succeeds
+    if (data.name.toLowerCase() === 'restart' && data.success) {
+      setTimeout(() => tryShowRestartModal(), 500);
+    }
   });
 
   eventSource.addEventListener('tool_result', (e) => {
@@ -198,7 +321,10 @@ function connectSSE() {
 
   eventSource.addEventListener('status', (e) => {
     const data = JSON.parse(e.data);
-    if (!isCurrentThread(data.thread_id)) return;
+    if (!isCurrentThread(data.thread_id)) {
+      if (data.thread_id) debouncedLoadThreads();
+      return;
+    }
     // "Done" and "Awaiting approval" are terminal signals from the agent:
     // the agentic loop finished, so re-enable input as a safety net in case
     // the response SSE event is empty or lost.
@@ -222,18 +348,35 @@ function connectSSE() {
 
   eventSource.addEventListener('auth_required', (e) => {
     const data = JSON.parse(e.data);
-    showAuthCard(data);
+    if (data.auth_url) {
+      // OAuth flow: show the auth card with an OAuth button + optional token paste field.
+      showAuthCard(data);
+    } else {
+      // Setup flow: fetch the extension's credential schema and show the multi-field
+      // configure modal (the same UI used by the Extensions tab "Setup" button).
+      showConfigureModal(data.extension_name);
+    }
   });
 
   eventSource.addEventListener('auth_completed', (e) => {
     const data = JSON.parse(e.data);
+    // Dismiss whichever UI path was active: auth card (OAuth) or configure modal (setup).
     removeAuthCard(data.extension_name);
-    showToast(data.message, 'success');
+    closeConfigureModal();
+    showToast(data.message, data.success ? 'success' : 'error');
+    // Refresh extensions list so status indicators update
+    if (currentTab === 'extensions') loadExtensions();
     enableChatInput();
   });
 
   eventSource.addEventListener('extension_status', (e) => {
     if (currentTab === 'extensions') loadExtensions();
+  });
+
+  eventSource.addEventListener('image_generated', (e) => {
+    const data = JSON.parse(e.data);
+    if (!isCurrentThread(data.thread_id)) return;
+    addGeneratedImage(data.data_url, data.path);
   });
 
   eventSource.addEventListener('error', (e) => {
@@ -277,9 +420,9 @@ function connectSSE() {
 }
 
 // Check if an SSE event belongs to the currently viewed thread.
-// Events without a thread_id (legacy) are always shown.
+// Events without a thread_id are dropped (prevents notification leaking).
 function isCurrentThread(threadId) {
-  if (!threadId) return true;
+  if (!threadId) return false;
   if (!currentThreadId) return true;
   return threadId === currentThreadId;
 }
@@ -293,23 +436,135 @@ function sendMessage() {
     return;
   }
   const content = input.value.trim();
-  if (!content) return;
+  if (!content && stagedImages.length === 0) return;
 
-  addMessage('user', content);
+  addMessage('user', content || '(images attached)');
   input.value = '';
   autoResizeTextarea(input);
   input.focus();
 
+  const body = { content, thread_id: currentThreadId || undefined, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };
+  if (stagedImages.length > 0) {
+    body.images = stagedImages.map(img => ({ media_type: img.media_type, data: img.data }));
+    stagedImages = [];
+    renderImagePreviews();
+  }
+
   apiFetch('/api/chat/send', {
     method: 'POST',
-    body: { content, thread_id: currentThreadId || undefined },
+    body: body,
   }).catch((err) => {
     addMessage('system', 'Failed to send: ' + err.message);
   });
 }
 
 function enableChatInput() {
-  // no-op: input and send button are always enabled
+  if (currentThreadIsReadOnly) return;
+  const input = document.getElementById('chat-input');
+  const btn = document.getElementById('send-btn');
+  if (input) {
+    input.disabled = false;
+    input.placeholder = 'Message or / for commands...';
+  }
+  if (btn) btn.disabled = false;
+}
+
+// --- Image Upload ---
+
+function renderImagePreviews() {
+  const strip = document.getElementById('image-preview-strip');
+  strip.innerHTML = '';
+  stagedImages.forEach((img, idx) => {
+    const container = document.createElement('div');
+    container.className = 'image-preview-container';
+
+    const preview = document.createElement('img');
+    preview.className = 'image-preview';
+    preview.src = img.dataUrl;
+    preview.alt = 'Attached image';
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'image-preview-remove';
+    removeBtn.textContent = '\u00d7';
+    removeBtn.addEventListener('click', () => {
+      stagedImages.splice(idx, 1);
+      renderImagePreviews();
+    });
+
+    container.appendChild(preview);
+    container.appendChild(removeBtn);
+    strip.appendChild(container);
+  });
+}
+
+const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB per image
+const MAX_STAGED_IMAGES = 5;
+
+function handleImageFiles(files) {
+  Array.from(files).forEach(file => {
+    if (!file.type.startsWith('image/')) return;
+    if (file.size > MAX_IMAGE_SIZE_BYTES) {
+      alert(`Image "${file.name}" exceeds 5 MB limit (${(file.size / 1024 / 1024).toFixed(1)} MB)`);
+      return;
+    }
+    if (stagedImages.length >= MAX_STAGED_IMAGES) {
+      alert(`Maximum ${MAX_STAGED_IMAGES} images allowed per message`);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      const dataUrl = e.target.result;
+      const commaIdx = dataUrl.indexOf(',');
+      const meta = dataUrl.substring(0, commaIdx); // e.g. "data:image/png;base64"
+      const base64 = dataUrl.substring(commaIdx + 1);
+      const mediaType = meta.replace('data:', '').replace(';base64', '');
+      stagedImages.push({ media_type: mediaType, data: base64, dataUrl: dataUrl });
+      renderImagePreviews();
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+document.getElementById('attach-btn').addEventListener('click', () => {
+  document.getElementById('image-file-input').click();
+});
+
+document.getElementById('image-file-input').addEventListener('change', (e) => {
+  handleImageFiles(e.target.files);
+  e.target.value = '';
+});
+
+document.getElementById('chat-input').addEventListener('paste', (e) => {
+  const items = (e.clipboardData || e.originalEvent.clipboardData).items;
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].kind === 'file' && items[i].type.startsWith('image/')) {
+      const file = items[i].getAsFile();
+      if (file) handleImageFiles([file]);
+    }
+  }
+});
+
+function addGeneratedImage(dataUrl, path) {
+  const container = document.getElementById('chat-messages');
+  const card = document.createElement('div');
+  card.className = 'generated-image-card';
+
+  const img = document.createElement('img');
+  img.className = 'generated-image';
+  img.src = dataUrl;
+  img.alt = 'Generated image';
+
+  card.appendChild(img);
+
+  if (path) {
+    const pathLabel = document.createElement('div');
+    pathLabel.className = 'generated-image-path';
+    pathLabel.textContent = path;
+    card.appendChild(pathLabel);
+  }
+
+  container.appendChild(card);
+  container.scrollTop = container.scrollHeight;
 }
 
 // --- Slash Autocomplete ---
@@ -359,6 +614,9 @@ function selectSlashItem(cmd) {
 function updateSlashHighlight() {
   const items = document.querySelectorAll('#slash-autocomplete .slash-ac-item');
   items.forEach((el, i) => el.classList.toggle('selected', i === _slashSelected));
+  if (_slashSelected >= 0 && items[_slashSelected]) {
+    items[_slashSelected].scrollIntoView({ block: 'nearest' });
+  }
 }
 
 function filterSlashCommands(value) {
@@ -401,6 +659,13 @@ function sendApprovalAction(requestId, action) {
 
 function renderMarkdown(text) {
   if (typeof marked !== 'undefined') {
+    // Escape raw HTML error pages instead of rendering them as markup.
+    // Only triggers when the text *starts with* a doctype or <html> tag
+    // (after optional whitespace), so normal messages that mention HTML
+    // tags in prose or code fences are not affected.  See #263.
+    if (/^\s*<!doctype\s/i.test(text) || /^\s*<html[\s>]/i.test(text)) {
+      return escapeHtml(text);
+    }
     let html = marked.parse(text);
     // Sanitize HTML output to prevent XSS from tool output or LLM responses.
     html = sanitizeRenderedHtml(html);
@@ -581,7 +846,7 @@ function addToolCard(name) {
   container.scrollTop = container.scrollHeight;
 }
 
-function completeToolCard(name, success) {
+function completeToolCard(name, success, error, parameters) {
   const entries = _activeToolCards[name];
   if (!entries || entries.length === 0) return;
   // Find first running card
@@ -602,6 +867,27 @@ function completeToolCard(name, success) {
     ? '<span class="activity-icon-success">&#10003;</span>'
     : '<span class="activity-icon-fail">&#10007;</span>';
   entry.card.setAttribute('data-status', success ? 'success' : 'fail');
+
+  // For failed tools, populate the body with error details and auto-expand
+  if (!success && (error || parameters)) {
+    const output = entry.card.querySelector('.activity-tool-output');
+    if (output) {
+      let detail = '';
+      if (parameters) {
+        detail += 'Input:\n' + parameters + '\n\n';
+      }
+      if (error) {
+        detail += 'Error:\n' + error;
+      }
+      output.textContent = detail;
+
+      // Auto-expand so the error is immediately visible
+      const body = entry.card.querySelector('.activity-tool-body');
+      const chevron = entry.card.querySelector('.activity-tool-chevron');
+      if (body) body.style.display = 'block';
+      if (chevron) chevron.classList.add('expanded');
+    }
+  }
 }
 
 function setToolCardOutput(name, preview) {
@@ -842,7 +1128,7 @@ function showAuthCard(data) {
     oauthBtn.className = 'auth-oauth';
     oauthBtn.textContent = 'Authenticate with ' + data.extension_name;
     oauthBtn.addEventListener('click', () => {
-      window.open(data.auth_url, '_blank', 'width=600,height=700');
+      openOAuthUrl(data.auth_url);
     });
     links.appendChild(oauthBtn);
   }
@@ -865,7 +1151,7 @@ function showAuthCard(data) {
 
   const tokenInput = document.createElement('input');
   tokenInput.type = 'password';
-  tokenInput.placeholder = 'Paste your API key or token';
+  tokenInput.placeholder = data.instructions || 'Paste your API key or token';
   tokenInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') submitAuthToken(data.extension_name, tokenInput.value);
   });
@@ -973,7 +1259,9 @@ function loadHistory(before) {
       // Fresh load: clear and render
       container.innerHTML = '';
       for (const turn of data.turns) {
-        addMessage('user', turn.user_input);
+        if (turn.user_input) {
+          addMessage('user', turn.user_input);
+        }
         if (turn.tool_calls && turn.tool_calls.length > 0) {
           addToolCallsSummary(turn.tool_calls);
         }
@@ -995,8 +1283,10 @@ function loadHistory(before) {
       const savedHeight = container.scrollHeight;
       const fragment = document.createDocumentFragment();
       for (const turn of data.turns) {
-        const userDiv = createMessageElement('user', turn.user_input);
-        fragment.appendChild(userDiv);
+        if (turn.user_input) {
+          const userDiv = createMessageElement('user', turn.user_input);
+          fragment.appendChild(userDiv);
+        }
         if (turn.tool_calls && turn.tool_calls.length > 0) {
           fragment.appendChild(createToolCallsSummaryElement(turn.tool_calls));
         }
@@ -1095,6 +1385,38 @@ function removeScrollSpinner() {
 
 // --- Threads ---
 
+function threadTitle(thread) {
+  if (thread.workspace_topic) return thread.workspace_topic;
+  if (thread.title) return thread.title;
+  const ch = thread.channel || 'gateway';
+  if (thread.thread_type === 'heartbeat') return 'Heartbeat Alerts';
+  if (thread.thread_type === 'routine') return 'Routine';
+  if (ch !== 'gateway') return ch.charAt(0).toUpperCase() + ch.slice(1);
+  if (thread.turn_count === 0) return 'New chat';
+  return thread.id.substring(0, 8);
+}
+
+function relativeTime(isoStr) {
+  if (!isoStr) return '';
+  const diff = Date.now() - new Date(isoStr).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'now';
+  if (mins < 60) return mins + 'm ago';
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return hrs + 'h ago';
+  const days = Math.floor(hrs / 24);
+  return days + 'd ago';
+}
+
+function isReadOnlyChannel(channel) {
+  return channel && channel !== 'gateway' && channel !== 'routine' && channel !== 'heartbeat';
+}
+
+function debouncedLoadThreads() {
+  if (_loadThreadsTimer) clearTimeout(_loadThreadsTimer);
+  _loadThreadsTimer = setTimeout(() => { _loadThreadsTimer = null; loadThreads(); }, 500);
+}
+
 function loadThreads() {
   apiFetch('/api/chat/threads').then((data) => {
     // Pinned assistant thread
@@ -1103,9 +1425,13 @@ function loadThreads() {
       const el = document.getElementById('assistant-thread');
       const isActive = currentThreadId === assistantThreadId;
       el.className = 'assistant-item' + (isActive ? ' active' : '');
+      const labelEl = document.getElementById('assistant-label');
+      if (labelEl) {
+        const at = data.assistant_thread;
+        labelEl.textContent = 'Assistant';
+      }
       const meta = document.getElementById('assistant-meta');
-      const count = data.assistant_thread.turn_count || 0;
-      meta.textContent = count > 0 ? count + ' turns' : '';
+      meta.textContent = relativeTime(data.assistant_thread.updated_at);
     }
 
     // Regular threads
@@ -1114,16 +1440,38 @@ function loadThreads() {
     const threads = data.threads || [];
     for (const thread of threads) {
       const item = document.createElement('div');
-      item.className = 'thread-item' + (thread.id === currentThreadId ? ' active' : '');
+      const isActive = thread.id === currentThreadId;
+      item.className = 'thread-item' + (isActive ? ' active' : '');
+
+      // Channel badge for non-gateway threads
+      const ch = thread.channel || 'gateway';
+      if (ch !== 'gateway') {
+        const badge = document.createElement('span');
+        badge.className = 'thread-badge thread-badge-' + ch;
+        badge.textContent = ch;
+        item.appendChild(badge);
+      }
+
       const label = document.createElement('span');
       label.className = 'thread-label';
-      label.textContent = thread.title || thread.id.substring(0, 8);
-      label.title = thread.title ? thread.title + ' (' + thread.id + ')' : thread.id;
+      label.textContent = threadTitle(thread);
+      label.title = (thread.title || '') + ' (' + thread.id + ')';
       item.appendChild(label);
+
       const meta = document.createElement('span');
       meta.className = 'thread-meta';
-      meta.textContent = (thread.turn_count || 0) + ' turns';
+      meta.textContent = relativeTime(thread.updated_at);
       item.appendChild(meta);
+
+      // Unread dot
+      const unread = unreadThreads.get(thread.id) || 0;
+      if (unread > 0 && !isActive) {
+        const dot = document.createElement('span');
+        dot.className = 'thread-unread';
+        dot.textContent = unread > 9 ? '9+' : String(unread);
+        item.appendChild(dot);
+      }
+
       item.addEventListener('click', () => switchThread(thread.id));
       list.appendChild(item);
     }
@@ -1133,17 +1481,36 @@ function loadThreads() {
       switchToAssistant();
     }
 
-    // Enable chat input once a thread is available
+    // Enable/disable chat input based on channel type
     if (currentThreadId) {
-      enableChatInput();
+      const currentThread = threads.find(t => t.id === currentThreadId);
+      const ch = currentThread ? currentThread.channel : 'gateway';
+      currentThreadIsReadOnly = isReadOnlyChannel(ch);
+      if (currentThreadIsReadOnly) {
+        disableChatInputReadOnly();
+      } else {
+        enableChatInput();
+      }
     }
   }).catch(() => {});
+}
+
+function disableChatInputReadOnly() {
+  const input = document.getElementById('chat-input');
+  const btn = document.getElementById('send-btn');
+  if (input) {
+    input.disabled = true;
+    input.placeholder = 'Read-only thread (external channel)';
+  }
+  if (btn) btn.disabled = true;
 }
 
 function switchToAssistant() {
   if (!assistantThreadId) return;
   finalizeActivityGroup();
   currentThreadId = assistantThreadId;
+  currentThreadIsReadOnly = false;
+  unreadThreads.delete(assistantThreadId);
   hasMore = false;
   oldestTimestamp = null;
   loadHistory();
@@ -1153,6 +1520,7 @@ function switchToAssistant() {
 function switchThread(threadId) {
   finalizeActivityGroup();
   currentThreadId = threadId;
+  unreadThreads.delete(threadId);
   hasMore = false;
   oldestTimestamp = null;
   loadHistory();
@@ -1196,7 +1564,7 @@ chatInput.addEventListener('keydown', (e) => {
       updateSlashHighlight();
       return;
     }
-    if (e.key === 'Tab' || (e.key === 'Enter' && _slashSelected >= 0)) {
+    if (e.key === 'Tab' || e.key === 'Enter') {
       e.preventDefault();
       const pick = _slashSelected >= 0 ? _slashMatches[_slashSelected] : _slashMatches[0];
       if (pick) selectSlashItem(pick.cmd);
@@ -1209,7 +1577,7 @@ chatInput.addEventListener('keydown', (e) => {
     }
   }
 
-  if (e.key === 'Enter' && !e.shiftKey) {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
     hideSlashAutocomplete();
     sendMessage();
@@ -1728,6 +2096,13 @@ function renderAvailableExtensionCard(entry) {
   kind.textContent = kindLabels[entry.kind] || entry.kind;
   header.appendChild(kind);
 
+  if (entry.version) {
+    const ver = document.createElement('span');
+    ver.className = 'ext-version';
+    ver.textContent = 'v' + entry.version;
+    header.appendChild(ver);
+  }
+
   card.appendChild(header);
 
   const desc = document.createElement('div');
@@ -1757,6 +2132,11 @@ function renderAvailableExtensionCard(entry) {
     }).then(function(res) {
       if (res.success) {
         showToast('Installed ' + entry.display_name, 'success');
+        // OAuth popup if auth started during install (builtin creds)
+        if (res.auth_url) {
+          showToast('Opening authentication for ' + entry.display_name, 'info');
+          openOAuthUrl(res.auth_url);
+        }
         loadExtensions();
         // Auto-open configure for WASM channels
         if (entry.kind === 'wasm_channel') {
@@ -1883,6 +2263,13 @@ function renderExtensionCard(ext) {
   kind.textContent = kindLabels[ext.kind] || ext.kind;
   header.appendChild(kind);
 
+  if (ext.version) {
+    const ver = document.createElement('span');
+    ver.className = 'ext-version';
+    ver.textContent = 'v' + ext.version;
+    header.appendChild(ver);
+  }
+
   // Auth dot only for non-WASM-channel extensions (channels use the stepper instead)
   if (ext.kind !== 'wasm_channel') {
     const authDot = document.createElement('span');
@@ -1913,7 +2300,7 @@ function renderExtensionCard(ext) {
     card.appendChild(url);
   }
 
-  if (ext.tools.length > 0) {
+  if (ext.tools && ext.tools.length > 0) {
     const tools = document.createElement('div');
     tools.className = 'ext-tools';
     tools.textContent = 'Tools: ' + ext.tools.join(', ');
@@ -1928,14 +2315,6 @@ function renderExtensionCard(ext) {
     card.appendChild(errorDiv);
   }
 
-  // Show "coming soon" note for non-Telegram channels that are configured but not fully supported yet
-  if (ext.kind === 'wasm_channel' && ext.name !== 'telegram'
-      && (ext.activation_status === 'configured' || ext.active)) {
-    const noteDiv = document.createElement('div');
-    noteDiv.className = 'ext-note';
-    noteDiv.textContent = 'Full integration coming soon. Use the CLI to complete setup.';
-    card.appendChild(noteDiv);
-  }
 
   const actions = document.createElement('div');
   actions.className = 'ext-actions';
@@ -1966,24 +2345,29 @@ function renderExtensionCard(ext) {
       actions.appendChild(setupBtn);
     }
   } else {
-    // Non-WASM-channel extensions: original behavior
-    if (!ext.active) {
+    // WASM tools / MCP servers
+    const activeLabel = document.createElement('span');
+    activeLabel.className = 'ext-active-label';
+    activeLabel.textContent = ext.active ? 'Active' : 'Installed';
+    actions.appendChild(activeLabel);
+
+    // MCP servers may be installed but inactive — show Activate button
+    if (ext.kind === 'mcp_server' && !ext.active) {
       const activateBtn = document.createElement('button');
       activateBtn.className = 'btn-ext activate';
       activateBtn.textContent = 'Activate';
       activateBtn.addEventListener('click', () => activateExtension(ext.name));
       actions.appendChild(activateBtn);
-    } else {
-      const activeLabel = document.createElement('span');
-      activeLabel.className = 'ext-active-label';
-      activeLabel.textContent = 'Active';
-      actions.appendChild(activeLabel);
     }
 
-    if (ext.needs_setup) {
+    // Show Configure/Reconfigure button when there are secrets to enter.
+    // Skip when has_auth is true but needs_setup is false and not yet authenticated —
+    // this means OAuth credentials resolve automatically (builtin/env) and the user
+    // just needs to complete the OAuth flow, not fill in a config form.
+    if (ext.needs_setup || (ext.has_auth && ext.authenticated)) {
       const configBtn = document.createElement('button');
       configBtn.className = 'btn-ext configure';
-      configBtn.textContent = ext.authenticated ? 'Reconfigure' : 'Setup';
+      configBtn.textContent = ext.authenticated ? 'Reconfigure' : 'Configure';
       configBtn.addEventListener('click', () => showConfigureModal(ext.name));
       actions.appendChild(configBtn);
     }
@@ -2013,13 +2397,18 @@ function activateExtension(name) {
   apiFetch('/api/extensions/' + encodeURIComponent(name) + '/activate', { method: 'POST' })
     .then((res) => {
       if (res.success) {
+        // Even on success, the tool may need OAuth (e.g., WASM loaded but no token yet)
+        if (res.auth_url) {
+          showToast('Opening authentication for ' + name, 'info');
+          openOAuthUrl(res.auth_url);
+        }
         loadExtensions();
         return;
       }
 
       if (res.auth_url) {
         showToast('Opening authentication for ' + name, 'info');
-        window.open(res.auth_url, '_blank');
+        openOAuthUrl(res.auth_url);
       } else if (res.awaiting_token) {
         showConfigureModal(name);
       } else {
@@ -2161,19 +2550,22 @@ function submitConfigureModal(name, fields) {
     body: { secrets },
   })
     .then((res) => {
-      closeConfigureModal();
       if (res.success) {
-        if (res.activated) {
-          showToast('Configured and activated ' + name, 'success');
-        } else if (res.needs_restart) {
-          showToast('Configured ' + name + '. Use Reconfigure to re-enter credentials and activate.', 'info');
-        } else {
-          showToast(res.message, 'success');
+        closeConfigureModal();
+        if (res.auth_url) {
+          // OAuth flow started — open consent popup. The auth_completed SSE will
+          // not arrive immediately (it fires after OAuth callback), so show a toast now.
+          showToast('Opening OAuth authorization for ' + name, 'info');
+          openOAuthUrl(res.auth_url);
+          loadExtensions();
         }
+        // For non-OAuth success: the server always broadcasts auth_completed SSE,
+        // which will show the toast and refresh extensions — no need to do it here too.
       } else {
+        // Keep modal open so the user can correct their input and retry.
+        btns.forEach(function(b) { b.disabled = false; });
         showToast(res.message || 'Configuration failed', 'error');
       }
-      loadExtensions();
     })
     .catch((err) => {
       btns.forEach(function(b) { b.disabled = false; });
@@ -2184,6 +2576,25 @@ function submitConfigureModal(name, fields) {
 function closeConfigureModal() {
   const existing = document.querySelector('.configure-overlay');
   if (existing) existing.remove();
+}
+
+// Validate that a server-supplied OAuth URL is HTTPS before opening a popup.
+// Rejects javascript:, data:, and other non-HTTPS schemes to prevent URL-injection.
+// Uses the URL constructor to safely parse and validate the scheme, which also
+// handles non-string values (objects, null, etc.) that would throw on .startsWith().
+function openOAuthUrl(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+    if (parsed.protocol !== 'https:') {
+      throw new Error('non-HTTPS protocol: ' + parsed.protocol);
+    }
+  } catch (e) {
+    console.warn('Blocked invalid/non-HTTPS OAuth URL:', url, e.message);
+    showToast('Invalid OAuth URL returned by server', 'error');
+    return;
+  }
+  window.open(parsed.href, '_blank', 'width=600,height=700');
 }
 
 // --- Pairing ---
@@ -2232,7 +2643,7 @@ function approvePairing(channel, code, container) {
   }).then(res => {
     if (res.success) {
       showToast('Pairing approved', 'success');
-      loadPairingRequests(channel, container);
+      loadExtensions();
     } else {
       showToast(res.message || 'Approve failed', 'error');
     }
@@ -2255,53 +2666,6 @@ function stopPairingPoll() {
   }
 }
 
-// --- Gateway restart ---
-
-function restartGateway() {
-  if (!confirm('Restart IronClaw gateway? Active connections will be dropped.')) return;
-
-  apiFetch('/api/gateway/restart', { method: 'POST' })
-    .then(function() {
-      showRestartOverlay();
-    })
-    .catch(function() {
-      showRestartOverlay();
-    });
-}
-
-function showRestartOverlay() {
-  var overlay = document.createElement('div');
-  overlay.className = 'restart-overlay';
-  overlay.innerHTML = '<div class="restart-message">'
-    + '<div class="restart-spinner"></div>'
-    + '<h2>Restarting IronClaw...</h2>'
-    + '<p>Waiting for server to come back online</p>'
-    + '</div>';
-  document.body.appendChild(overlay);
-
-  var pollCount = 0;
-  var pollTimer = setInterval(function() {
-    pollCount++;
-    if (pollCount > 30) { // 60 seconds
-      clearInterval(pollTimer);
-      overlay.querySelector('h2').textContent = 'Restart timed out';
-      overlay.querySelector('p').textContent = 'Server did not come back within 60 seconds. Check logs.';
-      overlay.querySelector('.restart-spinner').style.display = 'none';
-      return;
-    }
-    fetch('/api/gateway/status', {
-      headers: { 'Authorization': 'Bearer ' + token },
-    })
-    .then(function(r) {
-      if (r.ok) {
-        clearInterval(pollTimer);
-        window.location.reload();
-      }
-    })
-    .catch(function() { /* still restarting */ });
-  }, 2000);
-}
-
 // --- WASM channel stepper ---
 
 function renderWasmChannelStepper(ext) {
@@ -2309,23 +2673,17 @@ function renderWasmChannelStepper(ext) {
   stepper.className = 'ext-stepper';
 
   var status = ext.activation_status || 'installed';
-  var isTelegram = ext.name === 'telegram';
 
-  // Telegram gets a 3-step stepper (Installed → Configured → Active/Pairing).
-  // Other channels only get 2 steps (Installed → Configured) since full
-  // integration isn't available in the web UI yet.
   var steps = [
     { label: 'Installed', key: 'installed' },
     { label: 'Configured', key: 'configured' },
+    { label: status === 'pairing' ? 'Awaiting Pairing' : 'Active', key: 'active' },
   ];
-  if (isTelegram) {
-    steps.push({ label: status === 'pairing' ? 'Awaiting Pairing' : 'Active', key: 'active' });
-  }
 
   var reachedIdx;
-  if (status === 'active') reachedIdx = isTelegram ? 2 : 1;
+  if (status === 'active') reachedIdx = 2;
   else if (status === 'pairing') reachedIdx = 2;
-  else if (status === 'failed') reachedIdx = isTelegram ? 2 : 1;
+  else if (status === 'failed') reachedIdx = 2;
   else if (status === 'configured') reachedIdx = 1;
   else reachedIdx = 0;
 
@@ -2436,9 +2794,8 @@ function renderJobsList(jobs) {
     let actionBtns = '';
     if (job.state === 'pending' || job.state === 'in_progress') {
       actionBtns = '<button class="btn-cancel" onclick="event.stopPropagation(); cancelJob(\'' + job.id + '\')">Cancel</button>';
-    } else if (job.state === 'failed' || job.state === 'interrupted') {
-      actionBtns = '<button class="btn-restart" onclick="event.stopPropagation(); restartJob(\'' + job.id + '\')">Restart</button>';
     }
+    // Retry is only shown in the detail view where can_restart is available.
 
     return '<tr class="job-row" onclick="openJobDetail(\'' + job.id + '\')">'
       + '<td title="' + escapeHtml(job.id) + '">' + shortId + '</td>'
@@ -2467,10 +2824,12 @@ function restartJob(jobId) {
   apiFetch('/api/jobs/' + jobId + '/restart', { method: 'POST' })
     .then((res) => {
       showToast('Job restarted as ' + (res.new_job_id || '').substring(0, 8), 'success');
-      loadJobs();
     })
     .catch((err) => {
       showToast('Failed to restart job: ' + err.message, 'error');
+    })
+    .finally(() => {
+      loadJobs();
     });
 }
 
@@ -2505,8 +2864,8 @@ function renderJobDetail(job) {
     + '<h2>' + escapeHtml(job.title) + '</h2>'
     + '<span class="badge ' + stateClass + '">' + escapeHtml(job.state) + '</span>';
 
-  if (job.state === 'failed' || job.state === 'interrupted') {
-    headerHtml += '<button class="btn-restart" onclick="restartJob(\'' + job.id + '\')">Restart</button>';
+  if ((job.state === 'failed' || job.state === 'interrupted') && job.can_restart === true) {
+    headerHtml += '<button class="btn-restart" onclick="restartJob(\'' + job.id + '\')">Retry</button>';
   }
   if (job.browse_url) {
     headerHtml += '<a class="btn-browse" href="' + escapeHtml(job.browse_url) + '" target="_blank">Browse Files</a>';
@@ -2753,7 +3112,7 @@ function renderJobActivity(container, job) {
   activityCurrentJobId = job ? job.id : null;
   activityRenderedLiveIndex = 0;
 
-  container.innerHTML = '<div class="activity-toolbar">'
+  let html = '<div class="activity-toolbar">'
     + '<select id="activity-type-filter">'
     + '<option value="all">All Events</option>'
     + '<option value="message">Messages</option>'
@@ -2762,12 +3121,17 @@ function renderJobActivity(container, job) {
     + '</select>'
     + '<label class="logs-checkbox"><input type="checkbox" id="activity-autoscroll" checked> Auto-scroll</label>'
     + '</div>'
-    + '<div class="activity-terminal" id="activity-terminal"></div>'
-    + '<div class="activity-input-bar" id="activity-input-bar">'
-    + '<input type="text" id="activity-prompt-input" placeholder="Send follow-up prompt..." />'
-    + '<button id="activity-send-btn">Send</button>'
-    + '<button id="activity-done-btn" title="Signal done">Done</button>'
-    + '</div>';
+    + '<div class="activity-terminal" id="activity-terminal"></div>';
+
+  if (job && job.can_prompt === true) {
+    html += '<div class="activity-input-bar" id="activity-input-bar">'
+      + '<input type="text" id="activity-prompt-input" placeholder="Send follow-up prompt..." />'
+      + '<button id="activity-send-btn">Send</button>'
+      + '<button id="activity-done-btn" title="Signal done">Done</button>'
+      + '</div>';
+  }
+
+  container.innerHTML = html;
 
   document.getElementById('activity-type-filter').addEventListener('change', applyActivityFilter);
 
@@ -2776,9 +3140,9 @@ function renderJobActivity(container, job) {
   const sendBtn = document.getElementById('activity-send-btn');
   const doneBtn = document.getElementById('activity-done-btn');
 
-  sendBtn.addEventListener('click', () => sendJobPrompt(job.id, false));
-  doneBtn.addEventListener('click', () => sendJobPrompt(job.id, true));
-  input.addEventListener('keydown', (e) => {
+  if (sendBtn) sendBtn.addEventListener('click', () => sendJobPrompt(job.id, false));
+  if (doneBtn) doneBtn.addEventListener('click', () => sendJobPrompt(job.id, true));
+  if (input) input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') sendJobPrompt(job.id, false);
   });
 
@@ -3065,7 +3429,11 @@ function renderRoutineDetail(routine) {
 
 function triggerRoutine(id) {
   apiFetch('/api/routines/' + id + '/trigger', { method: 'POST' })
-    .then(() => showToast('Routine triggered', 'success'))
+    .then(() => {
+      showToast('Routine triggered', 'success');
+      if (currentRoutineId === id) openRoutineDetail(id);
+      else loadRoutines();
+    })
     .catch((err) => showToast('Trigger failed: ' + err.message, 'error'));
 }
 
@@ -3144,8 +3512,18 @@ function shortModelName(model) {
 
 function fetchGatewayStatus() {
   apiFetch('/api/gateway/status').then(function(data) {
+    // Update restart button visibility
+    restartEnabled = data.restart_enabled || false;
+    updateRestartButtonVisibility();
+
     var popover = document.getElementById('gateway-popover');
     var html = '';
+
+    // Version
+    if (data.version) {
+      html += '<div class="gw-section-label">IronClaw v' + escapeHtml(data.version) + '</div>';
+      html += '<div class="gw-divider"></div>';
+    }
 
     // Connection info
     html += '<div class="gw-section-label">Connections</div>';
@@ -3203,10 +3581,15 @@ let teeReportCache = null;
 let teeReportLoading = false;
 
 function teeApiBase() {
-  var parts = window.location.hostname.split('.');
-  if (parts.length < 2) return null;
-  var domain = parts.slice(1).join('.');
-  return window.location.protocol + '//api.' + domain;
+    var hostname = window.location.hostname;
+    // Skip IP addresses (IPv4 and IPv6) and localhost
+    if (hostname === "localhost" || /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(hostname) || hostname.indexOf(":") !== -1) {
+        return null;
+    }
+    var parts = hostname.split(".");
+    if (parts.length < 2) return null;
+    var domain = parts.slice(1).join(".");
+    return window.location.protocol + "//api." + domain;
 }
 
 function teeInstanceName() {
@@ -3217,13 +3600,19 @@ function checkTeeStatus() {
   var base = teeApiBase();
   if (!base) return;
   var name = teeInstanceName();
-  fetch(base + '/instances/' + encodeURIComponent(name) + '/attestation').then(function(res) {
-    if (!res.ok) throw new Error(res.status);
-    return res.json();
-  }).then(function(data) {
-    teeInfo = data;
-    document.getElementById('tee-shield').style.display = 'flex';
-  }).catch(function() {});
+  try {
+    fetch(base + '/instances/' + encodeURIComponent(name) + '/attestation').then(function(res) {
+      if (!res.ok) throw new Error(res.status);
+      return res.json();
+    }).then(function(data) {
+      teeInfo = data;
+      document.getElementById('tee-shield').style.display = 'flex';
+    }).catch(function(err) {
+      console.warn('Failed to fetch TEE attestation:', err);
+    });
+  } catch (e) {
+    console.warn("Failed to check TEE status:", e);
+  }
 }
 
 function fetchTeeReport() {
@@ -3615,7 +4004,7 @@ function formatTimeAgo(epochMs) {
 }
 
 function installSkill(nameOrSlug, url, btn) {
-  var body = { name: nameOrSlug };
+  var body = { name: nameOrSlug, slug: nameOrSlug };
   if (url) body.url = url;
 
   apiFetch('/api/skills/install', {

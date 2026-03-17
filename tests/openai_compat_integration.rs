@@ -72,6 +72,8 @@ impl LlmProvider for MockLlmProvider {
             input_tokens: 10,
             output_tokens: 5,
             finish_reason: FinishReason::Stop,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
         })
     }
 
@@ -97,6 +99,8 @@ impl LlmProvider for MockLlmProvider {
                 input_tokens: 15,
                 output_tokens: 8,
                 finish_reason: FinishReason::ToolUse,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             })
         } else {
             Ok(ToolCompletionResponse {
@@ -105,6 +109,8 @@ impl LlmProvider for MockLlmProvider {
                 input_tokens: 10,
                 output_tokens: 4,
                 finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             })
         }
     }
@@ -143,6 +149,8 @@ impl LlmProvider for FixedModelProvider {
             input_tokens: 10,
             output_tokens: 5,
             finish_reason: FinishReason::Stop,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
         })
     }
 
@@ -156,6 +164,8 @@ impl LlmProvider for FixedModelProvider {
             input_tokens: 10,
             output_tokens: 5,
             finish_reason: FinishReason::Stop,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
         })
     }
 
@@ -193,6 +203,7 @@ async fn start_test_server_with_provider(
         store: None,
         job_manager: None,
         prompt_queue: None,
+        scheduler: None,
         default_user_id: "test-user".to_string(),
         shutdown_tx: tokio::sync::RwLock::new(None),
         ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
@@ -204,6 +215,7 @@ async fn start_test_server_with_provider(
         chat_rate_limiter: PerUserRateLimiter::new(30, 60),
         registry_entries: Vec::new(),
         cost_guard: None,
+        routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
         startup_time: std::time::Instant::now(),
         restart_requested: std::sync::atomic::AtomicBool::new(false),
         collection_write_tx: None,
@@ -686,6 +698,7 @@ async fn test_no_llm_provider_returns_503() {
         store: None,
         job_manager: None,
         prompt_queue: None,
+        scheduler: None,
         default_user_id: "test-user".to_string(),
         shutdown_tx: tokio::sync::RwLock::new(None),
         ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
@@ -697,6 +710,7 @@ async fn test_no_llm_provider_returns_503() {
         chat_rate_limiter: PerUserRateLimiter::new(30, 60),
         registry_entries: Vec::new(),
         cost_guard: None,
+        routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
         startup_time: std::time::Instant::now(),
         restart_requested: std::sync::atomic::AtomicBool::new(false),
         collection_write_tx: None,
@@ -727,8 +741,8 @@ async fn test_chat_completions_body_too_large() {
     let (addr, _state, _mock_state) = start_test_server().await;
     let url = format!("http://{}/v1/chat/completions", addr);
 
-    // Build a payload over 1 MB (the gateway's DefaultBodyLimit)
-    let big_content = "x".repeat(2 * 1024 * 1024);
+    // Build a payload over 10 MB (the gateway's DefaultBodyLimit)
+    let big_content = "x".repeat(11 * 1024 * 1024);
     let resp = client()
         .post(&url)
         .bearer_auth(AUTH_TOKEN)

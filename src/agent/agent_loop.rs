@@ -13,6 +13,7 @@ use futures::StreamExt;
 
 use crate::agent::context_monitor::ContextMonitor;
 use crate::agent::heartbeat::spawn_heartbeat;
+use crate::agent::organizer_runner::{OrganizerConfig, spawn_organizer};
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
 use crate::agent::self_repair::{DefaultSelfRepair, RepairResult, SelfRepair};
 use crate::agent::session_manager::SessionManager;
@@ -29,6 +30,9 @@ use crate::llm::LlmProvider;
 use crate::safety::SafetyLayer;
 use crate::skills::SkillRegistry;
 use crate::tools::ToolRegistry;
+use uuid::Uuid;
+
+use crate::channels::web::server::WorkspacePool;
 use crate::workspace::Workspace;
 
 /// Collapse a tool output string into a single-line preview for display.
@@ -73,6 +77,30 @@ pub struct AgentDeps {
     pub hooks: Arc<HookRegistry>,
     /// Cost enforcement guardrails (daily budget, hourly rate limits).
     pub cost_guard: Arc<crate::agent::cost_guard::CostGuard>,
+    /// SSE broadcast manager for live job event streaming to the web gateway.
+    pub sse_tx: Option<Arc<crate::channels::web::sse::SseManager>>,
+    /// HTTP interceptor for trace recording/replay.
+    pub http_interceptor: Option<Arc<dyn crate::llm::recording::HttpInterceptor>>,
+    /// Audio transcription middleware for voice messages.
+    pub transcription: Option<Arc<crate::transcription::TranscriptionMiddleware>>,
+    /// Document text extraction middleware for PDF, DOCX, PPTX, etc.
+    pub document_extraction: Option<Arc<crate::document_extraction::DocumentExtractionMiddleware>>,
+    /// Workspace router for automatic topic-based context switching.
+    pub workspace_router: Option<Arc<crate::agent::workspace_router::WorkspaceRouter>>,
+    /// Pluggable thread resolver for message-to-thread routing and context injection.
+    /// When set, takes priority over `workspace_router` for routing decisions.
+    pub thread_resolver: Option<Arc<dyn crate::agent::thread_resolver::ThreadResolver>>,
+    /// Tool names that are always included in LLM context.
+    /// When non-empty, only core + discovered tools are sent to the LLM.
+    /// Empty = backward compatible (all tools sent).
+    pub core_tools: Vec<String>,
+    /// Receiver for organizer signals (passed to the organizer runner on spawn).
+    /// Created in main.rs alongside the resolver; consumed once by spawn_organizer.
+    pub organize_rx: Option<tokio::sync::mpsc::Receiver<crate::agent::organizer_runner::OrganizerSignal>>,
+    /// Per-user workspace pool for multi-tenant mode.
+    /// When set, the agent resolves per-user workspaces from this pool
+    /// (using the incoming message's `user_id`) instead of the single shared workspace.
+    pub workspace_pool: Option<Arc<WorkspacePool>>,
 }
 
 /// The main agent that coordinates all components.
@@ -88,9 +116,15 @@ pub struct Agent {
     pub(super) heartbeat_config: Option<HeartbeatConfig>,
     pub(super) hygiene_config: Option<crate::config::HygieneConfig>,
     pub(super) routine_config: Option<RoutineConfig>,
+    /// Optional slot to expose the routine engine to the gateway for manual triggering.
+    pub(super) routine_engine_slot:
+        Option<Arc<tokio::sync::RwLock<Option<Arc<crate::agent::routine_engine::RoutineEngine>>>>>,
     /// Broadcast sender for collection write events (shared with gateway).
     pub(super) collection_write_tx:
         Option<tokio::sync::broadcast::Sender<crate::agent::collection_events::CollectionWriteEvent>>,
+    /// Gateway state for injecting routine engine (late init).
+    pub(super) gateway_state:
+        Option<Arc<crate::channels::web::server::GatewayState>>,
 }
 
 impl Agent {
@@ -115,7 +149,7 @@ impl Agent {
 
         let session_manager = session_manager.unwrap_or_else(|| Arc::new(SessionManager::new()));
 
-        let scheduler = Arc::new(Scheduler::new(
+        let mut scheduler = Scheduler::new(
             config.clone(),
             context_manager.clone(),
             deps.llm.clone(),
@@ -123,7 +157,17 @@ impl Agent {
             deps.tools.clone(),
             deps.store.clone(),
             deps.hooks.clone(),
-        ));
+        );
+        if let Some(ref sse) = deps.sse_tx {
+            scheduler.set_sse_sender(Arc::clone(sse));
+        }
+        if !deps.core_tools.is_empty() {
+            scheduler.set_core_tools(deps.core_tools.clone());
+        }
+        if let Some(ref interceptor) = deps.http_interceptor {
+            scheduler.set_http_interceptor(Arc::clone(interceptor));
+        }
+        let scheduler = Arc::new(scheduler);
 
         Self {
             config,
@@ -137,8 +181,27 @@ impl Agent {
             heartbeat_config,
             hygiene_config,
             routine_config,
+            routine_engine_slot: None,
             collection_write_tx,
+            gateway_state: None,
         }
+    }
+
+    /// Set the routine engine slot for exposing the engine to the gateway.
+    pub fn set_routine_engine_slot(
+        &mut self,
+        slot: Arc<tokio::sync::RwLock<Option<Arc<crate::agent::routine_engine::RoutineEngine>>>>,
+    ) {
+        self.routine_engine_slot = Some(slot);
+    }
+
+    /// Inject the gateway state for late-init fields (e.g., routine engine).
+    pub fn with_gateway_state(
+        mut self,
+        state: Arc<crate::channels::web::server::GatewayState>,
+    ) -> Self {
+        self.gateway_state = Some(state);
+        self
     }
 
     // Convenience accessors
@@ -150,6 +213,47 @@ impl Agent {
 
     pub(super) fn store(&self) -> Option<&Arc<dyn Database>> {
         self.deps.store.as_ref()
+    }
+
+    /// Get or create the default "general" workspace for a user.
+    ///
+    /// Returns the existing workspace if one with topic "general" already exists,
+    /// otherwise creates a new one with an embedding for general conversation.
+    async fn get_or_create_default_workspace(
+        &self,
+        user_id: &str,
+        router: &crate::agent::workspace_router::WorkspaceRouter,
+        store: &Arc<dyn Database>,
+    ) -> Result<Option<crate::db::AgentWorkspace>, Error> {
+        // Check for existing default workspace
+        let workspaces = store.list_agent_workspaces(user_id, Some("active")).await?;
+        if let Some(existing) = workspaces.iter().find(|ws| ws.topic == "general") {
+            return Ok(Some(existing.clone()));
+        }
+
+        // Create new default workspace
+        let conversation_id = store
+            .create_conversation("workspace", user_id, None)
+            .await?;
+        let ws = store
+            .create_agent_workspace(user_id, conversation_id)
+            .await?;
+
+        let embedding = router
+            .embed("general conversation and miscellaneous topics")
+            .await
+            .map_err(|e| {
+                crate::error::DatabaseError::Query(format!("embed failed: {e}"))
+            })?;
+        store
+            .update_agent_workspace_topic(ws.id, "general", &embedding)
+            .await?;
+
+        tracing::info!(workspace_id = %ws.id, "Created default 'general' workspace");
+
+        // Re-fetch the workspace to get the updated topic
+        let workspaces = store.list_agent_workspaces(user_id, Some("active")).await?;
+        Ok(workspaces.into_iter().find(|w| w.id == ws.id))
     }
 
     pub(super) fn llm(&self) -> &Arc<dyn LlmProvider> {
@@ -173,6 +277,23 @@ impl Agent {
         self.deps.workspace.as_ref()
     }
 
+    /// Resolve a workspace for a specific user.
+    ///
+    /// In multi-tenant mode (workspace pool available), looks up or creates
+    /// a per-user workspace from the pool. Falls back to the single shared
+    /// workspace when no pool is configured.
+    pub(super) async fn workspace_for_user(&self, user_id: &str) -> Option<Arc<Workspace>> {
+        if let Some(ref pool) = self.deps.workspace_pool {
+            let identity = crate::channels::web::auth::UserIdentity {
+                user_id: user_id.to_string(),
+                workspace_read_scopes: Vec::new(),
+            };
+            Some(pool.get_or_create(&identity).await)
+        } else {
+            self.deps.workspace.as_ref().map(Arc::clone)
+        }
+    }
+
     pub(super) fn hooks(&self) -> &Arc<HookRegistry> {
         &self.deps.hooks
     }
@@ -190,9 +311,13 @@ impl Agent {
     }
 
     /// Select active skills for a message using deterministic prefiltering.
+    ///
+    /// If `user_id` is provided, skills with a `scope` field are filtered to
+    /// only those matching the user. Skills without a scope activate for all.
     pub(super) fn select_active_skills(
         &self,
         message_content: &str,
+        user_id: Option<&str>,
     ) -> Vec<crate::skills::LoadedSkill> {
         if let Some(registry) = self.skill_registry() {
             let guard = match registry.read() {
@@ -209,6 +334,7 @@ impl Agent {
                 available,
                 skills_cfg.max_active_skills,
                 skills_cfg.max_context_tokens,
+                user_id,
             );
 
             if !selected.is_empty() {
@@ -230,7 +356,7 @@ impl Agent {
     }
 
     /// Run the agent main loop.
-    pub async fn run(self) -> Result<(), Error> {
+    pub async fn run(mut self) -> Result<(), Error> {
         // Start channels
         let mut message_stream = self.channels.start_all().await?;
 
@@ -332,8 +458,19 @@ impl Agent {
         let heartbeat_handle = if let Some(ref hb_config) = self.heartbeat_config {
             if hb_config.enabled {
                 if let Some(workspace) = self.workspace() {
-                    let config = AgentHeartbeatConfig::default()
+                    let mut config = AgentHeartbeatConfig::default()
                         .with_interval(std::time::Duration::from_secs(hb_config.interval_secs));
+                    config.quiet_hours_start = hb_config.quiet_hours_start;
+                    config.quiet_hours_end = hb_config.quiet_hours_end;
+                    config.timezone = hb_config
+                        .timezone
+                        .clone()
+                        .or_else(|| Some(self.config.default_timezone.clone()));
+                    if let (Some(user), Some(channel)) =
+                        (&hb_config.notify_user, &hb_config.notify_channel)
+                    {
+                        config = config.with_notify(user, channel);
+                    }
 
                     // Set up notification channel
                     let (notify_tx, mut notify_rx) =
@@ -384,14 +521,33 @@ impl Agent {
                         hygiene,
                         workspace.clone(),
                         self.cheap_llm().clone(),
-                        self.safety().clone(),
                         Some(notify_tx),
+                        self.store().map(Arc::clone),
                     ))
                 } else {
                     tracing::warn!("Heartbeat enabled but no workspace available");
                     None
                 }
             } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Spawn organizer if enabled
+        let organizer_config = OrganizerConfig::from_env();
+        let organizer_handle = if organizer_config.enabled {
+            if let Some(ref resolver) = self.deps.thread_resolver {
+                let rx = self.deps.organize_rx.take().unwrap_or_else(|| {
+                    // No signal channel configured; create a dummy one.
+                    // The organizer will still run on ceiling ticks.
+                    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+                    rx
+                });
+                Some(spawn_organizer(organizer_config, Arc::clone(resolver), rx))
+            } else {
+                tracing::warn!("Organizer enabled but no thread resolver available");
                 None
             }
         } else {
@@ -485,6 +641,11 @@ impl Agent {
                     // SAFETY: self is consumed by run(), we can smuggle the engine in
                     // via a local to use in the message loop below.
 
+                    // Expose engine to gateway for manual triggering
+                    if let Some(ref slot) = self.routine_engine_slot {
+                        *slot.write().await = Some(Arc::clone(&engine));
+                    }
+
                     tracing::info!(
                         "Routines enabled: cron ticker every {}s, max {} concurrent",
                         rt_config.cron_check_interval_secs,
@@ -527,8 +688,29 @@ impl Agent {
                 }
             };
 
-            match self.handle_message(&message).await {
-                Ok(Some(response)) if !response.is_empty() => {
+            // Apply transcription middleware to audio attachments
+            let mut message = message;
+            if let Some(ref transcription) = self.deps.transcription {
+                transcription.process(&mut message).await;
+            }
+
+            // Apply document extraction middleware to document attachments
+            if let Some(ref doc_extraction) = self.deps.document_extraction {
+                doc_extraction.process(&mut message).await;
+            }
+
+            // Store successfully extracted document text in workspace for indexing
+            self.store_extracted_documents(&message).await;
+
+            // Check if the caller requested response suppression (passive ingestion).
+            let suppress = message
+                .metadata
+                .get("suppress_response")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            match self.handle_message(&mut message).await {
+                Ok(Some(response)) if !response.is_empty() && !suppress => {
                     // Hook: BeforeOutbound — allow hooks to modify or suppress outbound
                     let event = crate::hooks::HookEvent::Outbound {
                         user_id: message.user_id.clone(),
@@ -569,6 +751,13 @@ impl Agent {
                             }
                         }
                     }
+                }
+                Ok(Some(response)) if suppress && !response.is_empty() => {
+                    tracing::debug!(
+                        user = %message.user_id,
+                        response_len = response.len(),
+                        "suppress_response=true, skipping outbound response"
+                    );
                 }
                 Ok(Some(empty)) => {
                     // Empty response, nothing to send (e.g. approval handled via send_status)
@@ -619,13 +808,83 @@ impl Agent {
         if let Some((cron_handle, _)) = routine_handle {
             cron_handle.abort();
         }
+        if let Some(handle) = organizer_handle {
+            handle.abort();
+        }
         self.scheduler.stop_all().await;
         self.channels.shutdown_all().await?;
 
         Ok(())
     }
 
-    async fn handle_message(&self, message: &IncomingMessage) -> Result<Option<String>, Error> {
+    /// Store extracted document text in workspace memory for future search/recall.
+    async fn store_extracted_documents(&self, message: &IncomingMessage) {
+        let workspace = match self.workspace() {
+            Some(ws) => ws,
+            None => return,
+        };
+
+        for attachment in &message.attachments {
+            if attachment.kind != crate::channels::AttachmentKind::Document {
+                continue;
+            }
+            let text = match &attachment.extracted_text {
+                Some(t) if !t.starts_with('[') => t, // skip error messages like "[Failed to..."
+                _ => continue,
+            };
+
+            // Sanitize filename: strip path separators to prevent directory traversal
+            let raw_name = attachment.filename.as_deref().unwrap_or("unnamed_document");
+            let filename: String = raw_name
+                .chars()
+                .map(|c| {
+                    if c == '/' || c == '\\' || c == '\0' {
+                        '_'
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            let filename = filename.trim_start_matches('.');
+            let filename = if filename.is_empty() {
+                "unnamed_document"
+            } else {
+                filename
+            };
+            let date = chrono::Utc::now().format("%Y-%m-%d");
+            let path = format!("documents/{date}/{filename}");
+
+            let header = format!(
+                "# {filename}\n\n\
+                 > Uploaded by **{}** via **{}** on {date}\n\
+                 > MIME: {} | Size: {} bytes\n\n---\n\n",
+                message.user_id,
+                message.channel,
+                attachment.mime_type,
+                attachment.size_bytes.unwrap_or(0),
+            );
+            let content = format!("{header}{text}");
+
+            match workspace.write(&path, &content).await {
+                Ok(_) => {
+                    tracing::info!(
+                        path = %path,
+                        text_len = text.len(),
+                        "Stored extracted document in workspace memory"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path,
+                        error = %e,
+                        "Failed to store extracted document in workspace"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn handle_message(&self, message: &mut IncomingMessage) -> Result<Option<String>, Error> {
         // Set message tool context for this turn (current channel and target)
         // For Signal, use signal_target from metadata (group:ID or phone number),
         // otherwise fall back to user_id
@@ -641,6 +900,10 @@ impl Agent {
 
         // Parse submission type first
         let mut submission = SubmissionParser::parse(&message.content);
+        tracing::debug!(
+            "[agent_loop] Parsed submission: {:?}",
+            std::any::type_name_of_val(&submission)
+        );
 
         // Hook: BeforeInbound — allow hooks to modify or reject user input
         if let Submission::UserInput { ref content } = submission {
@@ -668,20 +931,166 @@ impl Agent {
             }
         }
 
+        // Thread routing: if no explicit thread_id, resolve which thread to use.
+        // Priority: workspace_id metadata pin > thread_resolver (pluggable) > workspace_router (legacy).
+        let mut routed_thread_id = message.thread_id.clone();
+        let mut resolver_context: Option<String> = None;
+        let mut resolved_embedding: Option<Vec<f32>> = None;
+
+        // If a workspace_id is provided in metadata, pin to that workspace's thread.
+        if routed_thread_id.is_none()
+            && let Some(ws_id_str) = message.metadata.get("workspace_id").and_then(|v| v.as_str())
+            && let Ok(ws_id) = uuid::Uuid::parse_str(ws_id_str)
+            && let Some(ref store) = self.deps.store
+        {
+            use crate::db::AgentWorkspaceStore;
+            if let Ok(Some(ws)) = AgentWorkspaceStore::get_agent_workspace(store.as_ref(), ws_id).await {
+                routed_thread_id = Some(ws.conversation_id.to_string());
+                tracing::info!(workspace_id = %ws_id, "Pinned to workspace via metadata");
+            }
+        }
+
+        if routed_thread_id.is_none()
+            && let Submission::UserInput { ref content } = submission
+        {
+            if let Some(ref resolver) = self.deps.thread_resolver {
+                // Use the pluggable thread resolver
+                let default_thread_id = Uuid::new_v4(); // placeholder; resolver may ignore it
+                match resolver
+                    .resolve(&message.user_id, content, default_thread_id)
+                    .await
+                {
+                    Ok(resolution) => {
+                        if let Some(tid) = resolution.thread_id {
+                            tracing::info!(
+                                "ThreadResolver: routed to thread {}",
+                                tid
+                            );
+                            routed_thread_id = Some(tid.to_string());
+                        }
+                        resolver_context = resolution.context;
+                        resolved_embedding = resolution.message_embedding;
+                        // Broadcast routing metadata via SSE
+                        if !resolution.metadata.is_empty()
+                            && let Some(ref sse) = self.deps.sse_tx
+                            && let (Some(ws_id), Some(topic)) = (
+                                resolution.metadata.get("workspace_id"),
+                                resolution.metadata.get("topic"),
+                            )
+                        {
+                            sse.broadcast_for_user(
+                                &message.user_id,
+                                crate::channels::web::types::SseEvent::WorkspaceRouted {
+                                    workspace_id: ws_id.clone(),
+                                    topic: topic.clone(),
+                                    is_new: resolution.metadata.get("is_new")
+                                        .is_some_and(|v| v == "true"),
+                                    thread_id: routed_thread_id.clone(),
+                                },
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("ThreadResolver failed: {}, falling back", e);
+                    }
+                }
+            } else if let Some(ref router) = self.deps.workspace_router {
+                // Legacy workspace router fallback
+                match router.route(&message.user_id, content).await {
+                    Ok(Some(ws)) if ws.topic != "general" => {
+                        tracing::info!(
+                            "Workspace routing: matched workspace {} (topic: {})",
+                            ws.id, ws.topic
+                        );
+                        routed_thread_id = Some(ws.conversation_id.to_string());
+                        if let Some(ref sse) = self.deps.sse_tx {
+                            sse.broadcast_for_user(&message.user_id, crate::channels::web::types::SseEvent::WorkspaceRouted {
+                                workspace_id: ws.id.to_string(),
+                                topic: ws.topic.clone(),
+                                is_new: false,
+                                thread_id: Some(ws.conversation_id.to_string()),
+                            });
+                        }
+                        if let Some(ref store) = self.deps.store {
+                            let _ = store.touch_agent_workspace(ws.id).await;
+                        }
+                    }
+                    Ok(Some(_)) | Ok(None) => {
+                        if let Some(ref store) = self.deps.store {
+                            match self
+                                .get_or_create_default_workspace(
+                                    &message.user_id,
+                                    router,
+                                    store,
+                                )
+                                .await
+                            {
+                                Ok(Some(ws)) => {
+                                    tracing::info!(
+                                        "Workspace routing: default workspace {} (topic: {})",
+                                        ws.id, ws.topic
+                                    );
+                                    routed_thread_id = Some(ws.conversation_id.to_string());
+                                    if let Some(ref sse) = self.deps.sse_tx {
+                                        sse.broadcast_for_user(
+                                            &message.user_id,
+                                            crate::channels::web::types::SseEvent::WorkspaceRouted {
+                                                workspace_id: ws.id.to_string(),
+                                                topic: ws.topic.clone(),
+                                                is_new: false,
+                                                thread_id: Some(ws.conversation_id.to_string()),
+                                            },
+                                        );
+                                    }
+                                }
+                                Ok(None) => {
+                                    tracing::info!(
+                                        "Workspace routing: no default workspace, using ephemeral thread"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to get/create default workspace: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Workspace routing failed: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Inject resolver context into message metadata so the dispatcher can use it
+        if let Some(ref ctx) = resolver_context
+            && let Some(obj) = message.metadata.as_object_mut()
+        {
+            obj.insert("__resolver_context".to_string(), serde_json::json!(ctx));
+        }
+
         // Hydrate thread from DB if it's a historical thread not in memory
-        if let Some(ref external_thread_id) = message.thread_id {
+        let effective_thread_id = routed_thread_id.as_ref().or(message.thread_id.as_ref());
+        if let Some(external_thread_id) = effective_thread_id {
             self.maybe_hydrate_thread(message, external_thread_id).await;
         }
 
-        // Resolve session and thread
+        // Resolve session and thread — use routed thread_id if workspace routing matched
         let (session, thread_id) = self
             .session_manager
             .resolve_thread(
                 &message.user_id,
                 &message.channel,
-                message.thread_id.as_deref(),
+                routed_thread_id.as_deref().or(message.thread_id.as_deref()),
             )
             .await;
+
+        // Propagate the resolved thread_id back to the message so the gateway
+        // can tag SSE responses with the correct thread. Without this, messages
+        // arriving without an explicit thread_id would produce responses that
+        // the gateway drops ("no thread_id — skipping").
+        if message.thread_id.is_none() {
+            message.thread_id = routed_thread_id.or_else(|| Some(thread_id.to_string()));
+        }
 
         // Auth mode interception: if the thread is awaiting a token, route
         // the message directly to the credential store. Nothing touches
@@ -725,7 +1134,14 @@ impl Agent {
                     .await
             }
             Submission::SystemCommand { command, args } => {
-                self.handle_system_command(&command, &args).await
+                tracing::debug!(
+                    "[agent_loop] SystemCommand: command={}, channel={}",
+                    command,
+                    message.channel
+                );
+                // Authorization checks (including restart channel check) are enforced in handle_system_command
+                self.handle_system_command(&command, &args, &message.channel)
+                    .await
             }
             Submission::Undo => self.process_undo(session, thread_id).await,
             Submission::Redo => self.process_redo(session, thread_id).await,
@@ -736,6 +1152,17 @@ impl Agent {
             Submission::Heartbeat => self.process_heartbeat().await,
             Submission::Summarize => self.process_summarize(session, thread_id).await,
             Submission::Suggest => self.process_suggest(session, thread_id).await,
+            Submission::Organize => self.process_organize(&message.user_id).await,
+            Submission::WorkspaceList => {
+                self.process_workspace_list(&message.user_id).await
+            }
+            Submission::WorkspaceSwitch { name } => {
+                self.process_workspace_switch(&message.user_id, &name)
+                    .await
+            }
+            Submission::WorkspaceSummary => {
+                self.process_workspace_summary(&message.user_id).await
+            }
             Submission::JobStatus { job_id } => {
                 self.process_job_status(&message.user_id, job_id.as_deref())
                     .await
@@ -770,6 +1197,20 @@ impl Agent {
                     .await
             }
         };
+
+        // Notify the resolver that a message was processed in this thread.
+        // This allows stickiness tracking and other post-routing bookkeeping.
+        if let Some(ref resolver) = self.deps.thread_resolver
+            && result.is_ok()
+        {
+            resolver
+                .notify_routed(
+                    &message.user_id,
+                    thread_id,
+                    resolved_embedding.as_deref(),
+                )
+                .await;
+        }
 
         // Convert SubmissionResult to response string
         match result? {

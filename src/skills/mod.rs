@@ -19,17 +19,41 @@ pub mod catalog;
 pub mod gating;
 pub mod parser;
 pub mod registry;
+pub mod script_runner;
 pub mod selector;
 
-pub use attenuation::{AttenuationResult, attenuate_tools};
+pub use attenuation::{AttenuationResult, attenuate_tools, filter_tools_by_visibility};
 pub use registry::SkillRegistry;
 pub(crate) use registry::load_and_validate_skill;
+pub use script_runner::run_activation_script;
 pub use selector::prefilter_skills;
 
 use std::path::PathBuf;
 
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
+
+/// Optional user scope for a skill. When set, the skill only activates for
+/// matching user IDs. Supports both a single string and a list via untagged
+/// serde deserialization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum SkillScope {
+    /// Skill is scoped to a single user.
+    Single(String),
+    /// Skill is scoped to multiple users.
+    Multiple(Vec<String>),
+}
+
+impl SkillScope {
+    /// Check if the given user_id is within this scope.
+    pub fn matches(&self, user_id: &str) -> bool {
+        match self {
+            SkillScope::Single(s) => s == user_id,
+            SkillScope::Multiple(v) => v.iter().any(|s| s == user_id),
+        }
+    }
+}
 
 /// Maximum number of keywords allowed per skill to prevent scoring manipulation.
 const MAX_KEYWORDS_PER_SKILL: usize = 20;
@@ -92,6 +116,33 @@ pub enum SkillSource {
     Bundled(PathBuf),
 }
 
+/// Script to run at skill activation time, capturing stdout as dynamic context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivationScript {
+    /// Interpreter language: "python", "bash", or "node".
+    pub language: String,
+    /// Inline script content (mutually exclusive with `source_file`).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Script file path relative to the skill directory (mutually exclusive with `source`).
+    #[serde(default)]
+    pub source_file: Option<String>,
+    /// Script execution timeout in milliseconds.
+    #[serde(default = "default_script_timeout")]
+    pub timeout_ms: u64,
+    /// Maximum bytes to capture from stdout.
+    #[serde(default = "default_max_output")]
+    pub max_output_bytes: usize,
+}
+
+fn default_script_timeout() -> u64 {
+    5000
+}
+
+fn default_max_output() -> usize {
+    4096
+}
+
 /// Activation criteria parsed from SKILL.md frontmatter `activation` section.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActivationCriteria {
@@ -99,6 +150,10 @@ pub struct ActivationCriteria {
     /// Capped at `MAX_KEYWORDS_PER_SKILL` during loading.
     #[serde(default)]
     pub keywords: Vec<String>,
+    /// Keywords that veto this skill — if any match, score is 0 regardless of
+    /// keyword/pattern matches. Prevents cross-skill interference.
+    #[serde(default)]
+    pub exclude_keywords: Vec<String>,
     /// Regex patterns for more complex matching.
     /// Capped at `MAX_PATTERNS_PER_SKILL` during loading.
     #[serde(default)]
@@ -109,6 +164,13 @@ pub struct ActivationCriteria {
     /// Maximum context tokens this skill's prompt should consume.
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: usize,
+    /// Tool name prefix to auto-discover when this skill activates.
+    /// When set, matching tools are loaded into the session automatically.
+    #[serde(default)]
+    pub tools_prefix: Option<String>,
+    /// Script to run at activation time; stdout is appended to prompt content.
+    #[serde(default)]
+    pub script: Option<ActivationScript>,
 }
 
 impl ActivationCriteria {
@@ -119,6 +181,9 @@ impl ActivationCriteria {
     pub fn enforce_limits(&mut self) {
         self.keywords.retain(|k| k.len() >= MIN_KEYWORD_TAG_LENGTH);
         self.keywords.truncate(MAX_KEYWORDS_PER_SKILL);
+        self.exclude_keywords
+            .retain(|k| k.len() >= MIN_KEYWORD_TAG_LENGTH);
+        self.exclude_keywords.truncate(MAX_KEYWORDS_PER_SKILL);
         self.patterns.truncate(MAX_PATTERNS_PER_SKILL);
         self.tags.retain(|t| t.len() >= MIN_KEYWORD_TAG_LENGTH);
         self.tags.truncate(MAX_TAGS_PER_SKILL);
@@ -146,6 +211,10 @@ pub struct SkillManifest {
     /// Optional OpenClaw metadata.
     #[serde(default)]
     pub metadata: Option<SkillMetadata>,
+    /// Optional user_id scope. If set, the skill only activates for matching users.
+    /// Can be a single user_id or a list. If empty/None, activates for all users.
+    #[serde(default)]
+    pub scope: Option<SkillScope>,
 }
 
 fn default_version() -> String {
@@ -200,6 +269,9 @@ pub struct LoadedSkill {
     /// Pre-computed lowercased keywords for scoring (avoids per-message allocation).
     /// Derived from `manifest.activation.keywords` at load time — do not mutate independently.
     pub lowercased_keywords: Vec<String>,
+    /// Pre-computed lowercased exclude keywords for veto scoring.
+    /// Derived from `manifest.activation.exclude_keywords` at load time.
+    pub lowercased_exclude_keywords: Vec<String>,
     /// Pre-computed lowercased tags for scoring (avoids per-message allocation).
     /// Derived from `manifest.activation.tags` at load time — do not mutate independently.
     pub lowercased_tags: Vec<String>,
@@ -385,6 +457,74 @@ mod tests {
     }
 
     #[test]
+    fn test_activation_criteria_enforce_limits() {
+        // Build criteria that exceed all limits:
+        // - 25 keywords (5 over the 20 cap), including some short ones
+        // - 8 patterns (3 over the 5 cap)
+        // - 15 tags (5 over the 10 cap), including some short ones
+        let mut keywords: Vec<String> = vec!["a".into(), "bb".into()]; // short, should be filtered
+        keywords.extend((0..25).map(|i| format!("keyword{}", i)));
+
+        let patterns: Vec<String> = (0..8).map(|i| format!("pattern{}", i)).collect();
+
+        let mut tags: Vec<String> = vec!["x".into(), "ab".into()]; // short, should be filtered
+        tags.extend((0..15).map(|i| format!("tag{}", i)));
+
+        let mut criteria = ActivationCriteria {
+            keywords,
+            patterns,
+            tags,
+            ..Default::default()
+        };
+
+        criteria.enforce_limits();
+
+        // Short keywords (<3 chars) filtered, then truncated to 20
+        assert!(
+            !criteria
+                .keywords
+                .iter()
+                .any(|k| k.len() < MIN_KEYWORD_TAG_LENGTH),
+            "keywords shorter than {} chars should be filtered out",
+            MIN_KEYWORD_TAG_LENGTH
+        );
+        assert_eq!(
+            criteria.keywords.len(),
+            MAX_KEYWORDS_PER_SKILL,
+            "keywords should be capped at {}",
+            MAX_KEYWORDS_PER_SKILL
+        );
+
+        // Patterns truncated to 5 (no length filter on patterns)
+        assert_eq!(
+            criteria.patterns.len(),
+            MAX_PATTERNS_PER_SKILL,
+            "patterns should be capped at {}",
+            MAX_PATTERNS_PER_SKILL
+        );
+        // Verify the retained patterns are the first 5
+        for i in 0..MAX_PATTERNS_PER_SKILL {
+            assert_eq!(criteria.patterns[i], format!("pattern{}", i));
+        }
+
+        // Short tags (<3 chars) filtered, then truncated to 10
+        assert!(
+            !criteria
+                .tags
+                .iter()
+                .any(|t| t.len() < MIN_KEYWORD_TAG_LENGTH),
+            "tags shorter than {} chars should be filtered out",
+            MIN_KEYWORD_TAG_LENGTH
+        );
+        assert_eq!(
+            criteria.tags.len(),
+            MAX_TAGS_PER_SKILL,
+            "tags should be capped at {}",
+            MAX_TAGS_PER_SKILL
+        );
+    }
+
+    #[test]
     fn test_compile_patterns() {
         let patterns = vec![
             r"(?i)\bwrite\b".to_string(),
@@ -439,6 +579,7 @@ metadata:
                 description: String::new(),
                 activation: ActivationCriteria::default(),
                 metadata: None,
+                scope: None,
             },
             prompt_content: "test prompt".to_string(),
             trust: SkillTrust::Trusted,
@@ -446,9 +587,108 @@ metadata:
             content_hash: "sha256:000".to_string(),
             compiled_patterns: vec![],
             lowercased_keywords: vec![],
+            lowercased_exclude_keywords: vec![],
             lowercased_tags: vec![],
         };
         assert_eq!(skill.name(), "test");
         assert_eq!(skill.version(), "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_activation_script_yaml() {
+        let yaml = r#"
+name: scripted-skill
+activation:
+  keywords: ["hours"]
+  script:
+    language: python
+    source: "print('hello')"
+    timeout_ms: 3000
+    max_output_bytes: 2048
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        let script = manifest.activation.script.expect("script should be present");
+        assert_eq!(script.language, "python");
+        assert_eq!(script.source.as_deref(), Some("print('hello')"));
+        assert!(script.source_file.is_none());
+        assert_eq!(script.timeout_ms, 3000);
+        assert_eq!(script.max_output_bytes, 2048);
+    }
+
+    #[test]
+    fn test_activation_script_defaults() {
+        let yaml = r#"
+name: default-script
+activation:
+  script:
+    language: bash
+    source: "echo hi"
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        let script = manifest.activation.script.expect("script should be present");
+        assert_eq!(script.timeout_ms, 5000);
+        assert_eq!(script.max_output_bytes, 4096);
+    }
+
+    #[test]
+    fn test_no_script_field_is_none() {
+        let yaml = r#"
+name: plain-skill
+activation:
+  keywords: ["test"]
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        assert!(manifest.activation.script.is_none());
+    }
+
+    #[test]
+    fn test_skill_scope_single_matches() {
+        let scope = SkillScope::Single("alice".to_string());
+        assert!(scope.matches("alice"));
+        assert!(!scope.matches("bob"));
+    }
+
+    #[test]
+    fn test_skill_scope_multiple_matches() {
+        let scope = SkillScope::Multiple(vec!["alice".to_string(), "bob".to_string()]);
+        assert!(scope.matches("alice"));
+        assert!(scope.matches("bob"));
+        assert!(!scope.matches("charlie"));
+    }
+
+    #[test]
+    fn test_skill_scope_none_means_all_users() {
+        let yaml = r#"
+name: unscoped-skill
+activation:
+  keywords: ["test"]
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        assert!(manifest.scope.is_none());
+    }
+
+    #[test]
+    fn test_skill_scope_single_from_yaml() {
+        let yaml = r#"
+name: scoped-skill
+scope: alice
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        assert_eq!(manifest.scope, Some(SkillScope::Single("alice".to_string())));
+    }
+
+    #[test]
+    fn test_skill_scope_multiple_from_yaml() {
+        let yaml = r#"
+name: multi-scoped
+scope:
+  - alice
+  - bob
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        assert_eq!(
+            manifest.scope,
+            Some(SkillScope::Multiple(vec!["alice".to_string(), "bob".to_string()]))
+        );
     }
 }

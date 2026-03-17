@@ -11,6 +11,7 @@
 //! - Context compaction for long conversations
 
 mod agent_loop;
+mod attachments;
 pub mod collection_events;
 mod commands;
 pub mod compaction;
@@ -19,6 +20,8 @@ pub mod cost_guard;
 mod dispatcher;
 mod heartbeat;
 pub mod job_monitor;
+mod organizer_runner;
+pub mod passive_buffer;
 mod router;
 pub mod routine;
 pub mod routine_engine;
@@ -31,12 +34,18 @@ pub mod task;
 mod thread_ops;
 pub mod undo;
 pub mod worker;
+pub mod thread_resolver;
+pub mod workspace_queue;
+pub mod workspace_router;
+pub mod workspace_thread_resolver;
 
 pub(crate) use agent_loop::truncate_for_preview;
 pub use agent_loop::{Agent, AgentDeps};
+pub use thread_resolver::{OrganizeResult, ResolverError, ThreadResolution, ThreadResolver};
 pub use compaction::{CompactionResult, ContextCompactor};
 pub use context_monitor::{CompactionStrategy, ContextBreakdown, ContextMonitor};
 pub use heartbeat::{HeartbeatConfig, HeartbeatResult, HeartbeatRunner, spawn_heartbeat};
+pub use organizer_runner::{OrganizerConfig, OrganizerSignal, spawn_organizer};
 pub use router::{MessageIntent, Router};
 pub use routine::{Routine, RoutineAction, RoutineRun, Trigger};
 pub use routine_engine::RoutineEngine;

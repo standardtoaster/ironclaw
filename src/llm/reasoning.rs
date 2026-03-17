@@ -5,16 +5,139 @@ use std::sync::{Arc, LazyLock};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::error::LlmError;
+use crate::llm::error::LlmError;
 
 use crate::llm::{
-    ChatMessage, CompletionRequest, LlmProvider, ToolCall, ToolCompletionRequest, ToolDefinition,
+    ChatMessage, CompletionRequest, LlmProvider, Role, ToolCall, ToolCompletionRequest,
+    ToolDefinition,
 };
-use crate::safety::SafetyLayer;
 
 /// Token the agent returns when it has nothing to say (e.g. in group chats).
 /// The dispatcher should check for this and suppress the message.
 pub const SILENT_REPLY_TOKEN: &str = "NO_REPLY";
+
+/// Nudge message injected when the LLM expresses intent to use a tool but
+/// doesn't include any `tool_calls` in its response.
+pub const TOOL_INTENT_NUDGE: &str = "\
+You said you would perform an action, but you did not include any tool calls.\n\
+Do NOT describe what you intend to do — actually call the tool now.\n\
+Use the tool_calls mechanism to invoke the appropriate tool.";
+
+/// Detect when an LLM response expresses intent to call a tool without
+/// actually issuing tool calls. Returns `true` if the text contains phrases
+/// like "Let me search …" or "I'll fetch …" outside of fenced/indented code blocks.
+///
+/// Exclusion phrases (e.g. "let me explain") are checked first to avoid
+/// false positives on conversational language.
+pub fn llm_signals_tool_intent(response: &str) -> bool {
+    // Extract only non-code lines with quoted strings removed
+    let text = strip_code_blocks(response);
+    let lower = text.to_lowercase();
+
+    // Exclusion phrases — if any appear, bail out immediately
+    const EXCLUSIONS: &[&str] = &[
+        "let me explain",
+        "let me know",
+        "let me think",
+        "let me summarize",
+        "let me clarify",
+        "let me describe",
+        "let me help",
+        "let me understand",
+        "let me break",
+        "let me outline",
+        "let me walk you",
+        "let me provide",
+        "let me suggest",
+        "let me elaborate",
+        "let me start by",
+    ];
+    if EXCLUSIONS.iter().any(|e| lower.contains(e)) {
+        return false;
+    }
+
+    const PREFIXES: &[&str] = &["let me ", "i'll ", "i will ", "i'm going to "];
+    const ACTION_VERBS: &[&str] = &[
+        "search",
+        "look up",
+        "check",
+        "fetch",
+        "find",
+        "read the",
+        "write the",
+        "create",
+        "run the",
+        "execute",
+        "query",
+        "retrieve",
+        "add it",
+        "add the",
+        "add this",
+        "add that",
+        "update the",
+        "delete",
+        "remove the",
+        "look into",
+    ];
+
+    for prefix in PREFIXES {
+        for (i, _) in lower.match_indices(prefix) {
+            let after = &lower[i + prefix.len()..];
+            for verb in ACTION_VERBS {
+                if after.starts_with(verb) || after.contains(&format!(" {verb}")) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Strip fenced code blocks (``` ... ```), indented code lines (4+ spaces / tab),
+/// and double-quoted strings so that tool-intent detection only fires on prose.
+fn strip_code_blocks(text: &str) -> String {
+    let mut result = String::new();
+    let mut in_fence = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        // Skip indented code lines (4+ spaces or tab)
+        if line.starts_with("    ") || line.starts_with('\t') {
+            continue;
+        }
+        // Strip double-quoted strings to avoid matching intent phrases inside quotes
+        let stripped = strip_quoted_strings(line);
+        result.push_str(&stripped);
+        result.push('\n');
+    }
+    result
+}
+
+/// Remove double-quoted string literals from a line.
+fn strip_quoted_strings(line: &str) -> String {
+    let mut result = String::with_capacity(line.len());
+    let mut in_quote = false;
+    let mut prev = '\0';
+    for ch in line.chars() {
+        if ch == '"' && prev != '\\' {
+            in_quote = !in_quote;
+            continue;
+        }
+        if !in_quote {
+            result.push(ch);
+        }
+        prev = ch;
+    }
+    result
+}
 
 /// Check if a response is a silent reply (the agent has nothing to say).
 ///
@@ -65,6 +188,10 @@ pub struct ReasoningContext {
     /// When true, force a text-only response (ignore available tools).
     /// Used by the agentic loop to guarantee termination near the iteration limit.
     pub force_text: bool,
+    /// Pre-built system prompt. When set, `respond_with_tools` uses this directly
+    /// instead of calling `build_system_prompt_with_tools`. Allows callers to build
+    /// the prompt once and reuse it across iterations.
+    pub system_prompt: Option<String>,
 }
 
 impl ReasoningContext {
@@ -77,6 +204,7 @@ impl ReasoningContext {
             current_state: None,
             metadata: std::collections::HashMap::new(),
             force_text: false,
+            system_prompt: None,
         }
     }
 
@@ -95,6 +223,13 @@ impl ReasoningContext {
     /// Set available tools.
     pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
         self.available_tools = tools;
+        self
+    }
+
+    /// Set a pre-built system prompt. When set, `respond_with_tools` uses this
+    /// directly instead of building one from `Reasoning` state.
+    pub fn with_system_prompt(mut self, prompt: String) -> Self {
+        self.system_prompt = Some(prompt);
         self
     }
 
@@ -169,6 +304,10 @@ pub struct ToolSelection {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Tokens served from the provider's server-side prompt cache (Anthropic).
+    pub cache_read_input_tokens: u32,
+    /// Tokens written to the provider's prompt cache (Anthropic).
+    pub cache_creation_input_tokens: u32,
 }
 
 impl TokenUsage {
@@ -203,8 +342,6 @@ pub struct RespondOutput {
 /// Reasoning engine for the agent.
 pub struct Reasoning {
     llm: Arc<dyn LlmProvider>,
-    #[allow(dead_code)] // Will be used for sanitizing tool outputs
-    safety: Arc<SafetyLayer>,
     /// Optional workspace for loading identity/system prompts.
     workspace_system_prompt: Option<String>,
     /// Optional skill context block to inject into system prompt.
@@ -222,10 +359,9 @@ pub struct Reasoning {
 
 impl Reasoning {
     /// Create a new reasoning engine.
-    pub fn new(llm: Arc<dyn LlmProvider>, safety: Arc<SafetyLayer>) -> Self {
+    pub fn new(llm: Arc<dyn LlmProvider>) -> Self {
         Self {
             llm,
-            safety,
             workspace_system_prompt: None,
             skill_context: None,
             channel: None,
@@ -311,6 +447,8 @@ impl Reasoning {
         let usage = TokenUsage {
             input_tokens: response.input_tokens,
             output_tokens: response.output_tokens,
+            cache_read_input_tokens: response.cache_read_input_tokens,
+            cache_creation_input_tokens: response.cache_creation_input_tokens,
         };
         Ok((clean_response(&response.content), usage))
     }
@@ -319,8 +457,15 @@ impl Reasoning {
     pub async fn plan(&self, context: &ReasoningContext) -> Result<ActionPlan, LlmError> {
         let system_prompt = self.build_planning_prompt(context);
 
+        let system_prompt = merge_system_messages(system_prompt, &context.messages);
         let mut messages = vec![ChatMessage::system(system_prompt)];
-        messages.extend(context.messages.clone());
+        messages.extend(
+            context
+                .messages
+                .iter()
+                .filter(|m| m.role != Role::System)
+                .cloned(),
+        );
 
         if let Some(ref job) = context.job_description {
             messages.push(ChatMessage::user(format!(
@@ -335,8 +480,9 @@ impl Reasoning {
 
         let response = self.llm.complete(request).await?;
 
-        // Parse the plan from the response
-        self.parse_plan(&response.content)
+        // Clean reasoning model artifacts before parsing JSON
+        let cleaned = clean_response(&response.content);
+        self.parse_plan(&cleaned)
     }
 
     /// Select the best tool for the current situation.
@@ -429,7 +575,9 @@ Respond in JSON format:
 
         let response = self.llm.complete(request).await?;
 
-        self.parse_evaluation(&response.content)
+        // Clean reasoning model artifacts before parsing JSON
+        let cleaned = clean_response(&response.content);
+        self.parse_evaluation(&cleaned)
     }
 
     /// Generate a response to a user message.
@@ -463,10 +611,20 @@ Respond in JSON format:
         &self,
         context: &ReasoningContext,
     ) -> Result<RespondOutput, LlmError> {
-        let system_prompt = self.build_conversation_prompt(context);
+        let system_prompt = match context.system_prompt {
+            Some(ref prompt) => prompt.clone(),
+            None => self.build_system_prompt_with_tools(&context.available_tools),
+        };
 
+        let system_prompt = merge_system_messages(system_prompt, &context.messages);
         let mut messages = vec![ChatMessage::system(system_prompt)];
-        messages.extend(context.messages.clone());
+        messages.extend(
+            context
+                .messages
+                .iter()
+                .filter(|m| m.role != Role::System)
+                .cloned(),
+        );
 
         let effective_tools = if context.force_text {
             Vec::new()
@@ -478,7 +636,7 @@ Respond in JSON format:
         if !effective_tools.is_empty() {
             let mut request = ToolCompletionRequest::new(messages, effective_tools)
                 .with_max_tokens(4096)
-                .with_temperature(0.7)
+                .with_temperature(0.2)
                 .with_tool_choice("auto");
             request.metadata = context.metadata.clone();
 
@@ -486,6 +644,8 @@ Respond in JSON format:
             let usage = TokenUsage {
                 input_tokens: response.input_tokens,
                 output_tokens: response.output_tokens,
+                cache_read_input_tokens: response.cache_read_input_tokens,
+                cache_creation_input_tokens: response.cache_creation_input_tokens,
             };
 
             // If there were tool calls, return them for execution
@@ -545,7 +705,7 @@ Respond in JSON format:
             // No tools, use simple completion
             let mut request = CompletionRequest::new(messages)
                 .with_max_tokens(4096)
-                .with_temperature(0.7);
+                .with_temperature(0.2);
             request.metadata = context.metadata.clone();
 
             let response = self.llm.complete(request).await?;
@@ -564,6 +724,8 @@ Respond in JSON format:
                 usage: TokenUsage {
                     input_tokens: response.input_tokens,
                     output_tokens: response.output_tokens,
+                    cache_read_input_tokens: response.cache_read_input_tokens,
+                    cache_creation_input_tokens: response.cache_creation_input_tokens,
                 },
             })
         }
@@ -612,12 +774,15 @@ Respond with a JSON plan in this format:
         )
     }
 
-    fn build_conversation_prompt(&self, context: &ReasoningContext) -> String {
-        let tools_section = if context.available_tools.is_empty() {
+    /// Build the system prompt with the given tool definitions.
+    ///
+    /// Callers can invoke this once before a loop and pass the result via
+    /// `ReasoningContext::system_prompt` to avoid rebuilding each iteration.
+    pub fn build_system_prompt_with_tools(&self, tools: &[ToolDefinition]) -> String {
+        let tools_section = if tools.is_empty() {
             String::new()
         } else {
-            let tool_list: Vec<String> = context
-                .available_tools
+            let tool_list: Vec<String> = tools
                 .iter()
                 .map(|t| format!("  - {}: {}", t.name, t.description))
                 .collect();
@@ -653,7 +818,7 @@ Respond with a JSON plan in this format:
         let channel_section = self.build_channel_section();
 
         // Extension guidance (only when extension tools are available)
-        let extensions_section = self.build_extensions_section(context);
+        let extensions_section = self.build_extensions_section_for_tools(tools);
 
         // Runtime context (agent metadata)
         let runtime_section = self.build_runtime_section();
@@ -664,60 +829,54 @@ Respond with a JSON plan in this format:
         // Group chat guidance
         let group_section = self.build_group_section();
 
+        let tool_guidance = if tools.is_empty() {
+            String::new()
+        } else {
+            "\n- Call tools when they would help accomplish the task\n\
+             - Do NOT call the same tool repeatedly with similar arguments; if a tool returned unhelpful results, move on\n\
+             - If you have already called tools and gathered enough information, produce your final answer immediately\n\
+             - If tools return empty or irrelevant results, answer with what you already know rather than retrying\n\
+             \n\
+             ## Tool Call Style\n\
+             - ALWAYS call tools via tool_calls — never just describe what you would do\n\
+             - If you say \"let me fetch/check/look up X\", you MUST include the actual tool call in the same response\n\
+             - Do not narrate routine, low-risk tool calls; just call the tool\n\
+             - Narrate only when it helps: multi-step work, sensitive actions, or when the user asks\n\
+             - For multi-step tasks, call independent tools in parallel when possible\n\
+             - If a tool fails, explain the error briefly and try an alternative approach"
+                .to_string()
+        };
+
+        // When a workspace identity prompt exists (AGENTS.md, SOUL.md, etc.),
+        // use it as the primary identity instead of the hardcoded default.
+        // This allows deployments like Percy to fully control the agent's identity.
+        let agent_identity = if self.workspace_system_prompt.is_some() {
+            // Workspace identity comes first — it defines who the agent is
+            String::new()
+        } else {
+            "You are IronClaw Agent, a secure autonomous assistant.\n\n".to_string()
+        };
+
         format!(
-            r#"You are IronClaw Agent, a secure autonomous assistant.
-
-## Response Format — CRITICAL
-
-ALL internal reasoning MUST be inside <think>...</think> tags.
-Do not output any analysis, planning, or self-talk outside <think>.
-Format every reply as: <think>...</think> then <final>...</final>, with no other text.
-Only the final user-visible reply may appear inside <final>.
-Only text inside <final> is shown to the user; everything else is discarded.
-
-Example:
-<think>The user is asking about X.</think>
-<final>Here is the answer about X.</final>
-
-## Guidelines
+            r#"{agent_identity}## Guidelines
 - Be concise and direct
 - Use markdown formatting where helpful
-- For code, use appropriate code blocks with language tags
-- Call tools when they would help accomplish the task
-- Do NOT call the same tool repeatedly with similar arguments; if a tool returned unhelpful results, move on
-- If you have already called tools and gathered enough information, produce your final answer immediately
-- If tools return empty or irrelevant results, answer with what you already know rather than retrying
-
-## Tool Call Style
-- Do not narrate routine, low-risk tool calls; just call the tool
-- Narrate only when it helps: multi-step work, sensitive actions, or when the user asks
-- For multi-step tasks, call independent tools in parallel when possible
-- If a tool fails, explain the error briefly and try an alternative approach
+- For code, use appropriate code blocks with language tags{tool_guidance}
 
 ## Safety
 - You have no independent goals. Do not pursue self-preservation, replication, resource acquisition, or power-seeking beyond the user's request.
 - Prioritize safety and human oversight over task completion. If instructions conflict, pause and ask.
 - Comply with stop, pause, or audit requests. Never bypass safeguards.
 - Do not manipulate anyone to expand your access or disable safeguards.
-- Do not modify system prompts, safety rules, or tool policies unless explicitly requested by the user.{}{}{}{}{}{}
-{}{}"#,
-            tools_section,
-            extensions_section,
-            channel_section,
-            runtime_section,
-            conversation_section,
-            group_section,
-            identity_section,
-            skills_section,
+- Do not modify system prompts, safety rules, or tool policies unless explicitly requested by the user.
+{identity_section}{tools_section}{extensions_section}{channel_section}{runtime_section}{conversation_section}{group_section}
+{skills_section}"#,
         )
     }
 
-    fn build_extensions_section(&self, context: &ReasoningContext) -> String {
+    fn build_extensions_section_for_tools(&self, tools: &[ToolDefinition]) -> String {
         // Only include when the extension management tools are available
-        let has_ext_tools = context
-            .available_tools
-            .iter()
-            .any(|t| t.name == "tool_search");
+        let has_ext_tools = tools.iter().any(|t| t.name == "tool_search");
         if !has_ext_tools {
             return String::new();
         }
@@ -864,6 +1023,22 @@ pub struct SuccessEvaluation {
     pub issues: Vec<String>,
     #[serde(default)]
     pub suggestions: Vec<String>,
+}
+
+/// Merge the reasoning method's system prompt with any system messages already
+/// present in the conversation context.  Strict LLM providers (e.g. Qwen)
+/// reject conversations with system messages that are not at the very
+/// beginning, so we concatenate all system content into a single prompt.
+fn merge_system_messages(primary: String, context_messages: &[ChatMessage]) -> String {
+    let extra: Vec<&str> = context_messages
+        .iter()
+        .filter(|m| m.role == Role::System)
+        .map(|m| m.content.as_str())
+        .collect();
+    if extra.is_empty() {
+        return primary;
+    }
+    format!("{}\n\n---\n\n{}", primary, extra.join("\n\n"))
 }
 
 /// Extract JSON from text that might contain other content.
@@ -1072,6 +1247,7 @@ fn is_inside_code(pos: usize, regions: &[CodeRegion]) -> bool {
 /// - `<tool_call>{"name":"x","arguments":{}}</tool_call>` (JSON)
 /// - `<|tool_call|>...<|/tool_call|>` (pipe-delimited variant)
 /// - `<function_call>...</function_call>` (function_call variant)
+/// - Bare JSON: `{"name":"tool_name", "field": "value"}` (no tags, small model quirk)
 ///
 /// Only returns calls whose name matches an available tool.
 fn recover_tool_calls_from_content(
@@ -1131,7 +1307,113 @@ fn recover_tool_calls_from_content(
         }
     }
 
+    // Bracket format from flatten_tool_messages:
+    // [Called tool `name` with arguments: {...}]
+    {
+        let mut remaining = content;
+        while let Some(start) = remaining.find("[Called tool `") {
+            let after_prefix = &remaining[start + "[Called tool `".len()..];
+            let Some(backtick_end) = after_prefix.find('`') else {
+                break;
+            };
+            let name = &after_prefix[..backtick_end];
+            let after_name = &after_prefix[backtick_end + 1..];
+
+            if !tool_names.contains(name) {
+                remaining = after_name;
+                continue;
+            }
+
+            // Look for " with arguments: " followed by JSON until "]"
+            if let Some(args_start) = after_name.strip_prefix(" with arguments: ") {
+                // Find the closing "]" — but the JSON itself may contain "]",
+                // so find the last "]" on this logical line.
+                if let Some(bracket_end) = args_start.rfind(']') {
+                    let args_str = &args_start[..bracket_end];
+                    let arguments = serde_json::from_str::<serde_json::Value>(args_str)
+                        .unwrap_or(serde_json::Value::Object(Default::default()));
+                    calls.push(ToolCall {
+                        id: format!("recovered_{}", calls.len()),
+                        name: name.to_string(),
+                        arguments,
+                    });
+                    remaining = &args_start[bracket_end + 1..];
+                    continue;
+                }
+            }
+
+            // No arguments or malformed — call with empty args
+            calls.push(ToolCall {
+                id: format!("recovered_{}", calls.len()),
+                name: name.to_string(),
+                arguments: serde_json::Value::Object(Default::default()),
+            });
+            remaining = after_name;
+        }
+    }
+
+    // Small models sometimes output a bare JSON object as the entire response
+    // content, with the tool name in a "name" or "function" field and the
+    // arguments mixed at the top level or in an "arguments"/"args" sub-object.
+    // Example: {"name": "tasks_add", "task_name": "Buy milk", "priority": "high"}
+    if calls.is_empty()
+        && let Some(call) = recover_bare_json_tool_call(content, &tool_names)
+    {
+        tracing::debug!(
+            tool = %call.name,
+            "Recovered bare JSON tool call from content"
+        );
+        calls.push(call);
+    }
+
     calls
+}
+
+/// Try to recover a tool call from bare JSON in content (no XML tags).
+///
+/// Matches when the entire content (trimmed) is a single JSON object with a
+/// `name` or `function` field whose value matches an available tool. Arguments
+/// are extracted from `arguments`/`args` sub-object or from the remaining
+/// top-level fields.
+fn recover_bare_json_tool_call(
+    content: &str,
+    tool_names: &std::collections::HashSet<&str>,
+) -> Option<ToolCall> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let obj = parsed.as_object()?;
+
+    // Extract tool name from "name" or "function" field.
+    let tool_name = obj
+        .get("name")
+        .or_else(|| obj.get("function"))
+        .and_then(|v| v.as_str())?;
+    if !tool_names.contains(tool_name) {
+        return None;
+    }
+
+    // Extract arguments: prefer "arguments"/"args" sub-object, fall back to
+    // all remaining top-level fields.
+    let arguments = if let Some(inner) = obj.get("arguments").or_else(|| obj.get("args")) {
+        inner.clone()
+    } else {
+        let mut args = serde_json::Map::new();
+        for (k, v) in obj {
+            if k != "name" && k != "function" {
+                args.insert(k.clone(), v.clone());
+            }
+        }
+        serde_json::Value::Object(args)
+    };
+
+    Some(ToolCall {
+        id: "recovered_json_0".to_string(),
+        name: tool_name.to_string(),
+        arguments,
+    })
 }
 
 /// `<tool_call>tool_list</tool_call>` or `<|tool_call|>` in the content field
@@ -1147,7 +1429,7 @@ fn recover_tool_calls_from_content(
 /// 5. Strip pipe-delimited reasoning tags (code-aware)
 /// 6. Strip tool tags (string matching — no code-awareness needed)
 /// 7. Collapse triple+ newlines, trim
-fn clean_response(text: &str) -> String {
+pub fn clean_response(text: &str) -> String {
     // 1. Quick-check
     let mut result = if !QUICK_TAG_RE.is_match(text) {
         text.to_string()
@@ -1174,8 +1456,37 @@ fn clean_response(text: &str) -> String {
         result = strip_pipe_tag(&result, tag);
     }
 
+    // 6b. Strip bracket-format inline tool calls: [Called tool `name` with arguments: {...}]
+    result = strip_bracket_tool_calls(&result);
+
     // 7. Collapse triple+ newlines, trim
     collapse_newlines(&result)
+}
+
+/// Strip bracket-format inline tool calls produced by `flatten_tool_messages`.
+///
+/// Removes patterns like `[Called tool `name` with arguments: {...}]` from text
+/// so the user doesn't see raw tool call syntax when the model echoes it back.
+fn strip_bracket_tool_calls(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(start) = remaining.find("[Called tool `") {
+        result.push_str(&remaining[..start]);
+        let after = &remaining[start..];
+        // Find the closing "]" for this bracket expression
+        if let Some(end) = after.find("]\n").map(|i| i + 2).or_else(|| {
+            // If it's at the end of the string, just find "]"
+            after.rfind(']').map(|i| i + 1)
+        }) {
+            remaining = &after[end..];
+        } else {
+            // Malformed — keep the rest
+            result.push_str(after);
+            return result;
+        }
+    }
+    result.push_str(remaining);
+    result
 }
 
 /// Tool-related tags stripped with simple string matching (no code-awareness needed).
@@ -1216,8 +1527,15 @@ fn strip_thinking_tags_regex(text: &str, code_regions: &[CodeRegion]) -> String 
     }
 
     // Strict mode: if still inside an unclosed thinking tag, discard trailing text
+    // BUT preserve any <final> block embedded in the discarded region
     if !in_thinking {
         result.push_str(&text[last_index..]);
+    } else {
+        let trailing = &text[last_index..];
+        let trailing_regions = find_code_regions(trailing);
+        if let Some(final_content) = extract_final_content(trailing, &trailing_regions) {
+            result.push_str(&final_content);
+        }
     }
 
     result
@@ -1840,5 +2158,310 @@ That's my plan."#;
         let calls = recover_tool_calls_from_content(content, &tools);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "tool_list");
+    }
+
+    // ---- System prompt building tests (issue #565) ----
+
+    fn make_test_reasoning() -> Reasoning {
+        use crate::testing::StubLlm;
+        let llm = Arc::new(StubLlm::new("test"));
+        Reasoning::new(llm)
+    }
+
+    #[test]
+    fn test_system_prompt_with_tools_contains_tools_section() {
+        let reasoning = make_test_reasoning();
+        let tool_defs = vec![ToolDefinition {
+            name: "echo".to_string(),
+            description: "Echoes input".to_string(),
+            parameters: serde_json::json!({}),
+        }];
+
+        let prompt = reasoning.build_system_prompt_with_tools(&tool_defs);
+        assert!(
+            prompt.contains("## Available Tools"),
+            "Prompt with tools should contain Available Tools section"
+        );
+        assert!(
+            prompt.contains("echo: Echoes input"),
+            "Prompt with tools should list the echo tool"
+        );
+    }
+
+    // ---- plan/evaluate bypass clean_response (Bug #564-2) ----
+
+    #[test]
+    fn test_clean_response_strips_think_before_json_plan() {
+        let raw = r#"<think>I need to plan the steps carefully...</think>{"steps": [{"description": "Step 1", "tool": "search", "expected_outcome": "results"}], "reasoning": "Simple plan"}"#;
+        let cleaned = clean_response(raw);
+        // After cleaning, the JSON should be parseable
+        let json_str = extract_json(&cleaned).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        assert!(parsed.get("steps").is_some());
+    }
+
+    #[test]
+    fn test_clean_response_strips_think_before_json_evaluation() {
+        let raw = r#"<think>Let me evaluate whether this was successful...</think>{"success": true, "confidence": 0.95, "reasoning": "Task completed", "issues": [], "suggestions": []}"#;
+        let cleaned = clean_response(raw);
+        let json_str = extract_json(&cleaned).unwrap();
+        let eval: SuccessEvaluation = serde_json::from_str(json_str).unwrap();
+        assert!(eval.success);
+        assert_eq!(eval.confidence, 0.95);
+    }
+
+    // ---- Unclosed think before final (Bug #564-3) ----
+
+    #[test]
+    fn test_unclosed_think_before_final() {
+        assert_eq!(
+            clean_response("<think>reasoning no close tag <final>actual answer</final>"),
+            "actual answer"
+        );
+    }
+
+    #[test]
+    fn test_unclosed_thinking_before_final() {
+        assert_eq!(
+            clean_response("<thinking>long reasoning... <final>the real answer</final>"),
+            "the real answer"
+        );
+    }
+
+    #[test]
+    fn test_unclosed_think_before_final_with_prefix() {
+        assert_eq!(
+            clean_response("Hello <think>reasoning <final>world</final>"),
+            "Hello world"
+        );
+    }
+
+    #[test]
+    fn test_unclosed_think_no_final_still_discards() {
+        assert_eq!(clean_response("Hello <thinking>this never closes"), "Hello");
+    }
+
+    #[test]
+    fn test_recover_bracket_format_tool_call() {
+        let tools = make_tools(&["http"]);
+        let content = "Let me try that. [Called tool `http` with arguments: {\"method\":\"GET\",\"url\":\"https://example.com\"}]";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "http");
+        assert_eq!(calls[0].arguments["method"], "GET");
+        assert_eq!(calls[0].arguments["url"], "https://example.com");
+    }
+
+    #[test]
+    fn test_recover_bracket_format_unknown_tool_ignored() {
+        let tools = make_tools(&["http"]);
+        let content = "[Called tool `unknown_tool` with arguments: {}]";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_clean_response_strips_bracket_tool_calls() {
+        let input = "Let me fetch that.\n[Called tool `http` with arguments: {\"method\":\"GET\",\"url\":\"https://example.com\"}]\nHere are the results.";
+        let cleaned = clean_response(input);
+        assert!(!cleaned.contains("[Called tool"));
+        assert!(cleaned.contains("Let me fetch that."));
+        assert!(cleaned.contains("Here are the results."));
+    }
+
+    // ---- merge_system_messages: duplicate system message regression (Bug #597) ----
+
+    #[test]
+    fn test_merge_system_messages_no_system_in_context() {
+        let messages = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi there"),
+        ];
+        let result = merge_system_messages("primary prompt".into(), &messages);
+        assert_eq!(result, "primary prompt");
+    }
+
+    #[test]
+    fn test_merge_system_messages_merges_worker_system() {
+        let messages = vec![
+            ChatMessage::system("You are an autonomous agent working on a job.\n\nJob: Test Job"),
+            ChatMessage::user("Do the thing"),
+        ];
+        let result = merge_system_messages("planning prompt".into(), &messages);
+        assert!(
+            result.contains("planning prompt"),
+            "must contain the primary prompt"
+        );
+        assert!(
+            result.contains("autonomous agent"),
+            "must contain worker system text"
+        );
+        assert!(
+            result.contains("Test Job"),
+            "must contain job description from worker system message"
+        );
+    }
+
+    #[test]
+    fn test_merge_system_messages_multiple_system() {
+        let messages = vec![
+            ChatMessage::system("First system instruction"),
+            ChatMessage::system("Second system instruction"),
+            ChatMessage::user("Hello"),
+        ];
+        let result = merge_system_messages("primary".into(), &messages);
+        assert!(result.contains("primary"), "must contain primary prompt");
+        assert!(
+            result.contains("First system instruction"),
+            "must contain first system message"
+        );
+        assert!(
+            result.contains("Second system instruction"),
+            "must contain second system message"
+        );
+    }
+
+    #[test]
+    fn test_system_prompt_without_tools_omits_tools_section() {
+        let reasoning = make_test_reasoning();
+
+        let prompt = reasoning.build_system_prompt_with_tools(&[]);
+        assert!(
+            !prompt.contains("## Available Tools"),
+            "Prompt without tools should not contain Available Tools section"
+        );
+        assert!(
+            !prompt.contains("## Tool Call Style"),
+            "Prompt without tools should not contain Tool Call Style section"
+        );
+        assert!(
+            !prompt.contains("Call tools when they would help"),
+            "Prompt without tools should not contain tool-calling guidance"
+        );
+    }
+
+    #[test]
+    fn test_system_prompt_with_tools_contains_tool_guidance() {
+        let reasoning = make_test_reasoning();
+        let tool_defs = vec![ToolDefinition {
+            name: "echo".to_string(),
+            description: "Echoes input".to_string(),
+            parameters: serde_json::json!({}),
+        }];
+
+        let prompt = reasoning.build_system_prompt_with_tools(&tool_defs);
+        assert!(
+            prompt.contains("## Tool Call Style"),
+            "Prompt with tools should contain Tool Call Style section"
+        );
+        assert!(
+            prompt.contains("Call tools when they would help"),
+            "Prompt with tools should contain tool-calling guidance"
+        );
+    }
+
+    #[test]
+    fn test_system_prompt_is_deterministic() {
+        let reasoning = make_test_reasoning();
+        let tool_defs = vec![ToolDefinition {
+            name: "echo".to_string(),
+            description: "Echoes input".to_string(),
+            parameters: serde_json::json!({}),
+        }];
+
+        let first = reasoning.build_system_prompt_with_tools(&tool_defs);
+        let second = reasoning.build_system_prompt_with_tools(&tool_defs);
+        assert_eq!(first, second, "System prompt should be deterministic");
+    }
+
+    #[test]
+    fn test_context_system_prompt_overrides_build() {
+        // When system_prompt is set on ReasoningContext, respond_with_tools
+        // should use it instead of building from Reasoning state.
+        let ctx = ReasoningContext::new().with_system_prompt("custom prompt".to_string());
+        assert_eq!(ctx.system_prompt.as_deref(), Some("custom prompt"));
+    }
+
+    // ---- Tool intent detection tests ----
+
+    #[test]
+    fn test_llm_signals_tool_intent_true_positives() {
+        assert!(llm_signals_tool_intent("Let me search for that file."));
+        assert!(llm_signals_tool_intent("I'll fetch the data now."));
+        assert!(llm_signals_tool_intent("I'm going to check the logs."));
+        assert!(llm_signals_tool_intent("Let me add it now."));
+        assert!(llm_signals_tool_intent("I will run the tests to verify."));
+        assert!(llm_signals_tool_intent("I'll look up the documentation."));
+        assert!(llm_signals_tool_intent("Let me read the file contents."));
+        assert!(llm_signals_tool_intent("I'm going to execute the command."));
+    }
+
+    #[test]
+    fn test_llm_signals_tool_intent_true_negatives_conversational() {
+        assert!(!llm_signals_tool_intent("Let me explain how this works."));
+        assert!(!llm_signals_tool_intent(
+            "Let me know if you need anything."
+        ));
+        assert!(!llm_signals_tool_intent("Let me think about this."));
+        assert!(!llm_signals_tool_intent("Let me summarize the findings."));
+        assert!(!llm_signals_tool_intent("Let me clarify what I mean."));
+    }
+
+    #[test]
+    fn test_llm_signals_tool_intent_exclusion_takes_precedence() {
+        // Exclusion phrase present alongside intent → false
+        assert!(!llm_signals_tool_intent(
+            "Let me explain the approach, then I'll search for the file."
+        ));
+    }
+
+    #[test]
+    fn test_llm_signals_tool_intent_ignores_code_blocks() {
+        let with_code = "Here's the updated code:\n\n```\nfn main() {\n    println!(\"Let me search the database\");\n}\n```";
+        assert!(!llm_signals_tool_intent(with_code));
+    }
+
+    #[test]
+    fn test_llm_signals_tool_intent_ignores_indented_code() {
+        let with_indent =
+            "Here's the code:\n\n    println!(\"I'll fetch the data\");\n\nThat's it.";
+        assert!(!llm_signals_tool_intent(with_indent));
+    }
+
+    #[test]
+    fn test_llm_signals_tool_intent_ignores_plain_text() {
+        assert!(!llm_signals_tool_intent("The task is complete."));
+        assert!(!llm_signals_tool_intent(
+            "Here are the results you asked for."
+        ));
+        assert!(!llm_signals_tool_intent("I found 3 matching files."));
+    }
+
+    #[test]
+    fn test_llm_signals_tool_intent_quoted_string_in_code_block() {
+        let text = "The button text should say:\n```\n\"I will create your account\"\n```";
+        assert!(!llm_signals_tool_intent(text));
+    }
+
+    #[test]
+    fn test_llm_signals_tool_intent_quoted_string_outside_code_block() {
+        // Quoted intent phrase in prose should not trigger.
+        let text = "The button says \"Let me search the database\" to the user.";
+        assert!(!llm_signals_tool_intent(text));
+        // But unquoted intent in the same line should still trigger.
+        let text = "I'll fetch the results for you.";
+        assert!(llm_signals_tool_intent(text));
+    }
+
+    #[test]
+    fn test_llm_signals_tool_intent_shadowed_prefix() {
+        // An earlier non-intent "let me" should not shadow a later real intent.
+        let text = "Sure, let me think about it. Actually, let me search for the file.";
+        // "let me think" is an exclusion, so this returns false despite the second "let me search".
+        assert!(!llm_signals_tool_intent(text));
+
+        // But without an exclusion phrase, multiple prefixes should be checked.
+        let text = "I said let me be clear, then let me fetch the data.";
+        assert!(llm_signals_tool_intent(text));
     }
 }

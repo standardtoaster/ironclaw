@@ -1,0 +1,34 @@
+{
+  "http": {
+    "allowlist": [
+      {
+        "host": "outlook.office365.com",
+        "path_prefix": "/owa/calendar/",
+        "methods": ["GET"]
+      },
+      {
+        "host": "outlook.live.com",
+        "path_prefix": "/owa/calendar/",
+        "methods": ["GET"]
+      },
+      {
+        "host": "calendar.google.com",
+        "path_prefix": "/calendar/ical/",
+        "methods": ["GET"]
+      },
+      {
+        "host": "p*.icloud.com",
+        "path_prefix": "/",
+        "methods": ["GET"]
+      }
+    ],
+    "rate_limit": {
+      "requests_per_minute": 10,
+      "requests_per_hour": 60
+    },
+    "timeout_secs": 60
+  },
+  "workspace_read": {
+    "allowed_paths": ["ICS_SUBSCRIPTIONS"]
+  }
+}

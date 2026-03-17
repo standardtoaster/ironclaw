@@ -14,6 +14,7 @@ impl SubmissionParser {
     pub fn parse(content: &str) -> Submission {
         let trimmed = content.trim();
         let lower = trimmed.to_lowercase();
+        tracing::debug!("[SubmissionParser::parse] Parsing input: {:?}", trimmed);
 
         // Control commands (exact match or prefix)
         if lower == "/undo" {
@@ -39,6 +40,24 @@ impl SubmissionParser {
         }
         if lower == "/suggest" {
             return Submission::Suggest;
+        }
+        if lower == "/organize" {
+            return Submission::Organize;
+        }
+        if lower == "/workspace" || lower == "/workspace list" || lower == "/workspaces" {
+            return Submission::WorkspaceList;
+        }
+        if lower.starts_with("/workspace ") {
+            let arg = trimmed[11..].trim();
+            if arg.eq_ignore_ascii_case("summary") {
+                return Submission::WorkspaceSummary;
+            }
+            if arg.eq_ignore_ascii_case("list") {
+                return Submission::WorkspaceList;
+            }
+            return Submission::WorkspaceSwitch {
+                name: arg.to_string(),
+            };
         }
         if lower == "/thread new" || lower == "/new" {
             return Submission::NewThread;
@@ -88,6 +107,13 @@ impl SubmissionParser {
         if lower == "/debug" {
             return Submission::SystemCommand {
                 command: "debug".to_string(),
+                args: vec![],
+            };
+        }
+        if lower == "/restart" {
+            tracing::debug!("[SubmissionParser::parse] Recognized /restart command");
+            return Submission::SystemCommand {
+                command: "restart".to_string(),
                 args: vec![],
             };
         }
@@ -252,6 +278,18 @@ pub enum Submission {
     /// Suggest next steps based on the current thread.
     Suggest,
 
+    /// Trigger the workspace organizer to classify and create workspaces.
+    Organize,
+
+    /// List all workspaces.
+    WorkspaceList,
+
+    /// Switch to a workspace by topic name (fuzzy match).
+    WorkspaceSwitch { name: String },
+
+    /// Show the current workspace's summary.
+    WorkspaceSummary,
+
     /// Check job status. No job_id shows all jobs; with job_id shows a specific job.
     JobStatus {
         /// Optional job ID (UUID or short prefix). If None, shows all jobs.
@@ -348,6 +386,9 @@ impl Submission {
                 | Self::Heartbeat
                 | Self::Summarize
                 | Self::Suggest
+                | Self::WorkspaceList
+                | Self::WorkspaceSwitch { .. }
+                | Self::WorkspaceSummary
                 | Self::JobStatus { .. }
                 | Self::JobCancel { .. }
                 | Self::SystemCommand { .. }
@@ -524,6 +565,12 @@ mod tests {
     fn test_parser_suggest() {
         let submission = SubmissionParser::parse("/suggest");
         assert!(matches!(submission, Submission::Suggest));
+    }
+
+    #[test]
+    fn test_parser_organize() {
+        let submission = SubmissionParser::parse("/organize");
+        assert!(matches!(submission, Submission::Organize));
     }
 
     #[test]

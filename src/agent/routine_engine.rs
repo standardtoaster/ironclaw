@@ -10,6 +10,7 @@
 //! Lightweight routines execute inline (single LLM call, no scheduler slot).
 //! Full-job routines are delegated to the existing `Scheduler`.
 
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,6 +33,7 @@ use crate::context::JobContext;
 use crate::db::Database;
 use crate::error::RoutineError;
 use crate::llm::{ChatMessage, CompletionRequest, FinishReason, LlmProvider};
+use crate::tools::ApprovalContext;
 use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
 
@@ -66,8 +68,10 @@ pub struct RoutineEngine {
     tool_registry: Option<Arc<ToolRegistry>>,
     /// Gateway port for script `IRONCLAW_PORT` env var (resolved at construction).
     gateway_port: Option<u16>,
-    /// Default auth token for script `IRONCLAW_TOKEN` env var.
+    /// Default auth token for script `IRONCLAW_TOKEN` env var (single-tenant fallback).
     gateway_auth_token: Option<String>,
+    /// Reverse map from user_id → auth token, built from `GATEWAY_USER_TOKENS`.
+    user_token_map: HashMap<String, String>,
 }
 
 impl RoutineEngine {
@@ -86,6 +90,10 @@ impl RoutineEngine {
             .and_then(|s| s.parse().ok());
         let gateway_auth_token = std::env::var("GATEWAY_AUTH_TOKEN").ok();
 
+        // Build reverse map (user_id → token) from GATEWAY_USER_TOKENS for
+        // multi-tenant mode.  Falls back to gateway_auth_token in single-tenant.
+        let user_token_map = Self::build_user_token_map();
+
         Self {
             config,
             store,
@@ -99,7 +107,54 @@ impl RoutineEngine {
             tool_registry,
             gateway_port,
             gateway_auth_token,
+            user_token_map,
         }
+    }
+
+    /// Build a reverse map from `user_id` → auth token by parsing
+    /// `GATEWAY_USER_TOKENS` (JSON: `{token: {user_id: "...", ...}, ...}`).
+    fn build_user_token_map() -> HashMap<String, String> {
+        let json_str = match std::env::var("GATEWAY_USER_TOKENS") {
+            Ok(s) => s,
+            Err(_) => return HashMap::new(),
+        };
+
+        match Self::parse_user_token_map(&json_str) {
+            Ok(map) => {
+                tracing::info!(
+                    count = map.len(),
+                    "Routine engine built user_id→token map for multi-tenant mode"
+                );
+                map
+            }
+            Err(e) => {
+                tracing::warn!("Failed to parse GATEWAY_USER_TOKENS for routine engine: {e}");
+                HashMap::new()
+            }
+        }
+    }
+
+    /// Parse a GATEWAY_USER_TOKENS JSON string into a user_id → token map.
+    fn parse_user_token_map(json_str: &str) -> Result<HashMap<String, String>, serde_json::Error> {
+        #[derive(serde::Deserialize)]
+        struct TokenEntry {
+            user_id: String,
+        }
+
+        let tokens: HashMap<String, TokenEntry> = serde_json::from_str(json_str)?;
+        Ok(tokens
+            .into_iter()
+            .map(|(token, entry)| (entry.user_id, token))
+            .collect())
+    }
+
+    /// Resolve the auth token for a routine's user_id.
+    /// Checks multi-tenant map first, falls back to single-tenant `GATEWAY_AUTH_TOKEN`.
+    fn resolve_user_token(&self, user_id: &str) -> Option<String> {
+        self.user_token_map
+            .get(user_id)
+            .cloned()
+            .or_else(|| self.gateway_auth_token.clone())
     }
 
     /// Refresh the in-memory event trigger cache from DB.
@@ -283,7 +338,7 @@ impl RoutineEngine {
                 continue;
             }
 
-            let detail = if let Trigger::Cron { ref schedule } = routine.trigger {
+            let detail = if let Trigger::Cron { ref schedule, .. } = routine.trigger {
                 Some(schedule.clone())
             } else {
                 None
@@ -293,8 +348,16 @@ impl RoutineEngine {
         }
     }
 
-    /// Fire a routine manually (from tool call or CLI).
-    pub async fn fire_manual(&self, routine_id: Uuid) -> Result<Uuid, RoutineError> {
+    /// Fire a webhook-triggered routine.
+    ///
+    /// Validates that the routine exists, is enabled, has a `Trigger::Webhook`,
+    /// and passes guardrail checks before executing.
+    pub async fn fire_webhook(
+        &self,
+        routine_id: Uuid,
+        user_id: &str,
+        body: Option<String>,
+    ) -> Result<Uuid, RoutineError> {
         let routine = self
             .store
             .get_routine(routine_id)
@@ -303,6 +366,104 @@ impl RoutineEngine {
                 reason: e.to_string(),
             })?
             .ok_or(RoutineError::NotFound { id: routine_id })?;
+
+        if !routine.enabled {
+            return Err(RoutineError::Disabled {
+                name: routine.name.clone(),
+            });
+        }
+
+        // Verify this is a webhook trigger
+        if !matches!(routine.trigger, Trigger::Webhook { .. }) {
+            return Err(RoutineError::TriggerMismatch {
+                routine: routine.name.clone(),
+                expected: "webhook".to_string(),
+                actual: routine.trigger.type_tag().to_string(),
+            });
+        }
+
+        // Verify user ownership
+        if routine.user_id != user_id {
+            return Err(RoutineError::NotFound { id: routine_id });
+        }
+
+        if !self.check_concurrent(&routine).await {
+            return Err(RoutineError::MaxConcurrent {
+                name: routine.name.clone(),
+            });
+        }
+
+        if !self.check_cooldown(&routine) {
+            return Err(RoutineError::CooldownActive {
+                name: routine.name.clone(),
+            });
+        }
+
+        let detail = body.map(|b| truncate(&b, 500));
+        let run_id = Uuid::new_v4();
+        let run = RoutineRun {
+            id: run_id,
+            routine_id: routine.id,
+            trigger_type: "webhook".to_string(),
+            trigger_detail: detail,
+            started_at: Utc::now(),
+            completed_at: None,
+            status: RunStatus::Running,
+            result_summary: None,
+            tokens_used: None,
+            job_id: None,
+            created_at: Utc::now(),
+        };
+
+        if let Err(e) = self.store.create_routine_run(&run).await {
+            return Err(RoutineError::Database {
+                reason: format!("failed to create run record: {e}"),
+            });
+        }
+
+        let engine = EngineContext {
+            store: self.store.clone(),
+            llm: self.llm.clone(),
+            workspace: self.workspace.clone(),
+            notify_tx: self.notify_tx.clone(),
+            running_count: self.running_count.clone(),
+            scheduler: self.scheduler.clone(),
+            tool_registry: self.tool_registry.clone(),
+            gateway_port: self.gateway_port,
+            user_token: self.resolve_user_token(&routine.user_id),
+        };
+
+        tokio::spawn(async move {
+            execute_routine(engine, routine, run).await;
+        });
+
+        Ok(run_id)
+    }
+
+    /// Fire a routine manually (from tool call or CLI).
+    ///
+    /// Bypasses cooldown checks (those only apply to cron/event triggers).
+    /// Still enforces enabled check and concurrent run limit.
+    pub async fn fire_manual(
+        &self,
+        routine_id: Uuid,
+        user_id: Option<&str>,
+    ) -> Result<Uuid, RoutineError> {
+        let routine = self
+            .store
+            .get_routine(routine_id)
+            .await
+            .map_err(|e| RoutineError::Database {
+                reason: e.to_string(),
+            })?
+            .ok_or(RoutineError::NotFound { id: routine_id })?;
+
+        // Enforce ownership when a user_id is provided (gateway calls).
+        if let Some(uid) = user_id
+            && routine.user_id != uid
+        {
+            return Err(RoutineError::NotAuthorized { id: routine_id });
+        }
 
         if !routine.enabled {
             return Err(RoutineError::Disabled {
@@ -347,7 +508,7 @@ impl RoutineEngine {
             scheduler: self.scheduler.clone(),
             tool_registry: self.tool_registry.clone(),
             gateway_port: self.gateway_port,
-            user_token: self.gateway_auth_token.clone(),
+            user_token: self.resolve_user_token(&routine.user_id),
         };
 
         tokio::spawn(async move {
@@ -382,7 +543,7 @@ impl RoutineEngine {
             scheduler: self.scheduler.clone(),
             tool_registry: self.tool_registry.clone(),
             gateway_port: self.gateway_port,
-            user_token: self.gateway_auth_token.clone(),
+            user_token: self.resolve_user_token(&routine.user_id),
         };
 
         // Record the run in DB, then spawn execution
@@ -452,7 +613,19 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
             title,
             description,
             max_iterations,
-        } => execute_full_job(&ctx, &routine, &run, title, description, *max_iterations).await,
+            tool_permissions,
+        } => {
+            execute_full_job(
+                &ctx,
+                &routine,
+                &run,
+                title,
+                description,
+                *max_iterations,
+                tool_permissions,
+            )
+            .await
+        }
         RoutineAction::Wasm {
             tool_name,
             escalation_prompt,
@@ -506,8 +679,12 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
 
     // Update routine runtime state
     let now = Utc::now();
-    let next_fire = if let Trigger::Cron { ref schedule } = routine.trigger {
-        next_cron_fire(schedule).unwrap_or(None)
+    let next_fire = if let Trigger::Cron {
+        ref schedule,
+        ref timezone,
+    } = routine.trigger
+    {
+        next_cron_fire(schedule, timezone.as_deref()).unwrap_or(None)
     } else {
         None
     };
@@ -533,6 +710,39 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
         tracing::error!(routine = %routine.name, "Failed to update runtime state: {}", e);
     }
 
+    // Persist routine result to its dedicated conversation thread
+    let thread_id = match ctx
+        .store
+        .get_or_create_routine_conversation(routine.id, &routine.name, &routine.user_id)
+        .await
+    {
+        Ok(conv_id) => {
+            tracing::debug!(
+                routine = %routine.name,
+                routine_id = %routine.id,
+                conversation_id = %conv_id,
+                "Resolved routine conversation thread"
+            );
+            // Record the run result as a conversation message
+            let msg = match (&summary, status) {
+                (Some(s), _) => format!("[{}] {}: {}", run.trigger_type, status, s),
+                (None, _) => format!("[{}] {}", run.trigger_type, status),
+            };
+            if let Err(e) = ctx
+                .store
+                .add_conversation_message(conv_id, "assistant", &msg)
+                .await
+            {
+                tracing::error!(routine = %routine.name, "Failed to persist routine message: {}", e);
+            }
+            Some(conv_id.to_string())
+        }
+        Err(e) => {
+            tracing::error!(routine = %routine.name, "Failed to get routine conversation: {}", e);
+            None
+        }
+    };
+
     // Send notifications based on config
     send_notification(
         &ctx.notify_tx,
@@ -540,6 +750,7 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
         &routine.name,
         status,
         summary.as_deref(),
+        thread_id.as_deref(),
     )
     .await;
 }
@@ -674,6 +885,7 @@ async fn execute_full_job(
     title: &str,
     description: &str,
     max_iterations: u32,
+    tool_permissions: &[String],
 ) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
     let scheduler = ctx
         .scheduler
@@ -682,10 +894,26 @@ async fn execute_full_job(
             reason: "scheduler not available".to_string(),
         })?;
 
-    let metadata = serde_json::json!({ "max_iterations": max_iterations });
+    let mut metadata = serde_json::json!({ "max_iterations": max_iterations });
+    // Carry the routine's notify config in job metadata so the message tool
+    // can resolve channel/target per-job without global state mutation.
+    if let Some(channel) = &routine.notify.channel {
+        metadata["notify_channel"] = serde_json::json!(channel);
+    }
+    metadata["notify_user"] = serde_json::json!(&routine.notify.user);
+
+    // Build approval context: UnlessAutoApproved tools are auto-approved for routines;
+    // Always tools require explicit listing in tool_permissions.
+    let approval_context = ApprovalContext::autonomous_with_tools(tool_permissions.iter().cloned());
 
     let job_id = scheduler
-        .dispatch_job(&routine.user_id, title, description, Some(metadata))
+        .dispatch_job_with_context(
+            &routine.user_id,
+            title,
+            description,
+            Some(metadata),
+            approval_context,
+        )
         .await
         .map_err(|e| RoutineError::JobDispatchFailed {
             reason: format!("failed to dispatch job: {e}"),
@@ -829,6 +1057,7 @@ async fn send_notification(
     routine_name: &str,
     status: RunStatus,
     summary: Option<&str>,
+    thread_id: Option<&str>,
 ) {
     let should_notify = match status {
         RunStatus::Ok => notify.on_success,
@@ -855,7 +1084,7 @@ async fn send_notification(
 
     let response = OutgoingResponse {
         content: message,
-        thread_id: None,
+        thread_id: thread_id.map(String::from),
         attachments: Vec::new(),
         metadata: serde_json::json!({
             "source": "routine",
@@ -1153,7 +1382,7 @@ async fn execute_script_inner(
 mod tests {
     use crate::agent::collection_events::CollectionWriteEvent;
     use crate::agent::routine::{NotifyConfig, Routine, RoutineAction, RoutineGuardrails, RunStatus, Trigger};
-    use super::matches_collection_write;
+    use super::{matches_collection_write, RoutineEngine};
 
     #[test]
     fn test_notification_gating() {
@@ -1227,7 +1456,7 @@ mod tests {
         let routine = make_collection_write_routine("presence-handler", "wifi_presence", "test-user");
         let event = CollectionWriteEvent {
             user_id: "test-user".to_string(),
-            collection: "nanny_shifts".to_string(),
+            collection: "time_entries".to_string(),
             record_id: uuid::Uuid::new_v4(),
             data: serde_json::json!({}),
         };
@@ -1471,5 +1700,32 @@ else:
         assert_eq!(result, ScriptResult::Handled);
 
         let _ = tokio::fs::remove_file(&script_path).await;
+    }
+
+    #[test]
+    fn test_parse_user_token_map_multi_tenant() {
+        let json = r#"{"tok-alice": {"user_id": "alice", "llm_backend": "openai"}, "tok-shared": {"user_id": "shared"}}"#;
+        let map = RoutineEngine::parse_user_token_map(json).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("alice").unwrap(), "tok-alice");
+        assert_eq!(map.get("shared").unwrap(), "tok-shared");
+    }
+
+    #[test]
+    fn test_parse_user_token_map_empty() {
+        let map = RoutineEngine::parse_user_token_map("{}").unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_parse_user_token_map_invalid_json() {
+        assert!(RoutineEngine::parse_user_token_map("not json").is_err());
+    }
+
+    #[test]
+    fn test_parse_user_token_map_missing_user_id() {
+        // Token entry without user_id field should fail deserialization
+        let json = r#"{"tok-bad": {"llm_backend": "openai"}}"#;
+        assert!(RoutineEngine::parse_user_token_map(json).is_err());
     }
 }

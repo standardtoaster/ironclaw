@@ -245,6 +245,7 @@ fn builtin_entries() -> Vec<RegistryEntry> {
             },
             fallback_source: None,
             auth_hint: AuthHint::Dcr,
+            version: None,
         },
         RegistryEntry {
             name: "linear".to_string(),
@@ -265,6 +266,7 @@ fn builtin_entries() -> Vec<RegistryEntry> {
             },
             fallback_source: None,
             auth_hint: AuthHint::Dcr,
+            version: None,
         },
         RegistryEntry {
             name: "github".to_string(),
@@ -285,6 +287,7 @@ fn builtin_entries() -> Vec<RegistryEntry> {
             },
             fallback_source: None,
             auth_hint: AuthHint::Dcr,
+            version: None,
         },
         RegistryEntry {
             name: "slack-mcp".to_string(),
@@ -305,6 +308,7 @@ fn builtin_entries() -> Vec<RegistryEntry> {
             },
             fallback_source: None,
             auth_hint: AuthHint::Dcr,
+            version: None,
         },
         RegistryEntry {
             name: "sentry".to_string(),
@@ -325,6 +329,7 @@ fn builtin_entries() -> Vec<RegistryEntry> {
             },
             fallback_source: None,
             auth_hint: AuthHint::Dcr,
+            version: None,
         },
         RegistryEntry {
             name: "stripe".to_string(),
@@ -345,6 +350,7 @@ fn builtin_entries() -> Vec<RegistryEntry> {
             },
             fallback_source: None,
             auth_hint: AuthHint::Dcr,
+            version: None,
         },
         RegistryEntry {
             name: "cloudflare".to_string(),
@@ -365,6 +371,7 @@ fn builtin_entries() -> Vec<RegistryEntry> {
             },
             fallback_source: None,
             auth_hint: AuthHint::Dcr,
+            version: None,
         },
         RegistryEntry {
             name: "asana".to_string(),
@@ -383,6 +390,7 @@ fn builtin_entries() -> Vec<RegistryEntry> {
             },
             fallback_source: None,
             auth_hint: AuthHint::Dcr,
+            version: None,
         },
         RegistryEntry {
             name: "intercom".to_string(),
@@ -402,6 +410,7 @@ fn builtin_entries() -> Vec<RegistryEntry> {
             },
             fallback_source: None,
             auth_hint: AuthHint::Dcr,
+            version: None,
         },
         // WASM channels (telegram, slack, discord, whatsapp) come from the embedded
         // registry catalog (registry/channels/*.json) with WasmDownload URLs pointing
@@ -427,6 +436,7 @@ mod tests {
             },
             fallback_source: None,
             auth_hint: AuthHint::Dcr,
+            version: None,
         };
 
         let score = score_entry(&entry, &["notion".to_string()]);
@@ -450,6 +460,7 @@ mod tests {
             },
             fallback_source: None,
             auth_hint: AuthHint::Dcr,
+            version: None,
         };
 
         let score = score_entry(&entry, &["calendar".to_string()]);
@@ -473,6 +484,7 @@ mod tests {
             },
             fallback_source: None,
             auth_hint: AuthHint::Dcr,
+            version: None,
         };
 
         let score = score_entry(&entry, &["wiki".to_string()]);
@@ -496,6 +508,7 @@ mod tests {
             },
             fallback_source: None,
             auth_hint: AuthHint::Dcr,
+            version: None,
         };
 
         let score = score_entry(&entry, &["xyzfoobar".to_string()]);
@@ -560,6 +573,7 @@ mod tests {
             },
             fallback_source: None,
             auth_hint: AuthHint::Dcr,
+            version: None,
         };
 
         registry.cache_discovered(vec![discovered]).await;
@@ -586,6 +600,7 @@ mod tests {
             },
             fallback_source: None,
             auth_hint: AuthHint::None,
+            version: None,
         };
 
         registry.cache_discovered(vec![entry.clone()]).await;
@@ -605,12 +620,13 @@ mod tests {
                 description: "Telegram Bot API channel".to_string(),
                 keywords: vec!["messaging".into(), "bot".into()],
                 source: ExtensionSource::WasmBuildable {
-                    repo_url: "channels-src/telegram".to_string(),
+                    source_dir: "channels-src/telegram".to_string(),
                     build_dir: Some("channels-src/telegram".to_string()),
                     crate_name: Some("telegram-channel".to_string()),
                 },
                 fallback_source: None,
                 auth_hint: AuthHint::CapabilitiesAuth,
+                version: None,
             },
             // This shares a name with the builtin slack-mcp but has a different kind, so both should appear
             RegistryEntry {
@@ -620,12 +636,13 @@ mod tests {
                 description: "Slack WASM tool".to_string(),
                 keywords: vec!["messaging".into()],
                 source: ExtensionSource::WasmBuildable {
-                    repo_url: "tools-src/slack".to_string(),
+                    source_dir: "tools-src/slack".to_string(),
                     build_dir: Some("tools-src/slack".to_string()),
                     crate_name: Some("slack-tool".to_string()),
                 },
                 fallback_source: None,
                 auth_hint: AuthHint::CapabilitiesAuth,
+                version: None,
             },
         ];
 
@@ -662,6 +679,7 @@ mod tests {
             },
             fallback_source: None,
             auth_hint: AuthHint::Dcr,
+            version: None,
         }];
 
         let registry = ExtensionRegistry::new_with_catalog(catalog_entries);
@@ -683,12 +701,13 @@ mod tests {
                 description: "Telegram MTProto tool".to_string(),
                 keywords: vec!["messaging".into()],
                 source: ExtensionSource::WasmBuildable {
-                    repo_url: "tools-src/telegram".to_string(),
+                    source_dir: "tools-src/telegram".to_string(),
                     build_dir: Some("tools-src/telegram".to_string()),
                     crate_name: Some("telegram-tool".to_string()),
                 },
                 fallback_source: None,
                 auth_hint: AuthHint::CapabilitiesAuth,
+                version: None,
             },
             RegistryEntry {
                 name: "telegram".to_string(),
@@ -697,12 +716,13 @@ mod tests {
                 description: "Telegram Bot API channel".to_string(),
                 keywords: vec!["messaging".into(), "bot".into()],
                 source: ExtensionSource::WasmBuildable {
-                    repo_url: "channels-src/telegram".to_string(),
+                    source_dir: "channels-src/telegram".to_string(),
                     build_dir: Some("channels-src/telegram".to_string()),
                     crate_name: Some("telegram-channel".to_string()),
                 },
                 fallback_source: None,
                 auth_hint: AuthHint::CapabilitiesAuth,
+                version: None,
             },
         ];
 
@@ -759,12 +779,13 @@ mod tests {
             description: "A cached tool".to_string(),
             keywords: vec![],
             source: ExtensionSource::WasmBuildable {
-                repo_url: "tools-src/cached".to_string(),
+                source_dir: "tools-src/cached".to_string(),
                 build_dir: None,
                 crate_name: None,
             },
             fallback_source: None,
             auth_hint: AuthHint::None,
+            version: None,
         };
         let channel_entry = RegistryEntry {
             name: "cached-ext".to_string(),
@@ -773,12 +794,13 @@ mod tests {
             description: "A cached channel".to_string(),
             keywords: vec![],
             source: ExtensionSource::WasmBuildable {
-                repo_url: "channels-src/cached".to_string(),
+                source_dir: "channels-src/cached".to_string(),
                 build_dir: None,
                 crate_name: None,
             },
             fallback_source: None,
             auth_hint: AuthHint::None,
+            version: None,
         };
 
         registry
@@ -816,12 +838,13 @@ mod tests {
                 description: "Telegram messaging channel".to_string(),
                 keywords: vec!["messaging".into()],
                 source: ExtensionSource::WasmBuildable {
-                    repo_url: "channels-src/telegram".to_string(),
+                    source_dir: "channels-src/telegram".to_string(),
                     build_dir: None,
                     crate_name: None,
                 },
                 fallback_source: None,
                 auth_hint: AuthHint::CapabilitiesAuth,
+                version: None,
             },
             RegistryEntry {
                 name: "telegram".to_string(),
@@ -830,12 +853,13 @@ mod tests {
                 description: "Telegram API tool".to_string(),
                 keywords: vec!["messaging".into()],
                 source: ExtensionSource::WasmBuildable {
-                    repo_url: "tools-src/telegram".to_string(),
+                    source_dir: "tools-src/telegram".to_string(),
                     build_dir: None,
                     crate_name: None,
                 },
                 fallback_source: None,
                 auth_hint: AuthHint::CapabilitiesAuth,
+                version: None,
             },
         ];
 
@@ -878,12 +902,13 @@ mod tests {
                 description: "Channel".to_string(),
                 keywords: vec![],
                 source: ExtensionSource::WasmBuildable {
-                    repo_url: "x".to_string(),
+                    source_dir: "x".to_string(),
                     build_dir: None,
                     crate_name: None,
                 },
                 fallback_source: None,
                 auth_hint: AuthHint::None,
+                version: None,
             },
             RegistryEntry {
                 name: "myext".to_string(),
@@ -892,12 +917,13 @@ mod tests {
                 description: "Tool".to_string(),
                 keywords: vec![],
                 source: ExtensionSource::WasmBuildable {
-                    repo_url: "y".to_string(),
+                    source_dir: "y".to_string(),
                     build_dir: None,
                     crate_name: None,
                 },
                 fallback_source: None,
                 auth_hint: AuthHint::None,
+                version: None,
             },
         ];
 

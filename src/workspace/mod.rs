@@ -53,7 +53,8 @@ mod search;
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{MemoryChunk, MemoryDocument, WorkspaceEntry, merge_workspace_entries, paths};
 pub use embeddings::{
-    EmbeddingProvider, MockEmbeddings, NearAiEmbeddings, OllamaEmbeddings, OpenAiEmbeddings,
+    EmbeddingError, EmbeddingProvider, MockEmbeddings, NearAiEmbeddings, OllamaEmbeddings,
+    OpenAiEmbeddings,
 };
 #[cfg(feature = "postgres")]
 pub use repository::Repository;
@@ -353,6 +354,53 @@ const HEARTBEAT_SEED: &str = "\
      - Update daily logs with session summaries
      - Clean up context/ documents that are outdated
 -->";
+
+/// Default template seeded into TOOLS.md on first access.
+///
+/// TOOLS.md does not control tool availability; it is user guidance
+/// for how to use external tools. The agent may update this file as it
+/// learns environment-specific details (SSH hostnames, device names, etc.).
+const TOOLS_SEED: &str = "\
+<!-- TOOLS.md — Environment-specific tool notes.
+     This file does not control which tools are available; it is guidance only.
+     The agent can update this file as it learns your setup.
+
+     Examples:
+     - SSH hosts: dev-box (Ubuntu 22.04, username: alice)
+     - Camera: Canon R6 mounted at /Volumes/EOS_R
+     - Default shell on remote: bash, no zsh
+
+     Add your environment notes below (outside the comment block).
+-->";
+
+/// First-run ritual seeded into BOOTSTRAP.md on initial workspace setup.
+///
+/// The agent reads this file at the start of every session when it exists.
+/// After completing the ritual the agent must delete this file so it is
+/// never repeated. It is NOT a protected file; the agent needs write access.
+const BOOTSTRAP_SEED: &str = "\
+# Bootstrap
+
+You are starting up for the first time. Follow these steps before anything else.
+
+## Steps
+
+1. **Say hello.** Greet the user warmly and introduce yourself briefly.
+2. **Get to know the user.** Ask a few questions to understand who they are, \
+what they work on, and what they want from an AI assistant. Take notes.
+3. **Save what you learned.**
+   - Write any environment-specific tool details the user mentions to `TOOLS.md` \
+using `memory_write` with target set to the path.
+   - Write a summary of the conversation and key facts to `MEMORY.md` \
+using `memory_write` with target `memory`.
+   - Note: `USER.md`, `IDENTITY.md`, `SOUL.md`, and `AGENTS.md` are protected \
+from tool writes for security. Tell the user what you'd suggest for those files \
+so they can edit them directly.
+4. **Delete this file.** When onboarding is complete, use `memory_write` with \
+target `bootstrap` to clear this file so setup never repeats.
+
+Keep the conversation natural. Do not read these steps aloud.
+";
 
 /// Workspace provides database-backed memory storage for an agent.
 ///
@@ -856,11 +904,26 @@ impl Workspace {
     ///
     /// Daily logs are raw, append-only notes for the current day.
     pub async fn append_daily_log(&self, entry: &str) -> Result<(), WorkspaceError> {
-        let today = Utc::now().date_naive();
+        self.append_daily_log_tz(entry, chrono_tz::Tz::UTC)
+            .await
+            .map(|_| ())
+    }
+
+    /// Append an entry to today's daily log using the given timezone.
+    ///
+    /// Returns the path that was written to (e.g. `daily/2024-01-15.md`).
+    pub async fn append_daily_log_tz(
+        &self,
+        entry: &str,
+        tz: chrono_tz::Tz,
+    ) -> Result<String, WorkspaceError> {
+        let now = crate::timezone::now_in_tz(tz);
+        let today = now.date_naive();
         let path = format!("daily/{}.md", today.format("%Y-%m-%d"));
-        let timestamp = Utc::now().format("%H:%M:%S");
+        let timestamp = now.format("%H:%M:%S");
         let timestamped_entry = format!("[{}] {}", timestamp, entry);
-        self.append(&path, &timestamped_entry).await
+        self.append(&path, &timestamped_entry).await?;
+        Ok(path)
     }
 
     // ==================== System Prompt ====================
@@ -875,6 +938,18 @@ impl Workspace {
         self.system_prompt_for_context(false).await
     }
 
+    /// Build the system prompt with timezone-aware daily log dates.
+    ///
+    /// Uses the given timezone to determine "today" and "yesterday" for daily log injection.
+    pub async fn system_prompt_for_context_tz(
+        &self,
+        is_group_chat: bool,
+        tz: chrono_tz::Tz,
+    ) -> Result<String, WorkspaceError> {
+        self.system_prompt_for_context_inner(is_group_chat, Some(tz))
+            .await
+    }
+
     /// Build the system prompt, optionally excluding personal memory.
     ///
     /// When `is_group_chat` is true, MEMORY.md is excluded to prevent
@@ -883,7 +958,35 @@ impl Workspace {
         &self,
         is_group_chat: bool,
     ) -> Result<String, WorkspaceError> {
+        self.system_prompt_for_context_inner(is_group_chat, None)
+            .await
+    }
+
+    /// Inner implementation for system prompt building.
+    async fn system_prompt_for_context_inner(
+        &self,
+        is_group_chat: bool,
+        tz: Option<chrono_tz::Tz>,
+    ) -> Result<String, WorkspaceError> {
         let mut parts = Vec::new();
+
+        // Bootstrap ritual: inject FIRST when present (first-run only).
+        // The agent must complete the ritual and then delete this file.
+        //
+        // Note: BOOTSTRAP.md is intentionally NOT write-protected so the agent
+        // can delete it after onboarding. This means a prompt injection attack
+        // could write to it, but the file is only injected on the next session
+        // (not the current one), limiting the blast radius.
+        if let Ok(doc) = self.read(paths::BOOTSTRAP).await
+            && !doc.content.is_empty()
+        {
+            parts.push(format!(
+                "## First-Run Bootstrap\n\n\
+                 A BOOTSTRAP.md file exists in the workspace. Read and follow it, \
+                 then delete it when done.\n\n{}",
+                doc.content
+            ));
+        }
 
         // Load identity files in order of importance
         let identity_files = [
@@ -894,11 +997,37 @@ impl Workspace {
         ];
 
         for (path, header) in identity_files {
-            if let Ok(doc) = self.read(path).await
-                && !doc.content.is_empty()
-            {
-                parts.push(format!("{}\n\n{}", header, doc.content));
+            match self.read(path).await {
+                Ok(doc) if !doc.content.is_empty() => {
+                    parts.push(format!("{}\n\n{}", header, doc.content));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        user_id = %self.user_id,
+                        path = path,
+                        error = %e,
+                        "Failed to load identity file for system prompt"
+                    );
+                }
             }
+        }
+
+        // Current date/time — refreshed every turn so the model always knows "now".
+        {
+            let now = match tz {
+                Some(t) => Utc::now().with_timezone(&t).format("%Y-%m-%d %H:%M %Z (%A)").to_string(),
+                None => Utc::now().format("%Y-%m-%d %H:%M UTC (%A)").to_string(),
+            };
+            parts.push(format!("Current date and time: {now}"));
+        }
+
+        // Tool notes: environment-specific guidance the agent or user has written.
+        // TOOLS.md does not control tool availability; it is guidance only.
+        if let Ok(doc) = self.read(paths::TOOLS).await
+            && !doc.content.is_empty()
+        {
+            parts.push(format!("## Tool Notes\n\n{}", doc.content));
         }
 
         // Load MEMORY.md only in direct/main sessions (never group chats)
@@ -910,7 +1039,10 @@ impl Workspace {
         }
 
         // Add today's memory context (last 2 days of daily logs)
-        let today = Utc::now().date_naive();
+        let today = match tz {
+            Some(t) => crate::timezone::today_in_tz(t),
+            None => Utc::now().date_naive(),
+        };
         let yesterday = today.pred_opt().unwrap_or(today);
 
         for date in [today, yesterday] {
@@ -1045,6 +1177,7 @@ impl Workspace {
                  - `SOUL.md` - Core values and behavioral boundaries\n\
                  - `AGENTS.md` - Session routine and operational instructions\n\
                  - `USER.md` - Information about you (the user)\n\
+                 - `TOOLS.md` - Environment-specific tool notes\n\
                  - `HEARTBEAT.md` - Periodic background task checklist\n\
                  - `daily/` - Automatic daily session logs\n\
                  - `context/` - Additional context documents\n\n\
@@ -1115,6 +1248,7 @@ impl Workspace {
                  You can also edit this directly to provide context upfront.",
             ),
             (paths::HEARTBEAT, HEARTBEAT_SEED),
+            (paths::TOOLS, TOOLS_SEED),
         ];
 
         let mut count = 0;
@@ -1136,8 +1270,115 @@ impl Workspace {
             }
         }
 
+        // BOOTSTRAP.md is only seeded on truly fresh workspaces (no identity
+        // files exist yet). This prevents existing users from getting a
+        // spurious first-run ritual after upgrading.
+        if self.read(paths::BOOTSTRAP).await.is_err() {
+            let (agents_res, soul_res, user_res) = tokio::join!(
+                self.read(paths::AGENTS),
+                self.read(paths::SOUL),
+                self.read(paths::USER),
+            );
+            let is_fresh_workspace =
+                matches!(agents_res, Err(WorkspaceError::DocumentNotFound { .. }))
+                    && matches!(soul_res, Err(WorkspaceError::DocumentNotFound { .. }))
+                    && matches!(user_res, Err(WorkspaceError::DocumentNotFound { .. }));
+
+            if is_fresh_workspace {
+                if let Err(e) = self.write(paths::BOOTSTRAP, BOOTSTRAP_SEED).await {
+                    tracing::warn!("Failed to seed {}: {}", paths::BOOTSTRAP, e);
+                } else {
+                    count += 1;
+                }
+            }
+        }
+
         if count > 0 {
             tracing::info!("Seeded {} workspace files", count);
+        }
+        Ok(count)
+    }
+
+    /// Import markdown files from a directory on disk into the workspace DB.
+    ///
+    /// Scans `dir` for `*.md` files (non-recursive) and writes each one into
+    /// the workspace **only if it doesn't already exist in the database**.
+    /// This allows Docker images or deployment scripts to ship customized
+    /// workspace templates that override the generic seeds.
+    ///
+    /// Returns the number of files imported (0 if all already existed).
+    pub async fn import_from_directory(
+        &self,
+        dir: &std::path::Path,
+    ) -> Result<usize, WorkspaceError> {
+        if !dir.is_dir() {
+            tracing::warn!(
+                "Workspace import directory does not exist: {}",
+                dir.display()
+            );
+            return Ok(0);
+        }
+
+        let entries = std::fs::read_dir(dir).map_err(|e| WorkspaceError::IoError {
+            reason: format!("failed to read directory {}: {}", dir.display(), e),
+        })?;
+
+        let mut count = 0;
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("Failed to read directory entry in {}: {}", dir.display(), e);
+                    continue;
+                }
+            };
+
+            let path = entry.path();
+            // Only import .md files
+            if path.extension() != Some(std::ffi::OsStr::new("md")) {
+                continue;
+            }
+
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            // Skip if already exists in DB (never overwrite user edits)
+            match self.read(file_name).await {
+                Ok(_) => continue,
+                Err(WorkspaceError::DocumentNotFound { .. }) => {}
+                Err(e) => {
+                    tracing::warn!("Failed to check {}: {}", file_name, e);
+                    continue;
+                }
+            }
+
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("Failed to read import file {}: {}", path.display(), e);
+                    continue;
+                }
+            };
+
+            if content.trim().is_empty() {
+                continue;
+            }
+
+            if let Err(e) = self.write(file_name, &content).await {
+                tracing::warn!("Failed to import {}: {}", file_name, e);
+            } else {
+                tracing::info!("Imported workspace file from disk: {}", file_name);
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            tracing::info!(
+                "Imported {} workspace file(s) from {}",
+                count,
+                dir.display()
+            );
         }
         Ok(count)
     }

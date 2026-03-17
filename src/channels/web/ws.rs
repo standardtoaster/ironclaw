@@ -121,6 +121,7 @@ pub async fn handle_ws_connection(
     });
 
     // Receiver task: read client frames and route to agent
+    let workspace_read_scopes = user.workspace_read_scopes;
     let user_id = user.user_id;
     while let Some(Ok(frame)) = ws_stream.next().await {
         match frame {
@@ -128,7 +129,14 @@ pub async fn handle_ws_connection(
                 let parsed: Result<WsClientMessage, _> = serde_json::from_str(&text);
                 match parsed {
                     Ok(client_msg) => {
-                        handle_client_message(client_msg, &state, &user_id, &direct_tx).await;
+                        handle_client_message(
+                            client_msg,
+                            &state,
+                            &user_id,
+                            &workspace_read_scopes,
+                            &direct_tx,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         let _ = direct_tx
@@ -157,13 +165,46 @@ async fn handle_client_message(
     msg: WsClientMessage,
     state: &GatewayState,
     user_id: &str,
+    workspace_read_scopes: &[String],
     direct_tx: &mpsc::Sender<WsServerMessage>,
 ) {
     match msg {
-        WsClientMessage::Message { content, thread_id } => {
+        WsClientMessage::Message {
+            content,
+            thread_id,
+            timezone,
+            images,
+            suppress_response,
+        } => {
             let mut incoming = IncomingMessage::new("gateway", user_id, &content);
+            if let Some(ref tz) = timezone {
+                incoming = incoming.with_timezone(tz);
+            }
             if let Some(ref tid) = thread_id {
                 incoming = incoming.with_thread(tid);
+            }
+            let mut meta = serde_json::Map::new();
+            if suppress_response {
+                meta.insert(
+                    "suppress_response".to_string(),
+                    serde_json::json!(true),
+                );
+            }
+            if !workspace_read_scopes.is_empty() {
+                meta.insert(
+                    "workspace_read_scopes".to_string(),
+                    serde_json::json!(workspace_read_scopes),
+                );
+            }
+            if !meta.is_empty() {
+                incoming =
+                    incoming.with_metadata(serde_json::Value::Object(meta));
+            }
+
+            // Convert uploaded images to IncomingAttachments
+            if !images.is_empty() {
+                let attachments = crate::channels::web::server::images_to_attachments(&images);
+                incoming = incoming.with_attachments(attachments);
             }
 
             let tx_guard = state.msg_tx.read().await;
@@ -252,7 +293,7 @@ async fn handle_client_message(
         } => {
             if let Some(ref ext_mgr) = state.extension_manager {
                 match ext_mgr.auth(&extension_name, Some(&token)).await {
-                    Ok(result) if result.status == "authenticated" => {
+                    Ok(result) if result.is_authenticated() => {
                         let msg = match ext_mgr.activate(&extension_name).await {
                             Ok(r) => format!(
                                 "{} authenticated ({} tools loaded)",
@@ -279,9 +320,9 @@ async fn handle_client_message(
                             user_id,
                             crate::channels::web::types::SseEvent::AuthRequired {
                                 extension_name,
-                                instructions: result.instructions,
-                                auth_url: result.auth_url,
-                                setup_url: result.setup_url,
+                                instructions: result.instructions().map(String::from),
+                                auth_url: result.auth_url().map(String::from),
+                                setup_url: result.setup_url().map(String::from),
                             },
                         );
                     }
@@ -344,7 +385,7 @@ mod tests {
         let (direct_tx, mut direct_rx) = mpsc::channel(16);
         let state = make_test_state(None).await;
 
-        handle_client_message(WsClientMessage::Ping, &state, "user1", &direct_tx).await;
+        handle_client_message(WsClientMessage::Ping, &state, "user1", &[], &direct_tx).await;
 
         let response = direct_rx.recv().await.unwrap();
         assert!(matches!(response, WsServerMessage::Pong));
@@ -361,9 +402,13 @@ mod tests {
             WsClientMessage::Message {
                 content: "hello agent".to_string(),
                 thread_id: Some("t1".to_string()),
+                timezone: None,
+                images: Vec::new(),
+                suppress_response: false,
             },
             &state,
             "user1",
+            &[],
             &direct_tx,
         )
         .await;
@@ -385,9 +430,13 @@ mod tests {
             WsClientMessage::Message {
                 content: "hello".to_string(),
                 thread_id: None,
+                timezone: None,
+                images: Vec::new(),
+                suppress_response: false,
             },
             &state,
             "user1",
+            &[],
             &direct_tx,
         )
         .await;
@@ -416,6 +465,7 @@ mod tests {
             },
             &state,
             "user1",
+            &[],
             &direct_tx,
         )
         .await;
@@ -440,6 +490,7 @@ mod tests {
             },
             &state,
             "user1",
+            &[],
             &direct_tx,
         )
         .await;
@@ -466,6 +517,7 @@ mod tests {
             },
             &state,
             "user1",
+            &[],
             &direct_tx,
         )
         .await;
@@ -496,6 +548,7 @@ mod tests {
             store: None,
             job_manager: None,
             prompt_queue: None,
+            scheduler: None,
             default_user_id: "test".to_string(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
@@ -507,6 +560,7 @@ mod tests {
             chat_rate_limiter: crate::channels::web::server::PerUserRateLimiter::new(30, 60),
             registry_entries: Vec::new(),
             cost_guard: None,
+            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
             restart_requested: std::sync::atomic::AtomicBool::new(false),
             collection_write_tx: None,

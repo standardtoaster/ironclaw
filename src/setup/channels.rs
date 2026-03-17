@@ -1,6 +1,6 @@
-//! Channel-specific setup flows.
+//! Channel setup flows.
 //!
-//! Each channel (Telegram, HTTP, etc.) has its own setup function that:
+//! Each channel (HTTP, Signal, WASM, etc.) has its own setup function that:
 //! 1. Displays setup instructions
 //! 2. Collects configuration (tokens, ports, etc.)
 //! 3. Validates the configuration
@@ -9,9 +9,7 @@
 use std::sync::Arc;
 
 use base64::Engine;
-use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
 use url::Url;
 use uuid::Uuid;
 
@@ -105,267 +103,12 @@ impl SecretsContext {
     }
 }
 
-/// Result of Telegram setup.
-#[derive(Debug, Clone)]
-pub struct TelegramSetupResult {
-    pub enabled: bool,
-    pub bot_username: Option<String>,
-    pub webhook_secret: Option<String>,
-    pub owner_id: Option<i64>,
-}
-
-/// Telegram Bot API response for getMe.
-#[derive(Debug, Deserialize)]
-struct TelegramGetMeResponse {
-    ok: bool,
-    result: Option<TelegramUser>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TelegramUser {
-    username: Option<String>,
-    #[allow(dead_code)]
-    first_name: String,
-}
-
-/// Telegram Bot API response for getUpdates.
-#[derive(Debug, Deserialize)]
-struct TelegramGetUpdatesResponse {
-    ok: bool,
-    result: Vec<TelegramUpdate>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TelegramUpdate {
-    update_id: i64,
-    message: Option<TelegramUpdateMessage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TelegramUpdateMessage {
-    from: Option<TelegramUpdateUser>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TelegramUpdateUser {
-    id: i64,
-    first_name: String,
-    username: Option<String>,
-}
-
-/// Set up Telegram bot channel.
-///
-/// Guides the user through:
-/// 1. Creating a bot with @BotFather
-/// 2. Entering the bot token
-/// 3. Validating the token
-/// 4. Saving the token to the database
-pub async fn setup_telegram(
-    secrets: &SecretsContext,
-    settings: &Settings,
-) -> Result<TelegramSetupResult, ChannelSetupError> {
-    println!("Telegram Setup:");
-    println!();
-    print_info("To create a Telegram bot:");
-    print_info("1. Open Telegram and message @BotFather");
-    print_info("2. Send /newbot and follow the prompts");
-    print_info("3. Copy the bot token (looks like 123456:ABC-DEF...)");
-    println!();
-
-    // Check if token already exists
-    if secrets.secret_exists("telegram_bot_token").await {
-        print_info("Existing Telegram token found in database.");
-        if !confirm("Replace existing token?", false)? {
-            // Still offer to configure webhook secret and owner binding
-            let webhook_secret = setup_telegram_webhook_secret(secrets, &settings.tunnel).await?;
-            let owner_id = bind_telegram_owner_flow(secrets, settings).await?;
-            return Ok(TelegramSetupResult {
-                enabled: true,
-                bot_username: None,
-                webhook_secret,
-                owner_id,
-            });
-        }
-    }
-
-    loop {
-        let token = secret_input("Bot token (from @BotFather)")?;
-
-        // Validate the token
-        print_info("Validating bot token...");
-
-        match validate_telegram_token(&token).await {
-            Ok(username) => {
-                print_success(&format!(
-                    "Bot validated: @{}",
-                    username.as_deref().unwrap_or("unknown")
-                ));
-
-                // Save to database
-                secrets.save_secret("telegram_bot_token", &token).await?;
-                print_success("Token saved to database");
-
-                // Bind bot to owner's Telegram account
-                let owner_id = bind_telegram_owner(&token).await?;
-
-                // Offer webhook secret configuration
-                let webhook_secret =
-                    setup_telegram_webhook_secret(secrets, &settings.tunnel).await?;
-
-                return Ok(TelegramSetupResult {
-                    enabled: true,
-                    bot_username: username,
-                    webhook_secret,
-                    owner_id,
-                });
-            }
-            Err(e) => {
-                print_error(&format!("Token validation failed: {}", e));
-
-                if !confirm("Try again?", true)? {
-                    return Ok(TelegramSetupResult {
-                        enabled: false,
-                        bot_username: None,
-                        webhook_secret: None,
-                        owner_id: None,
-                    });
-                }
-            }
-        }
-    }
-}
-
-/// Bind the bot to the owner's Telegram account by having them send a message.
-///
-/// Polls `getUpdates` until a message arrives, then captures the sender's user ID.
-/// Returns `None` if the user declines or the flow times out.
-async fn bind_telegram_owner(token: &SecretString) -> Result<Option<i64>, ChannelSetupError> {
-    println!();
-    print_info("Account Binding (recommended):");
-    print_info("Binding restricts the bot so only YOU can use it.");
-    print_info("Without this, anyone who finds your bot can send it messages.");
-    println!();
-
-    if !confirm("Bind bot to your Telegram account?", true)? {
-        print_info("Skipping account binding. Bot will accept messages from all users.");
-        return Ok(None);
-    }
-
-    print_info("Send any message (e.g. /start) to your bot in Telegram.");
-    print_info("Waiting for your message (up to 120 seconds)...");
-
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(35))
-        .build()
-        .map_err(|e| ChannelSetupError::Network(format!("Failed to create HTTP client: {}", e)))?;
-
-    // Clear any existing webhook so getUpdates works
-    let delete_url = format!(
-        "https://api.telegram.org/bot{}/deleteWebhook",
-        token.expose_secret()
-    );
-    if let Err(e) = client.post(&delete_url).send().await {
-        tracing::warn!("Failed to delete webhook (getUpdates may not work): {e}");
-    }
-
-    let updates_url = format!(
-        "https://api.telegram.org/bot{}/getUpdates",
-        token.expose_secret()
-    );
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-
-    while std::time::Instant::now() < deadline {
-        let response = client
-            .get(&updates_url)
-            .query(&[("timeout", "30"), ("allowed_updates", "[\"message\"]")])
-            .send()
-            .await
-            .map_err(|e| ChannelSetupError::Network(format!("getUpdates request failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            return Err(ChannelSetupError::Network(format!(
-                "getUpdates returned status {}",
-                response.status()
-            )));
-        }
-
-        let body: TelegramGetUpdatesResponse = response.json().await.map_err(|e| {
-            ChannelSetupError::Network(format!("Failed to parse getUpdates response: {}", e))
-        })?;
-
-        if !body.ok {
-            return Err(ChannelSetupError::Network(
-                "Telegram API returned error for getUpdates".to_string(),
-            ));
-        }
-
-        // Find the first message with a sender
-        for update in &body.result {
-            if let Some(ref msg) = update.message
-                && let Some(ref from) = msg.from
-            {
-                let display_name = from
-                    .username
-                    .as_ref()
-                    .map(|u| format!("@{}", u))
-                    .unwrap_or_else(|| from.first_name.clone());
-
-                print_success(&format!(
-                    "Received message from {} (ID: {})",
-                    display_name, from.id
-                ));
-
-                // Acknowledge the update so it doesn't pile up
-                let ack_url = format!(
-                    "https://api.telegram.org/bot{}/getUpdates",
-                    token.expose_secret()
-                );
-                if let Err(e) = client
-                    .get(&ack_url)
-                    .query(&[("offset", &(update.update_id + 1).to_string())])
-                    .send()
-                    .await
-                {
-                    tracing::warn!("Failed to acknowledge Telegram update: {e}");
-                }
-
-                return Ok(Some(from.id));
-            }
-        }
-    }
-
-    print_error("Timed out waiting for a message. You can re-run setup to try again.");
-    print_info("Bot will accept messages from all users until owner is bound.");
-    Ok(None)
-}
-
-/// Bind flow when the token already exists (reads from secrets store).
-///
-/// Retrieves the saved bot token and delegates to `bind_telegram_owner`.
-async fn bind_telegram_owner_flow(
-    secrets: &SecretsContext,
-    settings: &Settings,
-) -> Result<Option<i64>, ChannelSetupError> {
-    if settings.channels.telegram_owner_id.is_some() {
-        print_info("Bot is already bound to a Telegram account.");
-        if !confirm("Re-bind to a different account?", false)? {
-            return Ok(settings.channels.telegram_owner_id);
-        }
-    }
-
-    // We need the token to poll getUpdates
-    let token = secrets.get_secret("telegram_bot_token").await?;
-
-    bind_telegram_owner(&token).await
-}
-
 /// Set up a tunnel for exposing the agent to the internet.
 ///
 /// This is shared across all channels that need webhook endpoints.
 /// Returns a `TunnelSettings` with provider config (managed tunnel)
 /// or a static URL.
-pub fn setup_tunnel(settings: &Settings) -> Result<TunnelSettings, ChannelSetupError> {
+pub async fn setup_tunnel(settings: &Settings) -> Result<TunnelSettings, ChannelSetupError> {
     // Show existing config
     let has_existing = settings.tunnel.public_url.is_some() || settings.tunnel.provider.is_some();
     if has_existing {
@@ -445,7 +188,7 @@ pub fn setup_tunnel(settings: &Settings) -> Result<TunnelSettings, ChannelSetupE
 
     match choice {
         0 => setup_tunnel_ngrok(),
-        1 => setup_tunnel_cloudflare(),
+        1 => setup_tunnel_cloudflare().await,
         2 => setup_tunnel_tailscale(),
         3 => setup_tunnel_custom(),
         4 => setup_tunnel_static(),
@@ -470,7 +213,7 @@ fn setup_tunnel_ngrok() -> Result<TunnelSettings, ChannelSetupError> {
     })
 }
 
-fn setup_tunnel_cloudflare() -> Result<TunnelSettings, ChannelSetupError> {
+async fn setup_tunnel_cloudflare() -> Result<TunnelSettings, ChannelSetupError> {
     // Check if cloudflared binary is on PATH
     let cloudflared_found = crate::skills::gating::binary_exists("cloudflared");
 
@@ -524,6 +267,28 @@ fn setup_tunnel_cloudflare() -> Result<TunnelSettings, ChannelSetupError> {
         }
     }
 
+    // Live-validate the token by briefly spawning cloudflared (if available)
+    if cloudflared_found && token_valid {
+        print_info("Verifying token with cloudflared...");
+        match validate_cloudflare_token_live(token.expose_secret()).await {
+            Ok(()) => {
+                print_success("Token verified -- cloudflared connected successfully.");
+            }
+            Err(stderr_output) => {
+                print_error(&format!(
+                    "cloudflared rejected the token: {}",
+                    stderr_output
+                ));
+                println!();
+                if !confirm("Save this token anyway?", false)? {
+                    return Err(ChannelSetupError::Validation(
+                        "Cloudflare tunnel token failed live validation.".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
     print_success("Cloudflare tunnel token saved.");
     if cloudflared_found {
         print_info("Start the tunnel with: cloudflared tunnel --no-autoupdate run --token <token>");
@@ -544,7 +309,8 @@ fn setup_tunnel_cloudflare() -> Result<TunnelSettings, ChannelSetupError> {
 /// Detect running cloudflared processes or managed services that could conflict
 /// with IronClaw's tunnel management.
 fn detect_existing_cloudflared() -> Option<String> {
-    let mut conflicts = Vec::new();
+    #[allow(unused_mut)]
+    let mut conflicts: Vec<String> = Vec::new();
 
     // Check for running cloudflared processes (all platforms)
     #[cfg(unix)]
@@ -701,84 +467,6 @@ fn setup_tunnel_static() -> Result<TunnelSettings, ChannelSetupError> {
         public_url: Some(tunnel_url),
         ..Default::default()
     })
-}
-
-/// Set up Telegram webhook secret for signature validation.
-///
-/// Returns the webhook secret if configured.
-async fn setup_telegram_webhook_secret(
-    secrets: &SecretsContext,
-    tunnel: &TunnelSettings,
-) -> Result<Option<String>, ChannelSetupError> {
-    if tunnel.public_url.is_none() {
-        print_info("");
-        print_info("No tunnel configured. Telegram will use polling mode (30s+ delay).");
-        print_info("Run setup again to configure a tunnel for instant delivery.");
-        return Ok(None);
-    }
-
-    println!();
-    print_info("Telegram Webhook Security:");
-    print_info("A webhook secret adds an extra layer of security by validating");
-    print_info("that requests actually come from Telegram's servers.");
-
-    if !confirm("Generate a webhook secret?", true)? {
-        return Ok(None);
-    }
-
-    let secret = generate_webhook_secret();
-    secrets
-        .save_secret(
-            "telegram_webhook_secret",
-            &SecretString::from(secret.clone()),
-        )
-        .await?;
-    print_success("Webhook secret generated and saved");
-
-    Ok(Some(secret))
-}
-
-/// Validate a Telegram bot token by calling the getMe API.
-///
-/// Returns the bot's username if valid.
-pub async fn validate_telegram_token(
-    token: &SecretString,
-) -> Result<Option<String>, ChannelSetupError> {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| ChannelSetupError::Network(format!("Failed to create HTTP client: {}", e)))?;
-
-    let url = format!(
-        "https://api.telegram.org/bot{}/getMe",
-        token.expose_secret()
-    );
-
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| ChannelSetupError::Network(format!("Request failed: {}", e)))?;
-
-    if !response.status().is_success() {
-        return Err(ChannelSetupError::Network(format!(
-            "API returned status {}",
-            response.status()
-        )));
-    }
-
-    let body: TelegramGetMeResponse = response
-        .json()
-        .await
-        .map_err(|e| ChannelSetupError::Network(format!("Failed to parse response: {}", e)))?;
-
-    if body.ok {
-        Ok(body.result.and_then(|u| u.username))
-    } else {
-        Err(ChannelSetupError::Network(
-            "Telegram API returned error".to_string(),
-        ))
-    }
 }
 
 /// Result of HTTP webhook setup.
@@ -1133,6 +821,71 @@ pub async fn setup_wasm_channel(
     })
 }
 
+/// Validate a Cloudflare tunnel token by briefly running `cloudflared`.
+///
+/// Spawns `cloudflared tunnel run` with a dummy local URL and watches stderr
+/// for up to 10 seconds. If a connection URL appears, the token is valid.
+/// If error indicators appear first, returns the error message.
+async fn validate_cloudflare_token_live(token: &str) -> Result<(), String> {
+    use tokio::io::AsyncBufReadExt;
+    use tokio::process::Command;
+
+    let mut child = Command::new("cloudflared")
+        .args([
+            "tunnel",
+            "--no-autoupdate",
+            "run",
+            "--token",
+            token,
+            "--url",
+            "http://localhost:1",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Failed to spawn cloudflared: {}", e))?;
+
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to capture cloudflared stderr".to_string())?;
+    let mut reader = tokio::io::BufReader::new(stderr).lines();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Ok(Some(line)) = reader.next_line().await {
+            // A successful connection logs a URL like "https://xxx.cfargotunnel.com"
+            if line.contains("https://")
+                && (line.contains("cfargotunnel.com") || line.contains("trycloudflare.com"))
+            {
+                return Ok(());
+            }
+            // Error indicators that appear before a URL mean the token is bad
+            let lower = line.to_lowercase();
+            if lower.starts_with("err")
+                || lower.contains("failed to unmarshal")
+                || lower.contains("unauthorized")
+            {
+                return Err(line);
+            }
+        }
+        // Process exited without clear signal -- check exit status
+        Err("cloudflared exited without establishing a connection".to_string())
+    })
+    .await;
+
+    // Ensure the process is killed regardless of outcome
+    let _ = child.kill().await;
+
+    match result {
+        Ok(inner) => inner,
+        Err(_elapsed) => {
+            // Timed out without error or success -- benefit of the doubt
+            Ok(())
+        }
+    }
+}
+
 /// Validate that a Cloudflare tunnel token has the expected format.
 ///
 /// Cloudflare tunnel tokens are base64-encoded JSON objects containing
@@ -1149,9 +902,9 @@ fn validate_cloudflare_token_format(token: &str) -> bool {
 /// Generate a random secret of specified length (in bytes).
 fn generate_secret_with_length(length: usize) -> String {
     use rand::RngCore;
-    let mut rng = rand::thread_rng();
+    use rand::rngs::OsRng;
     let mut bytes = vec![0u8; length];
-    rng.fill_bytes(&mut bytes);
+    OsRng.fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 

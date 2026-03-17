@@ -18,12 +18,18 @@ use crate::tools::wasm::{InjectedCredentials, SharedCredentialRegistry, inject_c
 #[cfg(feature = "html-to-markdown")]
 use crate::tools::builtin::convert_html_to_markdown;
 
-/// Maximum response body size (5 MB).
+/// Maximum response body size for text responses (5 MB).
 ///
 /// 5 MB is large enough for typical JSON API responses and moderate HTML pages,
 /// but small enough to prevent OOM from malicious or runaway servers.  The WASM
 /// HTTP wrapper uses the same limit for consistency.
 const MAX_RESPONSE_SIZE: usize = 5 * 1024 * 1024;
+
+/// Maximum response body size when saving to disk via `save_to` (50 MB).
+///
+/// Larger limit for file downloads since the body is written to disk, not held
+/// in memory for LLM context. Matches the WASM attachment size cap.
+const MAX_SAVE_TO_SIZE: usize = 50 * 1024 * 1024;
 
 /// Tool for making HTTP requests.
 pub struct HttpTool {
@@ -37,7 +43,45 @@ impl HttpTool {
     pub fn new() -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 10 {
+                    return attempt.error("too many redirects");
+                }
+                // Reject scheme downgrades (https → http)
+                if attempt.url().scheme() != "https" {
+                    return attempt.error("redirect to non-HTTPS URL is not allowed");
+                }
+                // Extract host info before consuming attempt
+                let host_owned = attempt.url().host_str().map(|h| h.to_owned());
+                let port = attempt.url().port_or_known_default().unwrap_or(443);
+
+                if let Some(host) = host_owned {
+                    let host_lower = host.to_lowercase();
+                    if host_lower == "localhost" || host_lower.ends_with(".localhost") {
+                        return attempt.error("redirect to localhost is not allowed");
+                    }
+                    if let Ok(ip) = host.parse::<IpAddr>()
+                        && is_disallowed_ip(&ip)
+                    {
+                        return attempt.error("redirect to private/local IP is not allowed");
+                    }
+                    // Resolve hostname and check all IPs
+                    let socket_addr = format!("{}:{}", host, port);
+                    if let Ok(addrs) = socket_addr.to_socket_addrs() {
+                        for addr in addrs {
+                            if is_disallowed_ip(&addr.ip()) {
+                                let msg = format!(
+                                    "redirect target '{}' resolves to disallowed IP {}",
+                                    host,
+                                    addr.ip()
+                                );
+                                return attempt.error(msg);
+                            }
+                        }
+                    }
+                }
+                attempt.follow()
+            }))
             .build()
             .expect("Failed to create HTTP client");
 
@@ -58,6 +102,31 @@ impl HttpTool {
         self.secrets_store = Some(secrets_store);
         self
     }
+}
+
+/// Validate and resolve a `save_to` path, ensuring it stays under `/tmp/`.
+///
+/// Uses `path_utils::validate_path` with `/tmp` as the base directory to catch
+/// traversal attacks like `/tmp/../../etc/passwd` and symlink escapes.
+/// Creates parent directories only after validation succeeds.
+fn validate_save_to_path(save_to: &str) -> Result<std::path::PathBuf, ToolError> {
+    // Quick prefix check before doing any fs work
+    if !save_to.starts_with("/tmp/") {
+        return Err(ToolError::InvalidParameters(
+            "save_to path must be under /tmp/".to_string(),
+        ));
+    }
+    // Validate path BEFORE creating directories to prevent traversal-based
+    // directory creation outside /tmp (e.g. `/tmp/../../etc/passwd`).
+    let tmp_base = std::path::Path::new("/tmp");
+    let validated = crate::tools::builtin::path_utils::validate_path(save_to, Some(tmp_base))?;
+    // Only create parent directories for the validated (safe) path
+    if let Some(parent) = validated.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ToolError::ExecutionFailed(format!("failed to create directory: {}", e))
+        })?;
+    }
+    Ok(validated)
 }
 
 pub(crate) fn validate_url(url: &str) -> Result<reqwest::Url, ToolError> {
@@ -201,7 +270,9 @@ impl Tool for HttpTool {
     }
 
     fn description(&self) -> &str {
-        "Make HTTP requests to external APIs. Supports GET, POST, PUT, DELETE methods."
+        "Make HTTP requests to external APIs. Supports GET, POST, PUT, DELETE methods. \
+         Use save_to to download binary files (images, PDFs, etc.) to a local path, \
+         e.g. {\"method\":\"GET\",\"url\":\"https://picsum.photos/800/600\",\"save_to\":\"/tmp/photo.jpg\"}."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -236,6 +307,10 @@ impl Tool for HttpTool {
                 "timeout_secs": {
                     "type": "integer",
                     "description": "Request timeout in seconds (default: 30)"
+                },
+                "save_to": {
+                    "type": "string",
+                    "description": "Save response body as raw bytes to this file path instead of returning it. Use for binary downloads (images, PDFs, etc.). The path must be under /tmp/."
                 }
             },
             "required": ["method", "url"]
@@ -245,7 +320,7 @@ impl Tool for HttpTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -311,7 +386,7 @@ impl Tool for HttpTool {
             let matched: Vec<crate::secrets::CredentialMapping> = registry.find_for_host(host);
             for mapping in &matched {
                 match store
-                    .get_decrypted(&_ctx.user_id, &mapping.secret_name)
+                    .get_decrypted(&ctx.user_id, &mapping.secret_name)
                     .await
                 {
                     Ok(secret) => {
@@ -343,6 +418,31 @@ impl Tool for HttpTool {
             .scan_http_request(parsed_url.as_str(), &headers_vec, body_bytes.as_deref())
             .map_err(|e| ToolError::NotAuthorized(format!("{}", e)))?;
 
+        // Build the interceptor request descriptor for recording/replay
+        let intercept_req = crate::llm::recording::HttpExchangeRequest {
+            method: method.to_uppercase(),
+            url: parsed_url.to_string(),
+            headers: headers_vec.clone(),
+            body: body_bytes
+                .as_ref()
+                .map(|b| String::from_utf8_lossy(b).into_owned()),
+        };
+
+        // Check HTTP interceptor (replay mode returns pre-recorded response)
+        if let Some(ref interceptor) = ctx.http_interceptor
+            && let Some(recorded) = interceptor.before_request(&intercept_req).await
+        {
+            let headers: HashMap<String, String> = recorded.headers.iter().cloned().collect();
+            let body: serde_json::Value = serde_json::from_str(&recorded.body)
+                .unwrap_or_else(|_| serde_json::Value::String(recorded.body.clone()));
+            let result = serde_json::json!({
+                "status": recorded.status,
+                "headers": headers,
+                "body": body
+            });
+            return Ok(ToolOutput::success(result, start.elapsed()).with_raw(recorded.body));
+        }
+
         // Execute request
         let response = request.send().await.map_err(|e| {
             if e.is_timeout() {
@@ -354,13 +454,8 @@ impl Tool for HttpTool {
 
         let status = response.status().as_u16();
 
-        // Block redirects: the server tried to send us elsewhere (potential SSRF)
-        if (300..400).contains(&status) {
-            return Err(ToolError::NotAuthorized(format!(
-                "request returned redirect (HTTP {}), which is blocked to prevent SSRF",
-                status
-            )));
-        }
+        // Redirects are followed automatically (up to 10 hops).
+        // If we still see a 3xx here, the chain was too long.
 
         let headers: HashMap<String, String> = response
             .headers()
@@ -368,22 +463,30 @@ impl Tool for HttpTool {
             .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
             .collect();
 
+        // Use a larger size limit when saving to disk (file downloads)
+        let saving_to_disk = params.get("save_to").is_some();
+        let max_size = if saving_to_disk {
+            MAX_SAVE_TO_SIZE
+        } else {
+            MAX_RESPONSE_SIZE
+        };
+
         // Pre-check Content-Length header to reject obviously oversized responses
         // before downloading anything, preventing OOM from malicious servers.
         if let Some(content_length) = response.headers().get(reqwest::header::CONTENT_LENGTH)
             && let Ok(s) = content_length.to_str()
             && let Ok(len) = s.parse::<usize>()
-            && len > MAX_RESPONSE_SIZE
+            && len > max_size
         {
             tracing::warn!(
                 url = %parsed_url,
                 content_length = len,
-                max = MAX_RESPONSE_SIZE,
+                max = max_size,
                 "Rejected HTTP response: Content-Length exceeds limit"
             );
             return Err(ToolError::ExecutionFailed(format!(
                 "Response Content-Length ({} bytes) exceeds maximum allowed size ({} bytes)",
-                len, MAX_RESPONSE_SIZE
+                len, max_size
             )));
         }
 
@@ -395,17 +498,58 @@ impl Tool for HttpTool {
             let chunk = chunk.map_err(|e| {
                 ToolError::ExternalService(format!("failed to read response body: {}", e))
             })?;
-            if body.len() + chunk.len() > MAX_RESPONSE_SIZE {
+            if body.len() + chunk.len() > max_size {
                 return Err(ToolError::ExecutionFailed(format!(
                     "Response body exceeds maximum allowed size ({} bytes)",
-                    MAX_RESPONSE_SIZE
+                    max_size
                 )));
             }
             body.extend_from_slice(&chunk);
         }
         let body_bytes = bytes::Bytes::from(body);
 
+        // If save_to is specified, write raw bytes to file and return metadata.
+        if let Some(save_to) = params.get("save_to").and_then(|v| v.as_str()) {
+            let save_to_owned = save_to.to_string();
+            let bytes_clone = body_bytes.clone();
+            tokio::task::spawn_blocking(move || {
+                let canonical = validate_save_to_path(&save_to_owned)?;
+                std::fs::write(&canonical, &bytes_clone).map_err(|e| {
+                    ToolError::ExecutionFailed(format!("failed to write file: {}", e))
+                })?;
+                Ok::<_, ToolError>(canonical)
+            })
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("spawn_blocking failed: {}", e)))?
+            .map_err(|e: ToolError| e)?;
+            let result = serde_json::json!({
+                "status": status,
+                "saved_to": save_to,
+                "size_bytes": body_bytes.len(),
+                "headers": headers,
+            });
+            return Ok(ToolOutput::success(result, start.elapsed()));
+        }
+
         let body_text = String::from_utf8_lossy(&body_bytes).into_owned();
+
+        // Record the HTTP exchange if interceptor is present (recording mode)
+        if let Some(ref interceptor) = ctx.http_interceptor {
+            let resp_headers: Vec<(String, String)> = headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            interceptor
+                .after_response(
+                    &intercept_req,
+                    &crate::llm::recording::HttpExchangeResponse {
+                        status,
+                        headers: resp_headers,
+                        body: body_text.clone(),
+                    },
+                )
+                .await;
+        }
 
         #[cfg(feature = "html-to-markdown")]
         let body_text = if is_html_response(&headers) {
@@ -802,5 +946,101 @@ mod tests {
     fn test_extract_host_from_params_missing_url() {
         let params = serde_json::json!({"method": "GET"});
         assert_eq!(extract_host_from_params(&params), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requires_approval_multi_thread_no_panic() {
+        use crate::secrets::CredentialMapping;
+        use crate::tools::wasm::SharedCredentialRegistry;
+
+        // Test with credential registry (uses std::sync::RwLock - should be safe)
+        let registry = Arc::new(SharedCredentialRegistry::new());
+        registry.add_mappings(vec![CredentialMapping::bearer("test_key", "api.test.com")]);
+
+        let tool = HttpTool::new().with_credentials(
+            registry,
+            Arc::new(crate::secrets::InMemorySecretsStore::new(Arc::new(
+                crate::secrets::SecretsCrypto::new(secrecy::SecretString::from(
+                    "0123456789abcdef0123456789abcdef".to_string(),
+                ))
+                .unwrap(),
+            ))),
+        );
+
+        // These calls should not panic in multi-thread runtime
+        let params_no_auth = serde_json::json!({
+            "method": "GET",
+            "url": "https://api.example.com/data"
+        });
+        let _ = tool.requires_approval(&params_no_auth);
+
+        let params_with_cred = serde_json::json!({
+            "method": "GET",
+            "url": "https://api.test.com/v1/models"
+        });
+        let _ = tool.requires_approval(&params_with_cred);
+
+        let params_with_auth = serde_json::json!({
+            "method": "GET",
+            "url": "https://api.example.com",
+            "headers": {"Authorization": "Bearer token"}
+        });
+        let _ = tool.requires_approval(&params_with_auth);
+    }
+
+    // ── save_to path validation tests ─────────────────────────────────────
+
+    #[test]
+    fn test_save_to_rejects_path_outside_tmp() {
+        let err = validate_save_to_path("/etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("must be under /tmp/"));
+    }
+
+    #[test]
+    fn test_save_to_rejects_home_dir() {
+        let err = validate_save_to_path("/home/user/file.txt").unwrap_err();
+        assert!(err.to_string().contains("must be under /tmp/"));
+    }
+
+    #[test]
+    fn test_save_to_rejects_traversal_via_dotdot() {
+        let err = validate_save_to_path("/tmp/../../etc/passwd").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("escapes") || msg.contains("resolves outside"),
+            "expected path traversal rejection, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_save_to_rejects_deep_traversal() {
+        let err = validate_save_to_path("/tmp/a/b/../../../../etc/shadow").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("escapes") || msg.contains("resolves outside"),
+            "expected path traversal rejection, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_save_to_accepts_simple_tmp_path() {
+        let path = validate_save_to_path("/tmp/test_ironclaw_photo.jpg").unwrap();
+        assert!(path.starts_with("/tmp"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_save_to_accepts_nested_tmp_path() {
+        let path = validate_save_to_path("/tmp/ironclaw_test_subdir/nested/file.png").unwrap();
+        assert!(path.starts_with("/tmp"));
+        let _ = std::fs::remove_dir_all("/tmp/ironclaw_test_subdir");
+    }
+
+    #[test]
+    fn test_save_to_rejects_bare_tmp() {
+        let err = validate_save_to_path("/tmp").unwrap_err();
+        assert!(err.to_string().contains("must be under /tmp/"));
     }
 }

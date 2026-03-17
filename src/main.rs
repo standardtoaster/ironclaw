@@ -1,6 +1,7 @@
 //! IronClaw - Main entry point.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -23,10 +24,10 @@ use ironclaw::{
     },
     config::Config,
     hooks::bootstrap_hooks,
-    llm::{SessionConfig, create_session_manager},
+    llm::create_session_manager,
     orchestrator::{
-        ContainerJobConfig, ContainerJobManager, OrchestratorApi, TokenStore,
-        api::OrchestratorState,
+        ContainerJobConfig, ContainerJobManager, OrchestratorApi, ReaperConfig, SandboxReaper,
+        TokenStore, api::OrchestratorState,
     },
     pairing::PairingStore,
     secrets::SecretsStore,
@@ -75,7 +76,7 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Command::Mcp(mcp_cmd)) => {
             init_cli_tracing();
-            return run_mcp_command(mcp_cmd.clone()).await;
+            return run_mcp_command(*mcp_cmd.clone()).await;
         }
         Some(Command::Memory(mem_cmd)) => {
             init_cli_tracing();
@@ -121,19 +122,21 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Command::Onboard {
             skip_auth,
             channels_only,
+            provider_only,
         }) => {
             #[cfg(any(feature = "postgres", feature = "libsql"))]
             {
                 let config = SetupConfig {
                     skip_auth: *skip_auth,
                     channels_only: *channels_only,
+                    provider_only: *provider_only,
                 };
                 let mut wizard = SetupWizard::with_config(config);
                 wizard.run().await?;
             }
             #[cfg(not(any(feature = "postgres", feature = "libsql")))]
             {
-                let _ = (skip_auth, channels_only);
+                let _ = (skip_auth, channels_only, provider_only);
                 eprintln!("Onboarding wizard requires the 'postgres' or 'libsql' feature.");
             }
             return Ok(());
@@ -142,6 +145,24 @@ async fn async_main() -> anyhow::Result<()> {
             // Continue to run agent
         }
     }
+
+    // ── PID lock (prevent multiple instances) ────────────────────────
+    let _pid_lock = match ironclaw::bootstrap::PidLock::acquire() {
+        Ok(lock) => Some(lock),
+        Err(ironclaw::bootstrap::PidLockError::AlreadyRunning { pid }) => {
+            anyhow::bail!(
+                "Another IronClaw instance is already running (PID {}). \
+                 If this is incorrect, remove the stale PID file: {}",
+                pid,
+                ironclaw::bootstrap::pid_lock_path().display()
+            );
+        }
+        Err(e) => {
+            eprintln!("Warning: Could not acquire PID lock: {}", e);
+            eprintln!("Continuing without PID lock protection.");
+            None
+        }
+    };
 
     // ── Agent startup ──────────────────────────────────────────────────
 
@@ -156,28 +177,26 @@ async fn async_main() -> anyhow::Result<()> {
         wizard.run().await?;
     }
 
-    // Load initial config from env + disk + optional TOML (before DB is available)
+    // Load initial config from env + disk + optional TOML (before DB is available).
+    // Credentials may be missing at this point — that's fine. LlmConfig::resolve()
+    // defers gracefully, and AppBuilder::build_all() re-resolves after loading
+    // secrets from the encrypted DB.
     let toml_path = cli.config.as_deref();
     let config = match Config::from_env_with_toml(toml_path).await {
         Ok(c) => c,
         Err(ironclaw::error::ConfigError::MissingRequired { key, hint }) => {
-            eprintln!("Configuration error: Missing required setting '{}'", key);
-            eprintln!("  {}", hint);
-            eprintln!();
-            eprintln!(
-                "Run 'ironclaw onboard' to configure, or set the required environment variables."
+            anyhow::bail!(
+                "Configuration error: Missing required setting '{}'. {}. \
+                 Run 'ironclaw onboard' to configure, or set the required environment variables.",
+                key,
+                hint
             );
-            std::process::exit(1);
         }
         Err(e) => return Err(e.into()),
     };
 
-    // Initialize session manager and authenticate before channel setup
-    let session_config = SessionConfig {
-        auth_base_url: config.llm.nearai.auth_base_url.clone(),
-        session_path: config.llm.nearai.session_path.clone(),
-    };
-    let session = create_session_manager(session_config).await;
+    // Initialize session manager before channel setup
+    let session = create_session_manager(config.llm.session.clone()).await;
 
     // Create log broadcaster before tracing init so the WebLogLayer can capture all events.
     let log_broadcaster = Arc::new(LogBroadcaster::new());
@@ -205,13 +224,6 @@ async fn async_main() -> anyhow::Result<()> {
     .await?;
 
     let config = components.config;
-
-    // Session-based auth is only needed for NEAR AI backend without an API key.
-    if config.llm.backend == ironclaw::config::LlmBackend::NearAi
-        && config.llm.nearai.api_key.is_none()
-    {
-        session.ensure_authenticated().await?;
-    }
 
     // ── Tunnel setup ───────────────────────────────────────────────────
 
@@ -478,6 +490,28 @@ async fn async_main() -> anyhow::Result<()> {
         components.secrets_store.clone(),
     );
 
+    // Register workspace tools if we have a database and embeddings.
+    let workspace_router_for_agent = if let (Some(db), Some(embedder)) = (&components.db, &components.embeddings) {
+        let workspace_router = Arc::new(ironclaw::agent::workspace_router::WorkspaceRouter::new(
+            Arc::clone(db) as Arc<dyn ironclaw::db::AgentWorkspaceStore>,
+            Arc::clone(embedder),
+            0.4, // similarity threshold — tuned for mxbai-embed-large score range
+        ));
+        let workspace_queue = Arc::new(
+            ironclaw::agent::workspace_queue::WorkspaceQueueManager::new(32),
+        );
+        components.tools.register_workspace_tools(
+            Arc::clone(&workspace_router),
+            scheduler_slot.clone(),
+            Arc::clone(db),
+            Arc::clone(embedder),
+            workspace_queue,
+        );
+        Some(workspace_router)
+    } else {
+        None
+    };
+
     // ── Collection write broadcast channel ──────────────────────────────
     // Shared between the gateway (event ingest sends) and the routine engine (listens).
     let (collection_write_tx, _collection_write_rx) =
@@ -487,6 +521,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     let mut gateway_url: Option<String> = None;
     let mut sse_manager: Option<std::sync::Arc<ironclaw::channels::web::sse::SseManager>> = None;
+    let mut routine_engine_slot: Option<ironclaw::channels::web::server::RoutineEngineSlot> = None;
     let mut gateway_state: Option<std::sync::Arc<ironclaw::channels::web::server::GatewayState>> =
         None;
     if let Some(ref gw_config) = config.channels.gateway {
@@ -538,6 +573,7 @@ async fn async_main() -> anyhow::Result<()> {
         if let Some(ref jm) = container_job_manager {
             gw = gw.with_job_manager(Arc::clone(jm));
         }
+        gw = gw.with_scheduler(scheduler_slot.clone());
         if let Some(ref sr) = components.skill_registry {
             gw = gw.with_skill_registry(Arc::clone(sr));
         }
@@ -573,10 +609,11 @@ async fn async_main() -> anyhow::Result<()> {
 
         tracing::info!("Web UI: http://{}:{}/", gw_config.host, gw_config.port);
 
-        // Capture SSE sender before moving gw into channels.
+        // Capture SSE sender and routine engine slot before moving gw into channels.
         // IMPORTANT: This must come after all `with_*` calls since `rebuild_state`
         // creates a new SseManager, which would orphan this sender.
         sse_manager = Some(Arc::clone(&gw.state().sse));
+        routine_engine_slot = Some(Arc::clone(&gw.state().routine_engine));
         gateway_state = Some(Arc::clone(gw.state()));
 
         channel_names.push("gateway".to_string());
@@ -653,7 +690,7 @@ async fn async_main() -> anyhow::Result<()> {
                 rt,
                 ps,
                 router,
-                config.channels.telegram_owner_id,
+                config.channels.wasm_channel_owner_ids.clone(),
             )
             .await;
         tracing::info!("Channel runtime wired into extension manager for hot-activation");
@@ -684,10 +721,107 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Wire SSE sender into extension manager for broadcasting status events.
     if let Some(ref ext_mgr) = components.extension_manager
-        && let Some(sse) = sse_manager
+        && let Some(ref sse) = sse_manager
     {
-        ext_mgr.set_sse_sender(sse).await;
+        ext_mgr.set_sse_sender(Arc::clone(sse)).await;
     }
+
+    // Snapshot memory for trace recording before the agent starts
+    if let Some(ref recorder) = components.recording_handle
+        && let Some(ref ws) = components.workspace
+    {
+        recorder.snapshot_memory(ws).await;
+    }
+
+    let http_interceptor = components
+        .recording_handle
+        .as_ref()
+        .map(|r| r.http_interceptor());
+    // Clone context_manager for the reaper before it's moved into Agent::new()
+    let reaper_context_manager = Arc::clone(&components.context_manager);
+
+    // Build ThreadResolver if workspace routing is available.
+    // Create organizer signal channel (tx goes to resolver, rx goes to runner via AgentDeps)
+    let (organize_tx, organize_rx) =
+        tokio::sync::mpsc::channel::<ironclaw::agent::OrganizerSignal>(64);
+
+    let thread_resolver_for_agent: Option<Arc<dyn ironclaw::agent::ThreadResolver>> =
+        match (&workspace_router_for_agent, &components.db) {
+            (Some(router), Some(db)) => {
+                let mut resolver_config = ironclaw::agent::workspace_thread_resolver::WorkspaceResolverConfig::default();
+                if let Ok(model) = std::env::var("ORGANIZER_MODEL") {
+                    resolver_config.organizer_model = Some(model);
+                }
+                if let Ok(temp) = std::env::var("ORGANIZER_TEMPERATURE")
+                    && let Ok(t) = temp.parse::<f32>()
+                {
+                    resolver_config.organizer_temperature = t;
+                }
+                if let Ok(tokens) = std::env::var("ORGANIZER_MAX_TOKENS")
+                    && let Ok(t) = tokens.parse::<u32>()
+                {
+                    resolver_config.organizer_max_tokens = t;
+                }
+                // Build organizer LLM: dedicated provider (env vars) > cheap_llm > main LLM.
+                let organizer_llm = match (
+                    std::env::var("ORGANIZER_LLM_BACKEND"),
+                    std::env::var("ORGANIZER_LLM_MODEL"),
+                ) {
+                    (Ok(backend_str), Ok(model)) => {
+                        let backend = backend_str.parse::<ironclaw::config::LlmBackend>()
+                            .map_err(|e| tracing::warn!("Invalid ORGANIZER_LLM_BACKEND: {e}"))
+                            .ok();
+                        if let Some(backend) = backend {
+                            let user_config = ironclaw::config::UserLlmConfig {
+                                backend,
+                                model,
+                                api_key: std::env::var("ORGANIZER_LLM_API_KEY").ok()
+                                    .map(secrecy::SecretString::from),
+                                base_url: std::env::var("ORGANIZER_LLM_BASE_URL").ok(),
+                            };
+                            match ironclaw::llm::create_provider_from_user_config(&user_config) {
+                                Ok(provider) => {
+                                    tracing::info!(
+                                        backend = %backend_str,
+                                        model = %user_config.model,
+                                        "Organizer using dedicated LLM provider"
+                                    );
+                                    Some(provider)
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to create organizer LLM: {e}, falling back");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+                .or_else(|| components.cheap_llm.clone())
+                .or_else(|| Some(Arc::clone(&components.llm)));
+                Some(Arc::new(
+                    ironclaw::agent::workspace_thread_resolver::WorkspaceThreadResolver::new(
+                        Arc::clone(router),
+                        Arc::clone(db) as Arc<dyn ironclaw::db::AgentWorkspaceStore>,
+                        Arc::clone(db) as Arc<dyn ironclaw::db::ConversationStore>,
+                        organizer_llm,
+                        resolver_config,
+                    )
+                    .with_organizer_channel(organize_tx),
+                ))
+            }
+            _ => None,
+        };
+
+    // Create per-user workspace pool for the agent (same pool the gateway uses).
+    let agent_workspace_pool = components.db.as_ref().map(|db| {
+        Arc::new(ironclaw::channels::web::server::WorkspacePool::new(
+            Arc::clone(db),
+            components.embeddings.clone(),
+        ))
+    });
 
     let deps = AgentDeps {
         store: components.db,
@@ -702,9 +836,23 @@ async fn async_main() -> anyhow::Result<()> {
         skills_config: config.skills.clone(),
         hooks: components.hooks,
         cost_guard: components.cost_guard,
+        sse_tx: sse_manager.clone(),
+        http_interceptor,
+        transcription: config
+            .transcription
+            .create_provider()
+            .map(|p| Arc::new(ironclaw::transcription::TranscriptionMiddleware::new(p))),
+        document_extraction: Some(Arc::new(
+            ironclaw::document_extraction::DocumentExtractionMiddleware::new(),
+        )),
+        workspace_router: workspace_router_for_agent.clone(),
+        thread_resolver: thread_resolver_for_agent,
+        core_tools: config.core_tools.clone(),
+        organize_rx: Some(organize_rx),
+        workspace_pool: agent_workspace_pool,
     };
 
-    let agent = Agent::new(
+    let mut agent = Agent::new(
         config.agent.clone(),
         deps,
         channels,
@@ -715,13 +863,48 @@ async fn async_main() -> anyhow::Result<()> {
         Some(session_manager),
         Some(collection_write_tx),
     );
+    if let Some(ref gw_state) = gateway_state {
+        agent = agent.with_gateway_state(Arc::clone(gw_state));
+    }
 
     // Fill the scheduler slot now that Agent (and its Scheduler) exist.
     *scheduler_slot.write().await = Some(agent.scheduler());
 
+    // Spawn sandbox reaper for orphaned container cleanup
+    if let Some(ref jm) = container_job_manager {
+        let reaper_jm = Arc::clone(jm);
+        let reaper_config = ReaperConfig {
+            scan_interval: Duration::from_secs(config.sandbox.reaper_interval_secs),
+            orphan_threshold: Duration::from_secs(config.sandbox.orphan_threshold_secs),
+            ..ReaperConfig::default()
+        };
+        let reaper_ctx = Arc::clone(&reaper_context_manager);
+        tokio::spawn(async move {
+            match SandboxReaper::new(reaper_jm, reaper_ctx, reaper_config).await {
+                Ok(reaper) => reaper.run().await,
+                Err(e) => tracing::error!("Sandbox reaper failed to initialize: {}", e),
+            }
+        });
+    }
+
+    // Give the agent the routine engine slot so it can expose the engine to the gateway.
+    if let Some(slot) = routine_engine_slot {
+        agent.set_routine_engine_slot(slot);
+    }
+
     agent.run().await?;
 
     // ── Shutdown ────────────────────────────────────────────────────────
+
+    // Shut down all stdio MCP server child processes.
+    components.mcp_process_manager.shutdown_all().await;
+
+    // Flush LLM trace recording if enabled
+    if let Some(ref recorder) = components.recording_handle
+        && let Err(e) = recorder.flush().await
+    {
+        tracing::warn!("Failed to write LLM trace: {}", e);
+    }
 
     if let Some(ref mut server) = webhook_server {
         server.shutdown().await;
@@ -735,16 +918,6 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     tracing::info!("Agent shutdown complete");
-
-    // Check if a restart was requested via the gateway API.
-    if let Some(ref gw_state) = gateway_state
-        && gw_state
-            .restart_requested
-            .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        eprintln!("Restarting IronClaw (exit code 75)...");
-        std::process::exit(75);
-    }
 
     Ok(())
 }
@@ -766,30 +939,11 @@ async fn run_memory_command(mem_cmd: &ironclaw::cli::MemoryCommand) -> anyhow::R
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    let session = create_session_manager(SessionConfig {
-        auth_base_url: config.llm.nearai.auth_base_url.clone(),
-        session_path: config.llm.nearai.session_path.clone(),
-    })
-    .await;
+    let session = create_session_manager(config.llm.session.clone()).await;
 
     let embeddings = config
         .embeddings
         .create_provider(&config.llm.nearai.base_url, session);
-
-    // Warn if libSQL backend is used with non-1536 embedding dimension.
-    if config.database.backend == ironclaw::config::DatabaseBackend::LibSql
-        && config.embeddings.enabled
-        && config.embeddings.dimension != 1536
-    {
-        tracing::warn!(
-            configured_dimension = config.embeddings.dimension,
-            "Embedding dimension {} is not 1536. The libSQL schema uses \
-             F32_BLOB(1536) which requires exactly 1536 dimensions. \
-             Embedding storage will fail. Use PostgreSQL or set \
-             EMBEDDING_DIMENSION=1536.",
-            config.embeddings.dimension
-        );
-    }
 
     let db: Arc<dyn ironclaw::db::Database> = ironclaw::db::connect_from_config(&config.database)
         .await
@@ -947,11 +1101,14 @@ async fn setup_wasm_channels(
     let pairing_store = Arc::new(PairingStore::new());
     let settings_store: Option<Arc<dyn ironclaw::db::SettingsStore>> =
         database.map(|db| Arc::clone(db) as Arc<dyn ironclaw::db::SettingsStore>);
-    let loader = WasmChannelLoader::new(
+    let mut loader = WasmChannelLoader::new(
         Arc::clone(&runtime),
         Arc::clone(&pairing_store),
         settings_store,
     );
+    if let Some(secrets) = secrets_store {
+        loader = loader.with_secrets_store(Arc::clone(secrets));
+    }
 
     let results = match loader
         .load_from_dir(&config.channels.wasm_channels_dir)
@@ -975,6 +1132,7 @@ async fn setup_wasm_channels(
 
         let secret_name = loaded.webhook_secret_name();
         let sig_key_secret_name = loaded.signature_key_secret_name();
+        let hmac_secret_name = loaded.hmac_secret_name();
 
         let webhook_secret = if let Some(secrets) = secrets_store {
             secrets
@@ -1015,9 +1173,11 @@ async fn setup_wasm_channels(
                 );
             }
 
-            // Inject owner_id for Telegram so the bot only responds to the bound user.
-            if channel_name == "telegram"
-                && let Some(owner_id) = config.channels.telegram_owner_id
+            // Inject owner_id if configured for this channel.
+            if let Some(&owner_id) = config
+                .channels
+                .wasm_channel_owner_ids
+                .get(channel_name.as_str())
             {
                 config_updates.insert("owner_id".to_string(), serde_json::json!(owner_id));
             }
@@ -1065,6 +1225,17 @@ async fn setup_wasm_channels(
                     tracing::error!(channel = %channel_name, error = %e, "Invalid signature key in secrets store")
                 }
             }
+        }
+
+        // Register HMAC signing secret if declared in capabilities
+        if let Some(ref hmac_secret_name) = hmac_secret_name
+            && let Some(secrets) = secrets_store
+            && let Ok(secret) = secrets.get_decrypted("default", hmac_secret_name).await
+        {
+            wasm_router
+                .register_hmac_secret(&channel_name, secret.expose())
+                .await;
+            tracing::info!(channel = %channel_name, "Registered HMAC signing secret");
         }
 
         if let Some(secrets) = secrets_store {
@@ -1133,7 +1304,7 @@ fn check_onboard_needed() -> Option<&'static str> {
     }
 
     if std::env::var("NEARAI_API_KEY").is_err() {
-        let session_path = ironclaw::llm::session::default_session_path();
+        let session_path = ironclaw::config::default_session_path();
         if !session_path.exists() {
             return Some("First run");
         }
@@ -1146,6 +1317,9 @@ fn check_onboard_needed() -> Option<&'static str> {
 ///
 /// Looks for secrets matching the pattern `{channel_name}_*` and injects them
 /// as credential placeholders (e.g., `telegram_bot_token` -> `{TELEGRAM_BOT_TOKEN}`).
+///
+/// Falls back to environment variables with the uppercase name if not found
+/// in the secrets store (e.g., `TELEGRAM_BOT_TOKEN`).
 async fn inject_channel_credentials(
     channel: &Arc<ironclaw::channels::wasm::WasmChannel>,
     secrets: &dyn SecretsStore,
@@ -1158,6 +1332,7 @@ async fn inject_channel_credentials(
 
     let prefix = format!("{}_", channel_name);
     let mut count = 0;
+    let mut injected_placeholders = std::collections::HashSet::new();
 
     for secret_meta in all_secrets {
         if !secret_meta.name.starts_with(&prefix) {
@@ -1188,7 +1363,32 @@ async fn inject_channel_credentials(
         channel
             .set_credential(&placeholder, decrypted.expose().to_string())
             .await;
+        injected_placeholders.insert(placeholder);
         count += 1;
+    }
+
+    // Fall back to environment variables for required secrets not found in the store.
+    // This allows channels to work when configured via env vars (e.g., TELEGRAM_BOT_TOKEN)
+    // without requiring the setup wizard to have run.
+    let caps = channel.capabilities();
+    if let Some(ref http_cap) = caps.tool_capabilities.http {
+        for cred_mapping in http_cap.credentials.values() {
+            let placeholder = cred_mapping.secret_name.to_uppercase();
+            if injected_placeholders.contains(&placeholder) {
+                continue;
+            }
+            if let Ok(env_value) = std::env::var(&placeholder)
+                && !env_value.is_empty()
+            {
+                tracing::debug!(
+                    channel = %channel_name,
+                    placeholder = %placeholder,
+                    "Injecting credential from environment variable"
+                );
+                channel.set_credential(&placeholder, env_value).await;
+                count += 1;
+            }
+        }
     }
 
     Ok(count)

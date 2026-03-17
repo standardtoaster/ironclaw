@@ -10,17 +10,20 @@ use crate::db::Database;
 use crate::extensions::ExtensionManager;
 use crate::llm::{LlmProvider, ToolDefinition};
 use crate::orchestrator::job_manager::ContainerJobManager;
-use crate::safety::SafetyLayer;
 use crate::secrets::SecretsStore;
 use crate::skills::catalog::SkillCatalog;
 use crate::skills::registry::SkillRegistry;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
 use crate::tools::builtin::{
-    ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, HttpTool, JobEventsTool, JobPromptTool,
-    JobStatusTool, JsonTool, ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool,
-    MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, ShellTool, SkillInstallTool,
-    SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool, ToolActivateTool, ToolAuthTool,
-    ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool, WebFetchTool, WriteFileTool,
+    ApplyPatchTool, CancelJobTool, CreateJobTool, CreateWorkspaceTool,
+    DelegateToWorkspaceTool, EchoTool,
+    ExtensionInfoTool, HttpTool, JobEventsTool, JobPromptTool, JobStatusTool, JsonTool,
+    ListDirTool, ListJobsTool, ListWorkspacesTool, MemoryReadTool, MemorySearchTool,
+    MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, SearchWorkspaceHistoryTool,
+    SetWorkspaceTopicTool, ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool,
+    SkillSearchTool, TimeTool, ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool,
+    ToolRemoveTool, ToolSearchTool, ToolUpgradeTool, WorkspaceSummaryTool,
+    WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::tool::{Tool, ToolDomain};
@@ -62,6 +65,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "routine_list",
     "routine_update",
     "routine_delete",
+    "routine_fire",
     "routine_history",
     "skill_list",
     "skill_search",
@@ -69,10 +73,19 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "skill_remove",
     "message",
     "web_fetch",
+    "restart",
+    "image_generate",
+    "image_edit",
+    "image_analyze",
     "collections_alter",
     "collections_list",
     "collections_register",
     "collections_drop",
+    "create_workspace",
+    "delegate_to_workspace",
+    "discover_tools",
+    "list_workspaces",
+    "set_workspace_topic",
 ];
 
 /// Registry of available tools.
@@ -80,6 +93,9 @@ pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
     /// Tracks which names were registered as built-in (protected from shadowing).
     builtin_names: RwLock<std::collections::HashSet<String>>,
+    /// Tools discovered/loaded during this session via `discover_tools`.
+    /// These are sent to the LLM alongside core tools.
+    discovered_tools: RwLock<std::collections::HashSet<String>>,
     /// Shared credential registry populated by WASM tools, consumed by HTTP tool.
     credential_registry: Option<Arc<SharedCredentialRegistry>>,
     /// Secrets store for credential injection (shared with HTTP tool).
@@ -96,6 +112,7 @@ impl ToolRegistry {
         Self {
             tools: RwLock::new(HashMap::new()),
             builtin_names: RwLock::new(std::collections::HashSet::new()),
+            discovered_tools: RwLock::new(std::collections::HashSet::new()),
             credential_registry: None,
             secrets_store: None,
             rate_limiter: RateLimiter::new(),
@@ -160,7 +177,8 @@ impl ToolRegistry {
 
     /// Get a tool by name.
     pub async fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.read().await.get(name).cloned()
+        let tools = self.tools.read().await;
+        tools.get(name).map(Arc::clone)
     }
 
     /// Check if a tool exists.
@@ -171,6 +189,18 @@ impl ToolRegistry {
     /// List all tool names.
     pub async fn list(&self) -> Vec<String> {
         self.tools.read().await.keys().cloned().collect()
+    }
+
+    /// Retain only tools whose names are in the given allowlist.
+    ///
+    /// If `names` is empty, this is a no-op (all tools are kept).
+    pub async fn retain_only(&self, names: &[&str]) {
+        if names.is_empty() {
+            return;
+        }
+        let names_set: std::collections::HashSet<&str> = names.iter().copied().collect();
+        let mut tools = self.tools.write().await;
+        tools.retain(|k, _| names_set.contains(k.as_str()));
     }
 
     /// Get the number of registered tools.
@@ -185,7 +215,8 @@ impl ToolRegistry {
 
     /// Get tool definitions for LLM function calling.
     pub async fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        self.tools
+        let mut defs: Vec<ToolDefinition> = self
+            .tools
             .read()
             .await
             .values()
@@ -194,7 +225,9 @@ impl ToolRegistry {
                 description: tool.description().to_string(),
                 parameters: tool.parameters_schema(),
             })
-            .collect()
+            .collect();
+        defs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        defs
     }
 
     /// Get tool definitions for specific tools.
@@ -202,11 +235,12 @@ impl ToolRegistry {
         let tools = self.tools.read().await;
         names
             .iter()
-            .filter_map(|name| tools.get(*name))
-            .map(|tool| ToolDefinition {
-                name: tool.name().to_string(),
-                description: tool.description().to_string(),
-                parameters: tool.parameters_schema(),
+            .filter_map(|name| {
+                tools.get(*name).map(|tool| ToolDefinition {
+                    name: tool.name().to_string(),
+                    description: tool.description().to_string(),
+                    parameters: tool.parameters_schema(),
+                })
             })
             .collect()
     }
@@ -222,7 +256,6 @@ impl ToolRegistry {
             http = http.with_credentials(Arc::clone(cr), Arc::clone(ss));
         }
         self.register_sync(Arc::new(http));
-        self.register_sync(Arc::new(WebFetchTool::new()));
 
         tracing::info!("Registered {} built-in tools", self.count());
     }
@@ -350,6 +383,20 @@ impl ToolRegistry {
         tracing::info!("Registered {} job management tools", job_tool_count);
     }
 
+    /// Register secret management tools (list, delete).
+    ///
+    /// These allow the LLM to persist API keys and tokens encrypted in the database.
+    /// Values are never returned to the LLM; only names and metadata are exposed.
+    pub fn register_secrets_tools(
+        &self,
+        store: Arc<dyn crate::secrets::SecretsStore + Send + Sync>,
+    ) {
+        use crate::tools::builtin::{SecretDeleteTool, SecretListTool};
+        self.register_sync(Arc::new(SecretListTool::new(Arc::clone(&store))));
+        self.register_sync(Arc::new(SecretDeleteTool::new(store)));
+        tracing::info!("Registered 2 secret management tools (list, delete)");
+    }
+
     /// Register extension management tools (search, install, auth, activate, list, remove).
     ///
     /// These allow the LLM to manage MCP servers and WASM tools through conversation.
@@ -359,8 +406,10 @@ impl ToolRegistry {
         self.register_sync(Arc::new(ToolAuthTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolActivateTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolListTool::new(Arc::clone(&manager))));
-        self.register_sync(Arc::new(ToolRemoveTool::new(manager)));
-        tracing::info!("Registered 6 extension management tools");
+        self.register_sync(Arc::new(ToolRemoveTool::new(Arc::clone(&manager))));
+        self.register_sync(Arc::new(ToolUpgradeTool::new(Arc::clone(&manager))));
+        self.register_sync(Arc::new(ExtensionInfoTool::new(manager)));
+        tracing::info!("Registered 8 extension management tools");
     }
 
     /// Register skill management tools (list, search, install, remove).
@@ -394,8 +443,8 @@ impl ToolRegistry {
         engine: Arc<crate::agent::routine_engine::RoutineEngine>,
     ) {
         use crate::tools::builtin::{
-            RoutineCreateTool, RoutineDeleteTool, RoutineHistoryTool, RoutineListTool,
-            RoutineUpdateTool,
+            RoutineCreateTool, RoutineDeleteTool, RoutineFireTool, RoutineHistoryTool,
+            RoutineListTool, RoutineUpdateTool,
         };
         self.register_sync(Arc::new(RoutineCreateTool::new(
             Arc::clone(&store),
@@ -410,8 +459,39 @@ impl ToolRegistry {
             Arc::clone(&store),
             Arc::clone(&engine),
         )));
+        self.register_sync(Arc::new(RoutineFireTool::new(
+            Arc::clone(&store),
+            Arc::clone(&engine),
+        )));
         self.register_sync(Arc::new(RoutineHistoryTool::new(store)));
-        tracing::info!("Registered 5 routine management tools");
+        tracing::info!("Registered 6 routine management tools");
+    }
+
+    /// Register workspace delegation tools.
+    ///
+    /// These allow the LLM to delegate tasks to persistent workspaces that
+    /// retain context across calls. The scheduler slot is filled later after
+    /// the agent is fully initialized. The queue manager enforces
+    /// single-writer access to workspace conversations.
+    pub fn register_workspace_tools(
+        &self,
+        router: Arc<crate::agent::workspace_router::WorkspaceRouter>,
+        scheduler: crate::tools::builtin::SchedulerSlot,
+        db: Arc<dyn Database>,
+        embedder: Arc<dyn crate::workspace::EmbeddingProvider>,
+        queue: Arc<crate::agent::workspace_queue::WorkspaceQueueManager>,
+    ) {
+        self.register_sync(Arc::new(CreateWorkspaceTool::new(
+            Arc::clone(&router), db.clone(),
+        )));
+        self.register_sync(Arc::new(DelegateToWorkspaceTool::new(
+            router, scheduler, db.clone(), queue,
+        )));
+        self.register_sync(Arc::new(ListWorkspacesTool::new(db.clone())));
+        self.register_sync(Arc::new(SetWorkspaceTopicTool::new(db.clone(), embedder)));
+        self.register_sync(Arc::new(SearchWorkspaceHistoryTool::new(db.clone())));
+        self.register_sync(Arc::new(WorkspaceSummaryTool::new(db)));
+        tracing::info!("Registered workspace tools");
     }
 
     /// Register message tool for sending messages to channels.
@@ -441,6 +521,193 @@ impl ToolRegistry {
         }
     }
 
+    /// Generate a capability manifest — a lightweight text summary of all
+    /// registered tools grouped by category. For injection into the system
+    /// prompt so the LLM knows what's discoverable.
+    pub async fn capability_manifest(&self, core_names: &[String]) -> String {
+        if core_names.is_empty() {
+            return String::new(); // No manifest needed when all tools are sent
+        }
+
+        let tools = self.tools.read().await;
+        let discovered = self.discovered_tools.read().await;
+
+        // Collect non-core, non-discovered tools (the discoverable ones)
+        let mut discoverable: Vec<(&str, &str)> = tools
+            .values()
+            .filter(|t| {
+                !core_names.iter().any(|c| c == t.name())
+                    && !discovered.contains(t.name())
+            })
+            .map(|t| (t.name(), t.description()))
+            .collect();
+        discoverable.sort_by_key(|(name, _)| *name);
+
+        if discoverable.is_empty() {
+            return String::new();
+        }
+
+        // Group by prefix (e.g., "grocery_items_add" → "grocery_items")
+        // Tools without a collection prefix go under "other"
+        let mut groups: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+
+        for (name, desc) in &discoverable {
+            let parts: Vec<&str> = name.splitn(3, '_').collect();
+            let group = if parts.len() >= 3 {
+                format!("{}_{}", parts[0], parts[1])
+            } else {
+                "other".to_string()
+            };
+
+            // Safe truncation for description (char-safe, not byte-based)
+            let short_desc: String = desc.chars().take(80).collect();
+            let short_desc = if desc.chars().count() > 80 {
+                format!("{short_desc}...")
+            } else {
+                short_desc
+            };
+            groups
+                .entry(group)
+                .or_default()
+                .push(format!("{name}: {short_desc}"));
+        }
+
+        let mut manifest = String::from(
+            "Discoverable tools (use discover_tools to load):\n",
+        );
+        for (group, tools_in_group) in &groups {
+            if tools_in_group.len() > 3 {
+                // Collection-style group — summarize
+                let first_name = tools_in_group[0].split(':').next().unwrap_or("");
+                manifest.push_str(&format!(
+                    "  {group}: {} tools (e.g., {first_name}, ...)\n",
+                    tools_in_group.len(),
+                ));
+            } else {
+                for tool_line in tools_in_group {
+                    manifest.push_str(&format!("  {tool_line}\n"));
+                }
+            }
+        }
+
+        manifest
+    }
+
+    /// Register the discover_tools meta-tool. Must be called after
+    /// the registry is wrapped in Arc.
+    pub async fn register_discover_tools(self: &Arc<Self>) {
+        use crate::tools::builtin::DiscoverToolsTool;
+        let tool = DiscoverToolsTool::new(Arc::clone(self));
+        let name = "discover_tools".to_string();
+        self.tools
+            .write()
+            .await
+            .insert(name.clone(), Arc::new(tool) as Arc<dyn Tool>);
+        if let Ok(mut builtins) = self.builtin_names.try_write() {
+            builtins.insert(name);
+        }
+        tracing::info!("Registered discover_tools meta-tool");
+    }
+
+    /// Mark a tool as discovered (loaded for this session).
+    pub async fn mark_discovered(&self, name: &str) {
+        self.discovered_tools.write().await.insert(name.to_string());
+    }
+
+    /// Check if a tool has been discovered this session.
+    pub async fn is_discovered(&self, name: &str) -> bool {
+        self.discovered_tools.read().await.contains(name)
+    }
+
+    /// Get all discovered tool names.
+    pub async fn discovered_tool_names(&self) -> Vec<String> {
+        self.discovered_tools.read().await.iter().cloned().collect()
+    }
+
+    /// Search registered tools by keyword match on name and description.
+    /// Returns (name, description) pairs for matching tools.
+    pub async fn search_tools(&self, query: &str) -> Vec<(String, String)> {
+        let query_lower = query.to_lowercase();
+        let tools = self.tools.read().await;
+        tools
+            .values()
+            .filter(|tool| {
+                tool.name().to_lowercase().contains(&query_lower)
+                    || tool.description().to_lowercase().contains(&query_lower)
+            })
+            .map(|tool| (tool.name().to_string(), tool.description().to_string()))
+            .collect()
+    }
+
+    /// Get tool definitions filtered to core + discovered tools only.
+    /// If `core_names` is empty, returns ALL tools (backward compatible).
+    pub async fn core_tool_definitions(&self, core_names: &[String]) -> Vec<ToolDefinition> {
+        if core_names.is_empty() {
+            return self.tool_definitions().await;
+        }
+        let discovered = self.discovered_tools.read().await;
+        let tools = self.tools.read().await;
+        tools
+            .values()
+            .filter(|tool| {
+                core_names.iter().any(|c| c == tool.name())
+                    || discovered.contains(tool.name())
+            })
+            .map(|tool| ToolDefinition {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters: tool.parameters_schema(),
+            })
+            .collect()
+    }
+
+    /// Register image generation and editing tools.
+    ///
+    /// These tools allow the LLM to generate and edit images using cloud APIs.
+    /// Requires an API base URL, API key, and model name for the image generation backend.
+    pub fn register_image_tools(
+        &self,
+        api_base_url: String,
+        api_key: String,
+        gen_model: String,
+        base_dir: Option<std::path::PathBuf>,
+    ) {
+        use crate::tools::builtin::{ImageEditTool, ImageGenerateTool};
+        self.register_sync(Arc::new(ImageGenerateTool::new(
+            api_base_url.clone(),
+            api_key.clone(),
+            gen_model.clone(),
+        )));
+        self.register_sync(Arc::new(ImageEditTool::new(
+            api_base_url,
+            api_key,
+            gen_model,
+            base_dir,
+        )));
+        tracing::info!("Registered 2 image tools (generate, edit)");
+    }
+
+    /// Register vision/image analysis tools.
+    ///
+    /// These tools allow the LLM to analyze images using a vision-capable model.
+    pub fn register_vision_tools(
+        &self,
+        api_base_url: String,
+        api_key: String,
+        vision_model: String,
+        base_dir: Option<std::path::PathBuf>,
+    ) {
+        use crate::tools::builtin::ImageAnalyzeTool;
+        self.register_sync(Arc::new(ImageAnalyzeTool::new(
+            api_base_url,
+            api_key,
+            vision_model,
+            base_dir,
+        )));
+        tracing::info!("Registered 1 vision tool (analyze)");
+    }
+
     /// Register structured collection tools.
     ///
     /// Registers three management tools (list, register, drop) plus dynamically
@@ -454,7 +721,7 @@ impl ToolRegistry {
     pub async fn register_collection_tools(
         self: &Arc<Self>,
         db: Arc<dyn Database>,
-        user_id: &str,
+        user_ids: &[&str],
         skills_dir: Option<std::path::PathBuf>,
         skill_registry: Option<Arc<std::sync::RwLock<SkillRegistry>>>,
         collection_write_tx: Option<tokio::sync::broadcast::Sender<crate::agent::collection_events::CollectionWriteEvent>>,
@@ -500,11 +767,32 @@ impl ToolRegistry {
         }
         self.register_sync(Arc::new(alter_tool));
 
-        // Load existing schemas and generate per-collection tools + skills
-        match db.list_collections(user_id).await {
-            Ok(schemas) => {
+        // Load existing schemas and generate per-collection tools + skills.
+        // In multi-tenant mode, iterate all user IDs to register tools for
+        // every tenant's collections (tool names are globally unique by
+        // collection name, so different users with the same collection name
+        // share the same tool — the tool resolves the correct user at runtime).
+        let mut all_schemas = Vec::new();
+        let mut seen_collections = std::collections::HashSet::new();
+        for uid in user_ids {
+            match db.list_collections(uid).await {
+                Ok(schemas) => {
+                    for s in schemas {
+                        if seen_collections.insert(s.collection.clone()) {
+                            all_schemas.push(s);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load collection schemas for user {uid}: {e}");
+                }
+            }
+        }
+        {
+            let schemas = &all_schemas;
+            if !schemas.is_empty() {
                 let mut tool_count = 0;
-                for schema in &schemas {
+                for schema in schemas {
                     let tools = generate_collection_tools(schema, Arc::clone(&db), collection_write_tx.clone());
                     tool_count += tools.len();
                     for tool in tools {
@@ -553,7 +841,7 @@ impl ToolRegistry {
                 if !schemas.is_empty()
                     && let Some(ref dir) = skills_dir
                 {
-                    generate_router_skill(&schemas, dir);
+                    generate_router_skill(schemas, dir);
 
                     if let Some(ref sr) = skill_registry {
                         let router_path =
@@ -587,15 +875,15 @@ impl ToolRegistry {
                 }
 
                 tracing::info!(
-                    "Registered 4 collection management tools + {} per-collection tools for {} schemas",
+                    "Registered 4 collection management tools + {} per-collection tools for {} schemas (across {} users)",
                     tool_count,
-                    schemas.len()
+                    schemas.len(),
+                    user_ids.len()
                 );
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load collection schemas: {e}");
+            } else {
                 tracing::info!(
-                    "Registered 4 collection management tools (no existing schemas loaded)"
+                    "Registered 4 collection management tools (no existing schemas found across {} users)",
+                    user_ids.len()
                 );
             }
         }
@@ -610,17 +898,15 @@ impl ToolRegistry {
     pub async fn register_builder_tool(
         self: &Arc<Self>,
         llm: Arc<dyn LlmProvider>,
-        safety: Arc<SafetyLayer>,
         config: Option<BuilderConfig>,
     ) {
         // First register dev tools needed by the builder
         self.register_dev_tools();
 
-        // Create the builder (arg order: config, llm, safety, tools)
+        // Create the builder (arg order: config, llm, tools)
         let builder = Arc::new(LlmSoftwareBuilder::new(
             config.unwrap_or_default(),
             llm,
-            safety,
             Arc::clone(self),
         ));
 
@@ -749,7 +1035,7 @@ impl ToolRegistry {
             limits: None,
             description: Some(&tool_with_binary.tool.description),
             schema: Some(tool_with_binary.tool.parameters_schema.clone()),
-            secrets_store: None,
+            secrets_store: self.secrets_store.clone(),
             oauth_refresh: None,
         })
         .await
@@ -815,7 +1101,7 @@ impl std::fmt::Debug for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::registry::EchoTool;
+    use crate::tools::registry::{EchoTool, TimeTool};
 
     #[tokio::test]
     async fn test_register_and_get() {
@@ -894,5 +1180,200 @@ mod tests {
             .to_string();
         assert_eq!(desc, original_desc);
         assert_ne!(desc, "EVIL SHADOW");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_register_and_read_no_panic() {
+        use std::sync::Arc as StdArc;
+
+        let registry = StdArc::new(ToolRegistry::new());
+        registry.register_builtin_tools();
+
+        // Spawn concurrent readers and check they don't panic
+        let mut handles = Vec::new();
+
+        // Readers
+        for _ in 0..10 {
+            let reg = StdArc::clone(&registry);
+            handles.push(tokio::spawn(async move {
+                let tools = reg.all().await;
+                assert!(!tools.is_empty());
+                let names = reg.list().await;
+                assert!(!names.is_empty());
+                let _ = reg.get("echo").await;
+                let _ = reg.has("echo").await;
+                let _ = reg.tool_definitions().await;
+            }));
+        }
+
+        // Concurrent register attempts (will be rejected as shadowing)
+        for _ in 0..5 {
+            let reg = StdArc::clone(&registry);
+            handles.push(tokio::spawn(async move {
+                // This will be rejected (echo is protected) but should not panic
+                reg.register(Arc::new(EchoTool)).await;
+            }));
+        }
+
+        for handle in handles {
+            handle.await.expect("task should not panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_definitions_sorted_alphabetically() {
+        // Create tools with names that would NOT be alphabetical if inserted in this order.
+        struct ToolZ;
+        struct ToolA;
+        struct ToolM;
+
+        macro_rules! impl_tool {
+            ($ty:ident, $name:expr) => {
+                #[async_trait::async_trait]
+                impl Tool for $ty {
+                    fn name(&self) -> &str {
+                        $name
+                    }
+                    fn description(&self) -> &str {
+                        $name
+                    }
+                    fn parameters_schema(&self) -> serde_json::Value {
+                        serde_json::json!({})
+                    }
+                    async fn execute(
+                        &self,
+                        _: serde_json::Value,
+                        _: &crate::context::JobContext,
+                    ) -> Result<crate::tools::tool::ToolOutput, crate::tools::tool::ToolError> {
+                        unreachable!()
+                    }
+                }
+            };
+        }
+
+        impl_tool!(ToolZ, "zebra");
+        impl_tool!(ToolA, "alpha");
+        impl_tool!(ToolM, "middle");
+
+        let registry = ToolRegistry::new();
+        // Register in non-alphabetical order
+        registry.register(Arc::new(ToolZ)).await;
+        registry.register(Arc::new(ToolA)).await;
+        registry.register(Arc::new(ToolM)).await;
+
+        let defs = registry.tool_definitions().await;
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "middle", "zebra"]);
+    }
+
+    #[tokio::test]
+    async fn test_retain_only_filters_tools() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        let all = registry.list().await;
+        assert!(all.len() > 2, "expected multiple built-in tools");
+        registry.retain_only(&["echo", "time"]).await;
+        let remaining = registry.list().await;
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&"echo".to_string()));
+        assert!(remaining.contains(&"time".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_retain_only_empty_is_noop() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        let before = registry.list().await.len();
+        registry.retain_only(&[]).await;
+        let after = registry.list().await.len();
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn test_discovered_tools_tracking() {
+        let registry = ToolRegistry::new();
+        assert!(!registry.is_discovered("foo").await);
+        registry.mark_discovered("foo").await;
+        assert!(registry.is_discovered("foo").await);
+        let names = registry.discovered_tool_names().await;
+        assert_eq!(names, vec!["foo".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_matches_name_and_description() {
+        let registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool)).await;
+        // "echo" matches the tool name
+        let results = registry.search_tools("echo").await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "echo");
+        // no match
+        let results = registry.search_tools("nonexistent").await;
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_capability_manifest_empty_when_no_core() {
+        let registry = ToolRegistry::new();
+        let manifest = registry.capability_manifest(&[]).await;
+        assert!(manifest.is_empty(), "No manifest when core_tools is empty");
+    }
+
+    #[tokio::test]
+    async fn test_capability_manifest_lists_non_core_tools() {
+        let registry = ToolRegistry::new();
+        // Register some tools
+        registry.register_sync(Arc::new(EchoTool));
+        registry.register_sync(Arc::new(TimeTool));
+
+        let core = vec!["time".to_string()];
+        let manifest = registry.capability_manifest(&core).await;
+        // echo is not core, so it should be in the manifest
+        assert!(
+            manifest.contains("echo"),
+            "Non-core tool should be in manifest"
+        );
+        // time is core, so it should NOT be in the manifest
+        assert!(
+            !manifest.contains("time:"),
+            "Core tool should not be in manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_capability_manifest_excludes_discovered() {
+        let registry = ToolRegistry::new();
+        registry.register_sync(Arc::new(EchoTool));
+        registry.register_sync(Arc::new(TimeTool));
+
+        let core = vec!["time".to_string()];
+        // Mark echo as discovered — it should NOT appear in manifest
+        registry.mark_discovered("echo").await;
+        let manifest = registry.capability_manifest(&core).await;
+        assert!(
+            !manifest.contains("echo"),
+            "Discovered tool should not be in manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_core_tool_definitions_filters_correctly() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        // With empty core_names, returns all tools (backward compatible)
+        let all = registry.core_tool_definitions(&[]).await;
+        assert!(!all.is_empty());
+        // With specific core_names, returns only those + discovered
+        let core = vec!["echo".to_string()];
+        let filtered = registry.core_tool_definitions(&core).await;
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "echo");
+        // Discover "time", now it should also appear
+        registry.mark_discovered("time").await;
+        let filtered = registry.core_tool_definitions(&core).await;
+        assert_eq!(filtered.len(), 2);
+        let names: Vec<&str> = filtered.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"echo"));
+        assert!(names.contains(&"time"));
     }
 }

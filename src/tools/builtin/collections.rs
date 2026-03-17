@@ -32,9 +32,41 @@ use crate::context::JobContext;
 use crate::db::Database;
 use crate::db::structured::{
     AggOp, Aggregation, AlterOperation, Alteration, CollectionSchema, FieldType, Filter,
+    append_history, init_history,
 };
 use crate::tools::registry::ToolRegistry;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, ToolRateLimitConfig, require_str};
+
+// ==================== Cross-scope resolution ====================
+
+/// Resolve which user_id owns a collection, checking the caller's own scope
+/// first, then each `workspace_read_scope` in order.
+///
+/// Used by read-only collection tools (query, summary) to support cross-lens
+/// access. Write tools (add, update, delete) intentionally skip this and
+/// always operate on the caller's own scope.
+async fn resolve_collection_scope(
+    db: &dyn Database,
+    caller_user_id: &str,
+    scopes: &[String],
+    collection: &str,
+) -> Option<String> {
+    // Try caller's own collections first.
+    if db
+        .get_collection_schema(caller_user_id, collection)
+        .await
+        .is_ok()
+    {
+        return Some(caller_user_id.to_string());
+    }
+    // Try each scope in order.
+    for scope in scopes {
+        if db.get_collection_schema(scope, collection).await.is_ok() {
+            return Some(scope.clone());
+        }
+    }
+    None
+}
 
 // ==================== Schema → JSON Schema conversion ====================
 
@@ -501,14 +533,17 @@ impl Tool for CollectionListTool {
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
-        let schemas =
-            self.db.list_collections(&ctx.user_id).await.map_err(|e| {
+        // Collect from own scope + workspace_read_scopes (matching REST handler).
+        let mut user_ids = vec![ctx.user_id.clone()];
+        user_ids.extend(ctx.workspace_read_scopes.iter().cloned());
+
+        let mut all_collections: Vec<serde_json::Value> = Vec::new();
+        for uid in &user_ids {
+            let schemas = self.db.list_collections(uid).await.map_err(|e| {
                 ToolError::ExecutionFailed(format!("Failed to list collections: {e}"))
             })?;
 
-        let collections: Vec<serde_json::Value> = schemas
-            .iter()
-            .map(|s| {
+            for s in &schemas {
                 let fields: serde_json::Value = s
                     .fields
                     .iter()
@@ -523,18 +558,19 @@ impl Tool for CollectionListTool {
                     })
                     .collect::<serde_json::Map<String, serde_json::Value>>()
                     .into();
-                json!({
+                all_collections.push(json!({
                     "collection": s.collection,
                     "description": s.description,
+                    "owner": uid,
                     "fields": fields,
-                })
-            })
-            .collect();
+                }));
+            }
+        }
 
         Ok(ToolOutput::success(
             json!({
-                "collections": collections,
-                "count": collections.len(),
+                "collections": all_collections,
+                "count": all_collections.len(),
             }),
             start.elapsed(),
         ))
@@ -620,7 +656,7 @@ impl Tool for CollectionRegisterTool {
             "properties": {
                 "collection": {
                     "type": "string",
-                    "description": "Name for the collection (alphanumeric + underscores, e.g. 'nanny_shifts', 'grocery_items')"
+                    "description": "Name for the collection (alphanumeric + underscores, e.g. 'time_entries', 'task_list')"
                 },
                 "description": {
                     "type": "string",
@@ -962,6 +998,7 @@ impl Tool for CollectionsAlterTool {
                     "description": "Whether the field is required (add_field only, default: false)"
                 },
                 "default": {
+                    "type": "string",
                     "description": "Default value for the field (add_field only)"
                 },
                 "values": {
@@ -1188,6 +1225,9 @@ impl Tool for CollectionAddTool {
             );
         }
 
+        // Inject _history for audit trail.
+        init_history(&mut data, "conversation");
+
         // Clone before insert_record consumes `data`.
         let data_for_event = data.clone();
 
@@ -1306,6 +1346,23 @@ impl Tool for CollectionUpdateTool {
             return Err(ToolError::InvalidParameters(
                 "No fields to update provided".to_string(),
             ));
+        }
+
+        // Fetch existing record to get current _history, then append update entry.
+        let existing = self
+            .db
+            .get_record(&ctx.user_id, record_id)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to fetch record: {e}")))?;
+
+        let changed_fields = serde_json::Value::Object(updates.clone());
+        let mut existing_data = existing.data;
+        append_history(&mut existing_data, &changed_fields, "conversation");
+
+        // Carry the updated _history into the update payload so the DB merge
+        // replaces the old _history with the appended version.
+        if let Some(history) = existing_data.get("_history") {
+            updates.insert("_history".to_string(), history.clone());
         }
 
         self.db
@@ -1554,10 +1611,20 @@ impl Tool for CollectionQueryTool {
             .unwrap_or(50)
             .min(200) as usize;
 
+        // Resolve collection owner: own scope first, then workspace_read_scopes.
+        let owner = resolve_collection_scope(
+            self.db.as_ref(),
+            &ctx.user_id,
+            &ctx.workspace_read_scopes,
+            &self.schema.collection,
+        )
+        .await
+        .unwrap_or_else(|| ctx.user_id.clone());
+
         let records = self
             .db
             .query_records(
-                &ctx.user_id,
+                &owner,
                 &self.schema.collection,
                 &filters,
                 order_by,
@@ -1733,9 +1800,19 @@ impl Tool for CollectionSummaryTool {
             filters,
         };
 
+        // Resolve collection owner: own scope first, then workspace_read_scopes.
+        let owner = resolve_collection_scope(
+            self.db.as_ref(),
+            &ctx.user_id,
+            &ctx.workspace_read_scopes,
+            &self.schema.collection,
+        )
+        .await
+        .unwrap_or_else(|| ctx.user_id.clone());
+
         let result = self
             .db
-            .aggregate(&ctx.user_id, &self.schema.collection, &aggregation)
+            .aggregate(&owner, &self.schema.collection, &aggregation)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to aggregate: {e}")))?;
 
@@ -1916,8 +1993,8 @@ mod tests {
                 fields: BTreeMap::new(),
             },
             crate::db::structured::CollectionSchema {
-                collection: "nanny_hours".to_string(),
-                description: Some("Track nanny work hours".to_string()),
+                collection: "time_entries".to_string(),
+                description: Some("Track work time entries".to_string()),
                 fields: BTreeMap::new(),
             },
         ];
@@ -1931,7 +2008,7 @@ mod tests {
         assert!(content.starts_with("---\n"), "should have YAML frontmatter");
         assert!(content.contains("collections_list"), "should reference collections_list tool");
         assert!(content.contains("groceries"), "should reference groceries collection");
-        assert!(content.contains("nanny_hours"), "should reference nanny_hours collection");
+        assert!(content.contains("time_entries"), "should reference time_entries collection");
     }
 
     #[test]
@@ -1959,5 +2036,535 @@ mod tests {
 
         assert!(!router_path.exists(), "router SKILL.md should be removed for empty schemas");
         assert!(!router_dir.exists(), "router directory should be removed for empty schemas");
+    }
+
+    // ==================== History tracking tests ====================
+
+    #[cfg(feature = "libsql")]
+    mod history {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+
+        use crate::context::JobContext;
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use crate::db::structured::{CollectionSchema, FieldDef, FieldType};
+        use crate::tools::tool::Tool;
+
+        use super::{CollectionAddTool, CollectionUpdateTool};
+
+        fn test_schema() -> CollectionSchema {
+            let mut fields = BTreeMap::new();
+            fields.insert(
+                "item".to_string(),
+                FieldDef {
+                    field_type: FieldType::Text,
+                    required: true,
+                    default: None,
+                },
+            );
+            fields.insert(
+                "quantity".to_string(),
+                FieldDef {
+                    field_type: FieldType::Number,
+                    required: false,
+                    default: None,
+                },
+            );
+            CollectionSchema {
+                collection: "groceries".to_string(),
+                description: Some("test".to_string()),
+                fields,
+            }
+        }
+
+        async fn setup_db(tmp: &TempDir) -> Arc<dyn Database> {
+            let db_path = tmp.path().join("test.db");
+            let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+            backend.run_migrations().await.unwrap();
+            let db: Arc<dyn Database> = Arc::new(backend);
+            db.register_collection("alice", &test_schema())
+                .await
+                .unwrap();
+            db
+        }
+
+        #[tokio::test]
+        async fn insert_creates_history_with_one_entry() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db(&tmp).await;
+            let schema = test_schema();
+            let tool = CollectionAddTool::new(schema, Arc::clone(&db), None);
+            let ctx = JobContext::with_user("alice", "test", "test");
+
+            let result = tool
+                .execute(serde_json::json!({"item": "milk", "quantity": 2}), &ctx)
+                .await
+                .unwrap();
+            let record_id: uuid::Uuid = result.result["record_id"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+
+            let record = db.get_record("alice", record_id).await.unwrap();
+            let history = record.data["_history"].as_array().unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0]["op"], "insert");
+            assert_eq!(history[0]["source"], "conversation");
+            assert_eq!(history[0]["fields"]["item"], "milk");
+            assert_eq!(history[0]["fields"]["quantity"], 2);
+            // System fields should not appear in history fields.
+            assert!(history[0]["fields"].get("_lineage").is_none());
+            assert!(history[0]["fields"].get("_history").is_none());
+            // Time should be present.
+            assert!(history[0]["time"].as_str().is_some());
+        }
+
+        #[tokio::test]
+        async fn update_appends_to_history() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db(&tmp).await;
+            let schema = test_schema();
+            let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db), None);
+            let update_tool = CollectionUpdateTool::new(schema, Arc::clone(&db));
+            let ctx = JobContext::with_user("alice", "test", "test");
+
+            // Insert.
+            let result = add_tool
+                .execute(serde_json::json!({"item": "milk", "quantity": 1}), &ctx)
+                .await
+                .unwrap();
+            let record_id_str = result.result["record_id"].as_str().unwrap();
+            let record_id: uuid::Uuid = record_id_str.parse().unwrap();
+
+            // Update.
+            update_tool
+                .execute(
+                    serde_json::json!({"record_id": record_id_str, "quantity": 3}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+
+            let record = db.get_record("alice", record_id).await.unwrap();
+            let history = record.data["_history"].as_array().unwrap();
+            assert_eq!(history.len(), 2);
+            assert_eq!(history[0]["op"], "insert");
+            assert_eq!(history[1]["op"], "update");
+            assert_eq!(history[1]["source"], "conversation");
+            assert_eq!(history[1]["fields"]["quantity"], 3);
+            // Update should only contain changed fields, not all fields.
+            assert!(
+                history[1]["fields"].get("item").is_none(),
+                "update history should only contain changed fields"
+            );
+        }
+
+        #[tokio::test]
+        async fn multiple_updates_produce_multiple_history_entries() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db(&tmp).await;
+            let schema = test_schema();
+            let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db), None);
+            let update_tool = CollectionUpdateTool::new(schema, Arc::clone(&db));
+            let ctx = JobContext::with_user("alice", "test", "test");
+
+            let result = add_tool
+                .execute(serde_json::json!({"item": "eggs"}), &ctx)
+                .await
+                .unwrap();
+            let rid = result.result["record_id"].as_str().unwrap().to_string();
+            let record_id: uuid::Uuid = rid.parse().unwrap();
+
+            // Three sequential updates.
+            for qty in [6, 12, 24] {
+                update_tool
+                    .execute(
+                        serde_json::json!({"record_id": rid, "quantity": qty}),
+                        &ctx,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let record = db.get_record("alice", record_id).await.unwrap();
+            let history = record.data["_history"].as_array().unwrap();
+            assert_eq!(history.len(), 4, "1 insert + 3 updates = 4 entries");
+            assert_eq!(history[0]["op"], "insert");
+            assert_eq!(history[1]["fields"]["quantity"], 6);
+            assert_eq!(history[2]["fields"]["quantity"], 12);
+            assert_eq!(history[3]["fields"]["quantity"], 24);
+        }
+
+        #[tokio::test]
+        async fn history_preserves_existing_entries() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db(&tmp).await;
+            let schema = test_schema();
+            let add_tool = CollectionAddTool::new(schema.clone(), Arc::clone(&db), None);
+            let update_tool = CollectionUpdateTool::new(schema, Arc::clone(&db));
+            let ctx = JobContext::with_user("alice", "test", "test");
+
+            let result = add_tool
+                .execute(serde_json::json!({"item": "bread"}), &ctx)
+                .await
+                .unwrap();
+            let rid = result.result["record_id"].as_str().unwrap().to_string();
+            let record_id: uuid::Uuid = rid.parse().unwrap();
+
+            // First update.
+            update_tool
+                .execute(
+                    serde_json::json!({"record_id": rid, "quantity": 2}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+
+            // Snapshot the history after first update.
+            let record_after_first = db.get_record("alice", record_id).await.unwrap();
+            let history_after_first = record_after_first.data["_history"]
+                .as_array()
+                .unwrap()
+                .clone();
+            assert_eq!(history_after_first.len(), 2);
+
+            // Second update.
+            update_tool
+                .execute(
+                    serde_json::json!({"record_id": rid, "item": "sourdough bread"}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+
+            let record_after_second = db.get_record("alice", record_id).await.unwrap();
+            let history_after_second = record_after_second.data["_history"]
+                .as_array()
+                .unwrap();
+            assert_eq!(history_after_second.len(), 3);
+
+            // Previous entries must be identical.
+            assert_eq!(history_after_second[0], history_after_first[0]);
+            assert_eq!(history_after_second[1], history_after_first[1]);
+            // New entry.
+            assert_eq!(history_after_second[2]["op"], "update");
+            assert_eq!(history_after_second[2]["fields"]["item"], "sourdough bread");
+        }
+
+        #[tokio::test]
+        async fn history_source_from_lineage() {
+            // When inserting via the REST handler path, source comes from
+            // the lineage/request. For tools, it's "conversation". This test
+            // verifies the tool path sets source correctly.
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db(&tmp).await;
+            let schema = test_schema();
+            let tool = CollectionAddTool::new(schema, Arc::clone(&db), None);
+            let ctx = JobContext::with_user("alice", "test", "test");
+
+            let result = tool
+                .execute(serde_json::json!({"item": "butter"}), &ctx)
+                .await
+                .unwrap();
+            let record_id: uuid::Uuid = result.result["record_id"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+
+            let record = db.get_record("alice", record_id).await.unwrap();
+            let history = record.data["_history"].as_array().unwrap();
+            assert_eq!(history[0]["source"], "conversation");
+        }
+    }
+
+    // ==================== Cross-scope resolution tests ====================
+    //
+    // These tests use the libsql in-memory backend to verify that collection
+    // tools correctly resolve cross-scope access via workspace_read_scopes.
+
+    #[cfg(feature = "libsql")]
+    mod cross_scope {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+
+        use crate::context::JobContext;
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use crate::db::structured::{CollectionSchema, FieldDef, FieldType};
+        use crate::tools::tool::Tool;
+
+        use super::{
+            CollectionAddTool, CollectionDeleteTool, CollectionQueryTool, CollectionSummaryTool,
+            CollectionUpdateTool, resolve_collection_scope,
+        };
+
+        /// Create a minimal collection schema for testing.
+        fn test_schema(name: &str) -> CollectionSchema {
+            let mut fields = BTreeMap::new();
+            fields.insert(
+                "item".to_string(),
+                FieldDef {
+                    field_type: FieldType::Text,
+                    required: true,
+                    default: None,
+                },
+            );
+            CollectionSchema {
+                collection: name.to_string(),
+                description: Some("test collection".to_string()),
+                fields,
+            }
+        }
+
+        /// Set up a file-backed db with a collection registered under `owner_id`.
+        ///
+        /// Uses `new_local` instead of `new_memory` because in-memory libsql
+        /// databases don't share state between connections.
+        async fn setup_db_with_collection(
+            owner_id: &str,
+            collection: &str,
+            tmp: &TempDir,
+        ) -> Arc<dyn Database> {
+            let db_path = tmp.path().join("test.db");
+            let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+            backend.run_migrations().await.unwrap();
+            let db: Arc<dyn Database> = Arc::new(backend);
+            db.register_collection(owner_id, &test_schema(collection))
+                .await
+                .unwrap();
+            db
+        }
+
+        #[tokio::test]
+        async fn resolve_scope_own_collection_first() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("alice", "inventory", &tmp).await;
+            // Also register same-name collection under a scope.
+            db.register_collection("shared", &test_schema("inventory"))
+                .await
+                .unwrap();
+
+            let result = resolve_collection_scope(
+                db.as_ref(),
+                "alice",
+                &["shared".to_string()],
+                "inventory",
+            )
+            .await;
+            assert_eq!(result, Some("alice".to_string()), "should prefer own scope");
+        }
+
+        #[tokio::test]
+        async fn resolve_scope_falls_through_to_read_scope() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("shared", "inventory", &tmp).await;
+
+            let result = resolve_collection_scope(
+                db.as_ref(),
+                "alice",
+                &["shared".to_string()],
+                "inventory",
+            )
+            .await;
+            assert_eq!(
+                result,
+                Some("shared".to_string()),
+                "should fall through to shared scope"
+            );
+        }
+
+        #[tokio::test]
+        async fn resolve_scope_returns_none_when_not_found() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("carol", "inventory", &tmp).await;
+
+            let result = resolve_collection_scope(
+                db.as_ref(),
+                "alice",
+                &["shared".to_string()],
+                "inventory",
+            )
+            .await;
+            assert_eq!(result, None, "should return None when no scope has the collection");
+        }
+
+        #[tokio::test]
+        async fn query_tool_reads_from_cross_scope() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("shared", "inventory", &tmp).await;
+            // Insert a record under shared scope.
+            db.insert_record(
+                "shared",
+                "inventory",
+                serde_json::json!({"item": "widget"}),
+            )
+            .await
+            .unwrap();
+
+            let schema = test_schema("inventory");
+            let tool = CollectionQueryTool::new(schema, Arc::clone(&db));
+
+            // alice has workspace_read_scopes = ["shared"] but no own inventory collection.
+            let mut ctx = JobContext::with_user("alice", "test", "test");
+            ctx.workspace_read_scopes = vec!["shared".to_string()];
+
+            let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+            let output = &result.result;
+            assert_eq!(output["count"], 1, "should find shared scope's record via cross-scope");
+            assert_eq!(output["results"][0]["data"]["item"], "widget");
+        }
+
+        #[tokio::test]
+        async fn summary_tool_reads_from_cross_scope() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("shared", "inventory", &tmp).await;
+            db.insert_record(
+                "shared",
+                "inventory",
+                serde_json::json!({"item": "gadget"}),
+            )
+            .await
+            .unwrap();
+            db.insert_record(
+                "shared",
+                "inventory",
+                serde_json::json!({"item": "widget"}),
+            )
+            .await
+            .unwrap();
+
+            let schema = test_schema("inventory");
+            let tool = CollectionSummaryTool::new(schema, Arc::clone(&db));
+
+            let mut ctx = JobContext::with_user("alice", "test", "test");
+            ctx.workspace_read_scopes = vec!["shared".to_string()];
+
+            let result = tool
+                .execute(serde_json::json!({"operation": "count"}), &ctx)
+                .await
+                .unwrap();
+            let output = &result.result;
+            // The aggregation result should reflect 2 records from shared scope.
+            // Count returns the count directly (not wrapped in {"total": N}).
+            assert_eq!(output["aggregation"], 2, "should count shared scope's records via cross-scope");
+        }
+
+        #[tokio::test]
+        async fn add_tool_does_not_use_cross_scope() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("shared", "inventory", &tmp).await;
+
+            let schema = test_schema("inventory");
+            let tool = CollectionAddTool::new(schema, Arc::clone(&db), None);
+
+            // alice does NOT have her own inventory collection, only shared does.
+            let mut ctx = JobContext::with_user("alice", "test", "test");
+            ctx.workspace_read_scopes = vec!["shared".to_string()];
+
+            // The add tool uses ctx.user_id directly (no scope resolution).
+            // Since "alice" has no "inventory" collection, this should fail.
+            let result = tool
+                .execute(serde_json::json!({"item": "gadget"}), &ctx)
+                .await;
+            assert!(result.is_err(), "add should fail — alice has no own inventory collection");
+        }
+
+        #[tokio::test]
+        async fn update_tool_does_not_use_cross_scope() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("shared", "inventory", &tmp).await;
+            let record_id = db
+                .insert_record(
+                    "shared",
+                    "inventory",
+                    serde_json::json!({"item": "widget"}),
+                )
+                .await
+                .unwrap();
+
+            let schema = test_schema("inventory");
+            let tool = CollectionUpdateTool::new(schema, Arc::clone(&db));
+
+            let mut ctx = JobContext::with_user("alice", "test", "test");
+            ctx.workspace_read_scopes = vec!["shared".to_string()];
+
+            // alice tries to update a shared record — should fail because
+            // update uses ctx.user_id, not scope resolution.
+            let result = tool
+                .execute(
+                    serde_json::json!({
+                        "record_id": record_id.to_string(),
+                        "item": "premium widget"
+                    }),
+                    &ctx,
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "update should fail — alice cannot write to shared scope's collection via tool"
+            );
+        }
+
+        #[tokio::test]
+        async fn delete_tool_does_not_use_cross_scope() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("shared", "inventory", &tmp).await;
+            let record_id = db
+                .insert_record(
+                    "shared",
+                    "inventory",
+                    serde_json::json!({"item": "widget"}),
+                )
+                .await
+                .unwrap();
+
+            let schema = test_schema("inventory");
+            let tool = CollectionDeleteTool::new(schema, Arc::clone(&db));
+
+            let mut ctx = JobContext::with_user("alice", "test", "test");
+            ctx.workspace_read_scopes = vec!["shared".to_string()];
+
+            let result = tool
+                .execute(serde_json::json!({"record_id": record_id.to_string()}), &ctx)
+                .await;
+            assert!(
+                result.is_err(),
+                "delete should fail — alice cannot delete from shared scope's collection via tool"
+            );
+        }
+
+        #[tokio::test]
+        async fn list_tool_includes_cross_scope_collections() {
+            let tmp = TempDir::new().unwrap();
+            let db = setup_db_with_collection("shared", "inventory", &tmp).await;
+            // Also register a collection under alice.
+            db.register_collection("alice", &test_schema("task_list"))
+                .await
+                .unwrap();
+
+            let tool = super::CollectionListTool::new(Arc::clone(&db));
+
+            let mut ctx = JobContext::with_user("alice", "test", "test");
+            ctx.workspace_read_scopes = vec!["shared".to_string()];
+
+            let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+            let output = &result.result;
+            assert_eq!(output["count"], 2, "should list both own and cross-scope collections");
+
+            let collections = output["collections"].as_array().unwrap();
+            let names: Vec<&str> = collections
+                .iter()
+                .map(|c| c["collection"].as_str().unwrap())
+                .collect();
+            assert!(names.contains(&"task_list"), "should include own collection");
+            assert!(names.contains(&"inventory"), "should include cross-scope collection");
+        }
     }
 }

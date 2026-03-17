@@ -16,6 +16,20 @@ use crate::context::JobState;
 use crate::error::Error;
 use crate::llm::{ChatMessage, Reasoning};
 
+/// Format a duration since `dt` as a human-readable "Xd ago" / "Xh ago" / "Xm ago" / "just now".
+fn format_time_ago(dt: chrono::DateTime<chrono::Utc>) -> String {
+    let elapsed = chrono::Utc::now() - dt;
+    if elapsed.num_days() > 0 {
+        format!("{}d ago", elapsed.num_days())
+    } else if elapsed.num_hours() > 0 {
+        format!("{}h ago", elapsed.num_hours())
+    } else if elapsed.num_minutes() > 0 {
+        format!("{}m ago", elapsed.num_minutes())
+    } else {
+        "just now".to_string()
+    }
+}
+
 /// Format a count with a suffix, using K/M abbreviations for large numbers.
 fn format_count(n: u64, suffix: &str) -> String {
     if n >= 1_000_000 {
@@ -68,7 +82,10 @@ impl Agent {
                 self.handle_help_job(&message.user_id, &job_id).await?
             }
             MessageIntent::Command { command, args } => {
-                match self.handle_command(&command, &args).await? {
+                match self
+                    .handle_command(&command, &args, &message.channel)
+                    .await?
+                {
                     Some(s) => s,
                     None => return Ok(SubmissionResult::Ok { message: None }), // Shutdown signal
                 }
@@ -342,7 +359,6 @@ impl Agent {
             crate::workspace::hygiene::HygieneConfig::default(),
             workspace.clone(),
             self.llm().clone(),
-            self.safety().clone(),
         );
 
         match runner.check_heartbeat().await {
@@ -358,6 +374,169 @@ impl Agent {
             crate::agent::HeartbeatResult::Failed(err) => Ok(SubmissionResult::error(format!(
                 "Heartbeat failed: {}",
                 err
+            ))),
+        }
+    }
+
+    /// Trigger the workspace organizer to classify recent messages and create/update workspaces.
+    pub(super) async fn process_organize(
+        &self,
+        user_id: &str,
+    ) -> Result<SubmissionResult, Error> {
+        let Some(ref resolver) = self.deps.thread_resolver else {
+            return Ok(SubmissionResult::error(
+                "No thread resolver configured. Workspace auto-organization is not available.",
+            ));
+        };
+
+        match resolver.organize(user_id).await {
+            Ok(result) => {
+                let mut parts = Vec::new();
+                if !result.created.is_empty() {
+                    parts.push(format!(
+                        "Created {} workspace(s): {}",
+                        result.created.len(),
+                        result
+                            .created
+                            .iter()
+                            .map(|w| w.topic.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if !result.updated.is_empty() {
+                    parts.push(format!(
+                        "Updated {} workspace(s): {}",
+                        result.updated.len(),
+                        result
+                            .updated
+                            .iter()
+                            .map(|w| w.topic.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if parts.is_empty() {
+                    parts.push("No new workspaces needed.".to_string());
+                }
+                parts.push(format!(
+                    "Analyzed {} message(s).",
+                    result.messages_analyzed
+                ));
+                Ok(SubmissionResult::response(parts.join("\n")))
+            }
+            Err(e) => Ok(SubmissionResult::error(format!(
+                "Organize failed: {}",
+                e
+            ))),
+        }
+    }
+
+    /// List all active workspaces for a user.
+    pub(super) async fn process_workspace_list(
+        &self,
+        user_id: &str,
+    ) -> Result<SubmissionResult, Error> {
+        let Some(ref db) = self.deps.store else {
+            return Ok(SubmissionResult::error("Database not available."));
+        };
+
+        let workspaces = db
+            .list_agent_workspaces(user_id, Some("active"))
+            .await?;
+
+        if workspaces.is_empty() {
+            return Ok(SubmissionResult::response(
+                "No active workspaces. Send some messages and run /organize to create workspaces.",
+            ));
+        }
+
+        let mut lines = vec!["Active workspaces:".to_string()];
+        for ws in &workspaces {
+            let ago = format_time_ago(ws.last_accessed);
+            lines.push(format!(
+                "  {} ({} turns, last active {})",
+                ws.topic, ws.turn_count, ago
+            ));
+        }
+        Ok(SubmissionResult::response(lines.join("\n")))
+    }
+
+    /// Switch to a workspace by fuzzy-matching on topic name.
+    pub(super) async fn process_workspace_switch(
+        &self,
+        user_id: &str,
+        name: &str,
+    ) -> Result<SubmissionResult, Error> {
+        let Some(ref db) = self.deps.store else {
+            return Ok(SubmissionResult::error("Database not available."));
+        };
+
+        let workspaces = db
+            .list_agent_workspaces(user_id, Some("active"))
+            .await?;
+
+        let name_lower = name.to_ascii_lowercase();
+        let matched: Vec<_> = workspaces
+            .iter()
+            .filter(|ws| ws.topic.to_ascii_lowercase().contains(&name_lower))
+            .collect();
+
+        match matched.len() {
+            0 => Ok(SubmissionResult::response(format!(
+                "No workspace matching \"{name}\". Use /workspace list to see available workspaces."
+            ))),
+            1 => {
+                let ws = matched[0];
+                // Set stickiness via thread resolver
+                if let Some(ref resolver) = self.deps.thread_resolver {
+                    resolver.notify_routed(user_id, ws.conversation_id, None).await;
+                }
+                let mut response = format!("Switched to workspace: **{}**", ws.topic);
+                if let Some(ref summary) = ws.summary {
+                    response.push_str(&format!("\n\n{summary}"));
+                }
+                Ok(SubmissionResult::response(response))
+            }
+            _ => {
+                let names: Vec<&str> = matched.iter().map(|ws| ws.topic.as_str()).collect();
+                Ok(SubmissionResult::response(format!(
+                    "Multiple workspaces match \"{name}\": {}. Be more specific.",
+                    names.join(", ")
+                )))
+            }
+        }
+    }
+
+    /// Show the current (most recently accessed) workspace summary.
+    pub(super) async fn process_workspace_summary(
+        &self,
+        user_id: &str,
+    ) -> Result<SubmissionResult, Error> {
+        let Some(ref db) = self.deps.store else {
+            return Ok(SubmissionResult::error("Database not available."));
+        };
+
+        let workspaces = db
+            .list_agent_workspaces(user_id, Some("active"))
+            .await?;
+
+        // The first workspace is the most recently accessed (sorted by last_accessed DESC)
+        let ws = match workspaces.first() {
+            Some(ws) => ws,
+            None => {
+                return Ok(SubmissionResult::response("No active workspaces."));
+            }
+        };
+
+        match &ws.summary {
+            Some(summary) => Ok(SubmissionResult::response(format!(
+                "**{}**\n\n{summary}",
+                ws.topic
+            ))),
+            None => Ok(SubmissionResult::response(format!(
+                "**{}** — no summary yet. Summary will be generated after the next organizer run.",
+                ws.topic
             ))),
         }
     }
@@ -403,7 +582,7 @@ impl Agent {
             .with_max_tokens(512)
             .with_temperature(0.3);
 
-        let reasoning = Reasoning::new(self.llm().clone(), self.safety().clone());
+        let reasoning = Reasoning::new(self.llm().clone());
         match reasoning.complete(request).await {
             Ok((text, _usage)) => Ok(SubmissionResult::response(format!(
                 "Thread Summary:\n\n{}",
@@ -451,7 +630,7 @@ impl Agent {
             .with_max_tokens(512)
             .with_temperature(0.5);
 
-        let reasoning = Reasoning::new(self.llm().clone(), self.safety().clone());
+        let reasoning = Reasoning::new(self.llm().clone());
         match reasoning.complete(request).await {
             Ok((text, _usage)) => Ok(SubmissionResult::response(format!(
                 "Suggested Next Steps:\n\n{}",
@@ -466,6 +645,7 @@ impl Agent {
         &self,
         command: &str,
         args: &[String],
+        channel: &str,
     ) -> Result<SubmissionResult, Error> {
         match command {
             "help" => Ok(SubmissionResult::response(concat!(
@@ -497,15 +677,83 @@ impl Agent {
                 "  /skills             List installed skills\n",
                 "  /skills search <q>  Search ClawHub registry\n",
                 "\n",
+                "Workspaces:\n",
+                "  /workspace        List active workspaces\n",
+                "  /workspace <name> Switch to a workspace\n",
+                "  /workspace summary Show current workspace summary\n",
+                "\n",
                 "Agent:\n",
                 "  /heartbeat        Run heartbeat check\n",
                 "  /summarize        Summarize current thread\n",
                 "  /suggest          Suggest next steps\n",
+                "  /restart          Gracefully restart the process\n",
                 "\n",
                 "  /quit             Exit",
             ))),
 
             "ping" => Ok(SubmissionResult::response("pong!")),
+
+            "restart" => {
+                tracing::info!("[commands::restart] Restart command received");
+                // Channel authorization check: restart is only available via web interface
+                if channel != "gateway" {
+                    tracing::warn!(
+                        "[commands::restart] Restart rejected: not from gateway channel (from: {})",
+                        channel
+                    );
+                    return Ok(SubmissionResult::error(
+                        "Restart is only available through the web interface with explicit user confirmation. \
+                         Use the Restart button in the UI."
+                            .to_string(),
+                    ));
+                }
+                // Environment check: restart is only available in Docker containers
+                let in_docker = std::env::var("IRONCLAW_IN_DOCKER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false);
+
+                tracing::debug!("[commands::restart] IRONCLAW_IN_DOCKER={}", in_docker);
+
+                if !in_docker {
+                    tracing::warn!(
+                        "[commands::restart] Restart rejected: not in Docker environment"
+                    );
+                    return Ok(SubmissionResult::error(
+                        "Restart is not available in this environment. \
+                         The IRONCLAW_IN_DOCKER environment variable must be set to 'true' for Docker deployments."
+                            .to_string(),
+                    ));
+                }
+
+                // Execute restart tool directly (don't dispatch as a job for LLM planning)
+                // This ensures the tool runs immediately without LLM involvement
+                use crate::tools::Tool;
+                let tool = crate::tools::builtin::RestartTool;
+                let params = serde_json::json!({});
+
+                // Create a minimal JobContext for the tool
+                let dummy_ctx =
+                    crate::context::JobContext::with_user("system", "Restart", "Graceful restart");
+
+                match tool.execute(params, &dummy_ctx).await {
+                    Ok(output) => {
+                        tracing::info!("[commands::restart] RestartTool executed successfully");
+                        // Extract text from the ToolOutput result
+                        let response = match output.result {
+                            serde_json::Value::String(s) => s,
+                            _ => output.result.to_string(),
+                        };
+                        Ok(SubmissionResult::response(response))
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "[commands::restart] RestartTool execution failed: {:?}",
+                            e
+                        );
+                        Ok(SubmissionResult::error(format!("Restart failed: {}", e)))
+                    }
+                }
+            }
 
             "version" => Ok(SubmissionResult::response(format!(
                 "{} v{}",
@@ -596,10 +844,14 @@ impl Agent {
                     }
 
                     match self.llm().set_model(requested) {
-                        Ok(()) => Ok(SubmissionResult::response(format!(
-                            "Switched model to: {}",
-                            requested
-                        ))),
+                        Ok(()) => {
+                            // Persist the model choice so it survives restarts.
+                            self.persist_selected_model(requested).await;
+                            Ok(SubmissionResult::response(format!(
+                                "Switched model to: {}",
+                                requested
+                            )))
+                        }
                         Err(e) => Ok(SubmissionResult::error(format!(
                             "Failed to switch model: {}",
                             e
@@ -744,14 +996,53 @@ impl Agent {
         &self,
         command: &str,
         args: &[String],
+        channel: &str,
     ) -> Result<Option<String>, Error> {
         // System commands are now handled directly via Submission::SystemCommand,
         // but the router may still send us unknown /commands.
-        match self.handle_system_command(command, args).await? {
+        match self.handle_system_command(command, args, channel).await? {
             SubmissionResult::Response { content } => Ok(Some(content)),
             SubmissionResult::Ok { message } => Ok(message),
             SubmissionResult::Error { message } => Ok(Some(format!("Error: {}", message))),
             _ => Ok(None),
+        }
+    }
+
+    /// Persist the selected model to the settings store (DB and/or TOML config).
+    ///
+    /// Best-effort: logs warnings on failure but does not propagate errors,
+    /// since the in-memory model switch already succeeded.
+    async fn persist_selected_model(&self, model: &str) {
+        // 1. Persist to DB if available.
+        if let Some(store) = self.store() {
+            let value = serde_json::Value::String(model.to_string());
+            if let Err(e) = store.set_setting("default", "selected_model", &value).await {
+                tracing::warn!("Failed to persist model to DB: {}", e);
+            }
+        }
+
+        // 2. Update TOML config file if it exists (sync I/O in spawn_blocking).
+        let model_owned = model.to_string();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            let toml_path = crate::settings::Settings::default_toml_path();
+            match crate::settings::Settings::load_toml(&toml_path) {
+                Ok(Some(mut settings)) => {
+                    settings.selected_model = Some(model_owned);
+                    if let Err(e) = settings.save_toml(&toml_path) {
+                        tracing::warn!("Failed to persist model to config.toml: {}", e);
+                    }
+                }
+                Ok(None) => {
+                    // No config file on disk; nothing to update.
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load config.toml for model persistence: {}", e);
+                }
+            }
+        })
+        .await
+        {
+            tracing::warn!("Model TOML persistence task failed: {}", e);
         }
     }
 }

@@ -177,7 +177,9 @@ impl SseManager {
                     SseEvent::JobStatus { .. } => "job_status",
                     SseEvent::JobResult { .. } => "job_result",
                     SseEvent::Heartbeat => "heartbeat",
+                    SseEvent::ImageGenerated { .. } => "image_generated",
                     SseEvent::ExtensionStatus { .. } => "extension_status",
+                    SseEvent::WorkspaceRouted { .. } => "workspace_routed",
                 };
                 Ok(Event::default().event(event_type).data(data))
             });

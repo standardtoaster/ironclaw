@@ -28,14 +28,16 @@ impl JobStore for LibSqlBackend {
                 r#"
                 INSERT INTO agent_jobs (
                     id, conversation_id, title, description, category, status, source,
+                    user_id,
                     budget_amount, budget_token, bid_amount, estimated_cost, estimated_time_secs,
                     actual_cost, repair_attempts, created_at, started_at, completed_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
                 ON CONFLICT (id) DO UPDATE SET
                     title = excluded.title,
                     description = excluded.description,
                     category = excluded.category,
                     status = excluded.status,
+                    user_id = excluded.user_id,
                     estimated_cost = excluded.estimated_cost,
                     estimated_time_secs = excluded.estimated_time_secs,
                     actual_cost = excluded.actual_cost,
@@ -51,6 +53,7 @@ impl JobStore for LibSqlBackend {
                     opt_text(ctx.category.as_deref()),
                     status,
                     "direct",
+                    ctx.user_id.as_str(),
                     opt_text_owned(ctx.budget.map(|d| d.to_string())),
                     opt_text(ctx.budget_token.as_deref()),
                     opt_text_owned(ctx.bid_amount.map(|d| d.to_string())),
@@ -117,6 +120,14 @@ impl JobStore for LibSqlBackend {
                     transitions: Vec::new(),
                     metadata: serde_json::Value::Null,
                     extra_env: std::sync::Arc::new(std::collections::HashMap::new()),
+                    http_interceptor: None,
+                    tool_output_stash: std::sync::Arc::new(tokio::sync::RwLock::new(
+                        std::collections::HashMap::new(),
+                    )),
+                    // TODO(#661): persist user_timezone in agent_jobs table so
+                    // background/routine jobs retain the session's timezone context.
+                    user_timezone: "UTC".to_string(),
+                    workspace_read_scopes: Vec::new(),
                 }))
             }
             None => Ok(None),
@@ -211,6 +222,30 @@ impl JobStore for LibSqlBackend {
             });
         }
         Ok(jobs)
+    }
+
+    async fn get_agent_job_failure_reason(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<String>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT failure_reason FROM agent_jobs WHERE id = ?1",
+                [id.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            Ok(get_opt_text(&row, 0))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn agent_job_summary(&self) -> Result<AgentJobSummary, DatabaseError> {

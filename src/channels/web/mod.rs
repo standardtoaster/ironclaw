@@ -24,6 +24,13 @@ pub mod types;
 pub(crate) mod util;
 pub mod ws;
 
+/// Test helpers for gateway integration tests.
+///
+/// Always compiled (not behind `#[cfg(test)]`) so that integration tests in
+/// `tests/` -- which import this crate as a regular dependency -- can use
+/// [`TestGatewayBuilder`](test_helpers::TestGatewayBuilder).
+pub mod test_helpers;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -65,13 +72,11 @@ impl GatewayChannel {
     /// Builds a single-user `MultiAuthState` from the config.
     pub fn new(config: GatewayConfig) -> Self {
         let auth_token = config.auth_token.clone().unwrap_or_else(|| {
-            use rand::Rng;
-            let token: String = rand::thread_rng()
-                .sample_iter(&rand::distributions::Alphanumeric)
-                .take(32)
-                .map(char::from)
-                .collect();
-            token
+            use rand::RngCore;
+            use rand::rngs::OsRng;
+            let mut bytes = [0u8; 32];
+            OsRng.fill_bytes(&mut bytes);
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
         });
 
         let auth = MultiAuthState::single(auth_token, config.user_id.clone());
@@ -89,6 +94,7 @@ impl GatewayChannel {
             store: None,
             job_manager: None,
             prompt_queue: None,
+            scheduler: None,
             default_user_id: config.user_id.clone(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(ws::WsConnectionTracker::new())),
@@ -100,6 +106,7 @@ impl GatewayChannel {
             chat_rate_limiter: server::PerUserRateLimiter::new(30, 60),
             registry_entries: Vec::new(),
             cost_guard: None,
+            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
             restart_requested: std::sync::atomic::AtomicBool::new(false),
             collection_write_tx: None,
@@ -136,9 +143,11 @@ impl GatewayChannel {
             user_tokens,
             skill_registry: None,
             skill_catalog: None,
+            scheduler: None,
             chat_rate_limiter: server::PerUserRateLimiter::new(30, 60),
             registry_entries: Vec::new(),
             cost_guard: None,
+            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
             restart_requested: std::sync::atomic::AtomicBool::new(false),
             collection_write_tx: None,
@@ -155,7 +164,8 @@ impl GatewayChannel {
     fn rebuild_state(&mut self, mutate: impl FnOnce(&mut GatewayState)) {
         let mut new_state = GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
-            sse: Arc::new(SseManager::new()),
+            // Preserve the existing broadcast channel so sender handles remain valid.
+            sse: Arc::clone(&self.state.sse),
             workspace: self.state.workspace.clone(),
             workspace_pool: self.state.workspace_pool.clone(),
             session_manager: self.state.session_manager.clone(),
@@ -166,6 +176,7 @@ impl GatewayChannel {
             store: self.state.store.clone(),
             job_manager: self.state.job_manager.clone(),
             prompt_queue: self.state.prompt_queue.clone(),
+            scheduler: self.state.scheduler.clone(),
             default_user_id: self.state.default_user_id.clone(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: self.state.ws_tracker.clone(),
@@ -177,6 +188,7 @@ impl GatewayChannel {
             chat_rate_limiter: server::PerUserRateLimiter::new(30, 60),
             registry_entries: self.state.registry_entries.clone(),
             cost_guard: self.state.cost_guard.clone(),
+            routine_engine: Arc::clone(&self.state.routine_engine),
             startup_time: self.state.startup_time,
             restart_requested: std::sync::atomic::AtomicBool::new(false),
             collection_write_tx: self.state.collection_write_tx.clone(),
@@ -249,6 +261,12 @@ impl GatewayChannel {
         self
     }
 
+    /// Inject the scheduler for sending follow-up messages to agent jobs.
+    pub fn with_scheduler(mut self, slot: crate::tools::builtin::SchedulerSlot) -> Self {
+        self.rebuild_state(|s| s.scheduler = Some(slot));
+        self
+    }
+
     /// Inject the skill registry for skill management API.
     pub fn with_skill_registry(mut self, sr: Arc<std::sync::RwLock<SkillRegistry>>) -> Self {
         self.rebuild_state(|s| s.skill_registry = Some(sr));
@@ -279,6 +297,12 @@ impl GatewayChannel {
         self
     }
 
+    /// Inject the per-user workspace pool for multi-user mode.
+    pub fn with_workspace_pool(mut self, pool: Arc<server::WorkspacePool>) -> Self {
+        self.rebuild_state(|s| s.workspace_pool = Some(pool));
+        self
+    }
+
     /// Inject the broadcast sender for collection write events.
     pub fn with_collection_write_tx(
         mut self,
@@ -287,12 +311,6 @@ impl GatewayChannel {
         >,
     ) -> Self {
         self.rebuild_state(|s| s.collection_write_tx = Some(tx));
-        self
-    }
-
-    /// Inject the per-user workspace pool for multi-user mode.
-    pub fn with_workspace_pool(mut self, pool: Arc<server::WorkspacePool>) -> Self {
-        self.rebuild_state(|s| s.workspace_pool = Some(pool));
         self
     }
 
@@ -337,7 +355,15 @@ impl Channel for GatewayChannel {
         msg: &IncomingMessage,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
-        let thread_id = msg.thread_id.clone().unwrap_or_default();
+        let thread_id = match &msg.thread_id {
+            Some(tid) => tid.clone(),
+            None => {
+                tracing::warn!(
+                    "Gateway respond with no thread_id — skipping (clients would drop it)"
+                );
+                return Ok(());
+            }
+        };
 
         self.state.sse.broadcast_for_user(
             &msg.user_id,
@@ -368,9 +394,16 @@ impl Channel for GatewayChannel {
                 name,
                 thread_id: thread_id.clone(),
             },
-            StatusUpdate::ToolCompleted { name, success } => SseEvent::ToolCompleted {
+            StatusUpdate::ToolCompleted {
                 name,
                 success,
+                error,
+                parameters,
+            } => SseEvent::ToolCompleted {
+                name,
+                success,
+                error,
+                parameters,
                 thread_id: thread_id.clone(),
             },
             StatusUpdate::ToolResult { name, preview } => SseEvent::ToolResult {
@@ -428,6 +461,11 @@ impl Channel for GatewayChannel {
                 success,
                 message,
             },
+            StatusUpdate::ImageGenerated { data_url, path } => SseEvent::ImageGenerated {
+                data_url,
+                path,
+                thread_id,
+            },
         };
 
         // Scope events to the user when user_id is available in metadata.
@@ -447,11 +485,20 @@ impl Channel for GatewayChannel {
         user_id: &str,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
+        let thread_id = match response.thread_id {
+            Some(tid) => tid,
+            None => {
+                tracing::warn!(
+                    "Gateway broadcast with no thread_id — skipping (clients would drop it)"
+                );
+                return Ok(());
+            }
+        };
         self.state.sse.broadcast_for_user(
             user_id,
             SseEvent::Response {
                 content: response.content,
-                thread_id: String::new(),
+                thread_id,
             },
         );
         Ok(())
