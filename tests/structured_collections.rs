@@ -939,3 +939,5 @@ async fn scoped_collection_history_tracking() {
     assert_eq!(records[0].data["item"], "test history");
     assert_eq!(records[0].id, id);
 }
+
+// Boot-scan tests are in src/tools/registry.rs (unit tests) since ToolRegistry is private.

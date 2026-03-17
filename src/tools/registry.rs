@@ -773,12 +773,18 @@ impl ToolRegistry {
         // collection name, so different users with the same collection name
         // share the same tool — the tool resolves the correct user at runtime).
         let mut all_schemas = Vec::new();
-        let mut seen_collections = std::collections::HashSet::new();
+        let mut seen_tool_prefixes = std::collections::HashSet::new();
         for uid in user_ids {
             match db.list_collections(uid).await {
                 Ok(schemas) => {
                     for s in schemas {
-                        if seen_collections.insert(s.collection.clone()) {
+                        // Dedup by tool name prefix (includes source_scope for cross-scope tools).
+                        // "household_childcare_hours" and "childcare_hours" are different tool sets.
+                        let key = match &s.source_scope {
+                            Some(scope) => format!("{}_{}", scope, s.collection),
+                            None => s.collection.clone(),
+                        };
+                        if seen_tool_prefixes.insert(key) {
                             all_schemas.push(s);
                         }
                     }
@@ -1375,5 +1381,87 @@ mod tests {
         let names: Vec<&str> = filtered.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"echo"));
         assert!(names.contains(&"time"));
+    }
+
+    // ── Boot-scan scoped collection tests ────────────────────────────
+
+    #[tokio::test]
+    async fn boot_scan_registers_scoped_and_unscoped_tools() {
+        use std::collections::BTreeMap;
+        use tempfile::TempDir;
+
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use crate::db::structured::{CollectionSchema, FieldDef, FieldType, StructuredStore};
+
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "item".to_string(),
+            FieldDef {
+                field_type: FieldType::Text,
+                required: true,
+                default: None,
+            },
+        );
+
+        // household's own childcare_hours
+        let own_schema = CollectionSchema {
+            collection: "childcare_hours".to_string(),
+            description: Some("test".to_string()),
+            fields: fields.clone(),
+            source_scope: None,
+        };
+        backend
+            .register_collection("household", &own_schema)
+            .await
+            .unwrap();
+
+        // andrew's cross-scope childcare_hours → household
+        let scoped_schema = CollectionSchema {
+            collection: "childcare_hours".to_string(),
+            description: Some("test".to_string()),
+            fields,
+            source_scope: Some("household".to_string()),
+        };
+        backend
+            .register_collection("andrew", &scoped_schema)
+            .await
+            .unwrap();
+
+        let db: Arc<dyn Database> = Arc::new(backend);
+        let registry = Arc::new(ToolRegistry::new());
+
+        registry
+            .register_collection_tools(
+                db,
+                &["andrew", "household"],
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        // Both scoped and unscoped tools should exist
+        assert!(
+            registry.has("childcare_hours_query").await,
+            "unscoped childcare_hours_query should exist (for household's own data)"
+        );
+        assert!(
+            registry.has("household_childcare_hours_query").await,
+            "scoped household_childcare_hours_query should exist (for andrew's cross-scope access)"
+        );
+        assert!(
+            registry.has("childcare_hours_add").await,
+            "unscoped childcare_hours_add should exist"
+        );
+        assert!(
+            registry.has("household_childcare_hours_add").await,
+            "scoped household_childcare_hours_add should exist"
+        );
     }
 }
