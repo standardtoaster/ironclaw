@@ -10,8 +10,6 @@ use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use crate::channels::web::auth::AuthenticatedUser;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
-use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
 
 /// Request body for the event ingest endpoint.
