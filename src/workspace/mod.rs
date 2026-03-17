@@ -281,18 +281,6 @@ impl WorkspaceStorage {
         }
     }
 
-    async fn list_all_paths_multi(
-        &self,
-        user_ids: &[String],
-        agent_id: Option<Uuid>,
-    ) -> Result<Vec<String>, WorkspaceError> {
-        match self {
-            #[cfg(feature = "postgres")]
-            Self::Repo(repo) => repo.list_all_paths_multi(user_ids, agent_id).await,
-            Self::Db(db) => db.list_all_paths_multi(user_ids, agent_id).await,
-        }
-    }
-
     async fn get_document_by_path_multi(
         &self,
         user_ids: &[String],
@@ -312,21 +300,6 @@ impl WorkspaceStorage {
         }
     }
 
-    async fn list_directory_multi(
-        &self,
-        user_ids: &[String],
-        agent_id: Option<Uuid>,
-        directory: &str,
-    ) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
-        match self {
-            #[cfg(feature = "postgres")]
-            Self::Repo(repo) => {
-                repo.list_directory_multi(user_ids, agent_id, directory)
-                    .await
-            }
-            Self::Db(db) => db.list_directory_multi(user_ids, agent_id, directory).await,
-        }
-    }
 }
 
 /// Default template seeded into HEARTBEAT.md on first access.
@@ -513,7 +486,12 @@ impl Workspace {
     /// ```
     pub async fn read(&self, path: &str) -> Result<MemoryDocument, WorkspaceError> {
         let path = normalize_path(path);
-        if self.is_multi_scope() {
+        if self.is_multi_scope() && crate::workspace::document::is_identity_path(&path) {
+            // Identity files are primary-scope-only — never read from secondary scopes
+            self.storage
+                .get_document_by_path(&self.user_id, self.agent_id, &path)
+                .await
+        } else if self.is_multi_scope() {
             self.storage
                 .get_document_by_path_multi(&self.read_user_ids, self.agent_id, &path)
                 .await
@@ -713,7 +691,12 @@ impl Workspace {
     /// When multi-scope reads are configured, checks across all read scopes.
     pub async fn exists(&self, path: &str) -> Result<bool, WorkspaceError> {
         let path = normalize_path(path);
-        let result = if self.is_multi_scope() {
+        let result = if self.is_multi_scope() && crate::workspace::document::is_identity_path(&path) {
+            // Identity files: check primary scope only
+            self.storage
+                .get_document_by_path(&self.user_id, self.agent_id, &path)
+                .await
+        } else if self.is_multi_scope() {
             self.storage
                 .get_document_by_path_multi(&self.read_user_ids, self.agent_id, &path)
                 .await
@@ -758,9 +741,28 @@ impl Workspace {
     pub async fn list(&self, directory: &str) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
         let directory = normalize_directory(directory);
         if self.is_multi_scope() {
-            self.storage
-                .list_directory_multi(&self.read_user_ids, self.agent_id, &directory)
-                .await
+            // List primary scope (unfiltered), then merge secondary scopes
+            // with identity file exclusion.
+            let mut entries = self
+                .storage
+                .list_directory(&self.user_id, self.agent_id, &directory)
+                .await?;
+            let primary_paths: std::collections::HashSet<String> =
+                entries.iter().map(|e| e.path.clone()).collect();
+            for scope in &self.read_user_ids[1..] {
+                let secondary = self
+                    .storage
+                    .list_directory(scope, self.agent_id, &directory)
+                    .await?;
+                for entry in secondary {
+                    if !crate::workspace::document::is_identity_path(&entry.path)
+                        && !primary_paths.contains(&entry.path)
+                    {
+                        entries.push(entry);
+                    }
+                }
+            }
+            Ok(entries)
         } else {
             self.storage
                 .list_directory(&self.user_id, self.agent_id, &directory)
@@ -773,9 +775,25 @@ impl Workspace {
     /// When multi-scope reads are configured, lists across all read scopes.
     pub async fn list_all(&self) -> Result<Vec<String>, WorkspaceError> {
         if self.is_multi_scope() {
-            self.storage
-                .list_all_paths_multi(&self.read_user_ids, self.agent_id)
-                .await
+            // Get primary-scope paths (unfiltered) and secondary-scope paths (filtered)
+            let mut primary = self
+                .storage
+                .list_all_paths(&self.user_id, self.agent_id)
+                .await?;
+            for scope in &self.read_user_ids[1..] {
+                let secondary = self
+                    .storage
+                    .list_all_paths(scope, self.agent_id)
+                    .await?;
+                for path in secondary {
+                    if !crate::workspace::document::is_identity_path(&path)
+                        && !primary.contains(&path)
+                    {
+                        primary.push(path);
+                    }
+                }
+            }
+            Ok(primary)
         } else {
             self.storage
                 .list_all_paths(&self.user_id, self.agent_id)
@@ -994,7 +1012,11 @@ impl Workspace {
         };
 
         if self.is_multi_scope() {
-            self.storage
+            // Search with identity file filtering: search all scopes via
+            // hybrid_search_multi, then post-filter to exclude identity
+            // documents from secondary scopes.
+            let mut results = self
+                .storage
                 .hybrid_search_multi(
                     &self.read_user_ids,
                     self.agent_id,
@@ -1002,7 +1024,22 @@ impl Workspace {
                     embedding.as_deref(),
                     &config,
                 )
-                .await
+                .await?;
+
+            // Collect document IDs for identity filtering
+            let doc_ids: std::collections::HashSet<Uuid> =
+                results.iter().map(|r| r.document_id).collect();
+            let mut identity_doc_ids = std::collections::HashSet::new();
+            for doc_id in doc_ids {
+                if let Ok(doc) = self.storage.get_document_by_id(doc_id).await
+                    && crate::workspace::document::is_identity_path(&doc.path)
+                    && doc.user_id != self.user_id
+                {
+                    identity_doc_ids.insert(doc_id);
+                }
+            }
+            results.retain(|r| !identity_doc_ids.contains(&r.document_id));
+            Ok(results)
         } else {
             self.storage
                 .hybrid_search(

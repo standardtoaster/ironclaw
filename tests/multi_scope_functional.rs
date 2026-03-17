@@ -314,3 +314,157 @@ async fn append_memory_stays_in_primary_scope() {
         "append_memory should create in alice's scope"
     );
 }
+
+// --- Identity file isolation ---
+// Identity files (IDENTITY.md, SOUL.md, AGENTS.md, USER.md) must never
+// leak from secondary scopes. Each user's identity is private.
+
+#[tokio::test]
+async fn identity_files_not_readable_from_secondary_scope() {
+    let (db, _dir) = setup().await;
+
+    // Write identity files as "grace"
+    let ws_grace = Workspace::new_with_db("grace", Arc::clone(&db));
+    ws_grace
+        .write("IDENTITY.md", "I am Grace")
+        .await
+        .expect("grace write failed");
+    ws_grace
+        .write("SOUL.md", "Grace's soul overlay")
+        .await
+        .expect("grace write failed");
+    ws_grace
+        .write("USER.md", "Grace's user profile")
+        .await
+        .expect("grace write failed");
+    ws_grace
+        .write("AGENTS.md", "Grace's agent config")
+        .await
+        .expect("grace write failed");
+
+    // Alice has "grace" as a read scope
+    let ws_alice = Workspace::new_with_db("alice", Arc::clone(&db))
+        .with_additional_read_scopes(vec!["grace".to_string()]);
+
+    // Alice should NOT be able to read Grace's identity files
+    for path in &["IDENTITY.md", "SOUL.md", "USER.md", "AGENTS.md"] {
+        let result = ws_alice.read(path).await;
+        assert!(
+            result.is_err(),
+            "Alice should NOT read Grace's {} via secondary scope",
+            path
+        );
+    }
+}
+
+#[tokio::test]
+async fn identity_files_not_in_search_from_secondary_scope() {
+    let (db, _dir) = setup().await;
+
+    // Write identity content with a unique keyword, plus a non-identity doc
+    let ws_grace = Workspace::new_with_db("grace", Arc::clone(&db));
+    ws_grace
+        .write("SOUL.md", "Grace loves xylophone music passionately")
+        .await
+        .expect("grace write failed");
+    ws_grace
+        .write("notes/music.md", "Grace played xylophone at the concert")
+        .await
+        .expect("grace write failed");
+
+    // Alice with "grace" as read scope
+    let ws_alice = Workspace::new_with_db("alice", Arc::clone(&db))
+        .with_additional_read_scopes(vec!["grace".to_string()]);
+
+    // Search for "xylophone" — should find notes/music.md content but NOT SOUL.md content
+    let results = ws_alice.search("xylophone", 10).await.expect("search failed");
+
+    // The non-identity result should be present
+    let has_concert = results.iter().any(|r| r.content.contains("concert"));
+    assert!(has_concert, "Should find non-identity content from secondary scope");
+
+    // The identity file content should NOT appear
+    let has_soul = results.iter().any(|r| r.content.contains("passionately"));
+    assert!(
+        !has_soul,
+        "SOUL.md content from secondary scope should not appear in search results"
+    );
+}
+
+#[tokio::test]
+async fn identity_files_not_in_list_from_secondary_scope() {
+    let (db, _dir) = setup().await;
+
+    // Write identity + non-identity as "grace"
+    let ws_grace = Workspace::new_with_db("grace", Arc::clone(&db));
+    ws_grace
+        .write("IDENTITY.md", "I am Grace")
+        .await
+        .expect("grace write failed");
+    ws_grace
+        .write("notes/shared-note.md", "A shared note")
+        .await
+        .expect("grace write failed");
+
+    // Alice with "grace" as read scope
+    let ws_alice = Workspace::new_with_db("alice", Arc::clone(&db))
+        .with_additional_read_scopes(vec!["grace".to_string()]);
+
+    // List all paths — should include notes/shared-note.md but NOT IDENTITY.md
+    let paths = ws_alice.list_all().await.expect("list failed");
+    assert!(
+        !paths.contains(&"IDENTITY.md".to_string()),
+        "IDENTITY.md from secondary scope should not appear in path listing"
+    );
+    assert!(
+        paths.contains(&"notes/shared-note.md".to_string()),
+        "Non-identity files from secondary scope should be listed"
+    );
+}
+
+// --- Additional write isolation tests ---
+
+#[tokio::test]
+async fn empty_read_scopes_reads_primary_only() {
+    let (db, _dir) = setup().await;
+
+    // Write as "shared"
+    let ws_shared = Workspace::new_with_db("shared", Arc::clone(&db));
+    ws_shared
+        .write("docs/note.md", "Shared note")
+        .await
+        .expect("shared write failed");
+
+    // Alice with empty read scopes (default)
+    let ws_alice = Workspace::new_with_db("alice", Arc::clone(&db))
+        .with_additional_read_scopes(vec![]);
+
+    let result = ws_alice.read("docs/note.md").await;
+    assert!(
+        result.is_err(),
+        "Empty read scopes should not grant cross-scope access"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_read_scopes_handled() {
+    let (db, _dir) = setup().await;
+
+    let ws_shared = Workspace::new_with_db("shared", Arc::clone(&db));
+    ws_shared
+        .write("docs/note.md", "One note")
+        .await
+        .expect("shared write failed");
+
+    // Alice with duplicate "shared" scope — should not cause errors or duplicates
+    let ws_alice = Workspace::new_with_db("alice", Arc::clone(&db))
+        .with_additional_read_scopes(vec!["shared".to_string(), "shared".to_string()]);
+
+    let doc = ws_alice.read("docs/note.md").await.expect("read failed");
+    assert_eq!(doc.content, "One note");
+
+    // List should not return duplicates
+    let paths = ws_alice.list_all().await.expect("list failed");
+    let note_count = paths.iter().filter(|p| *p == "docs/note.md").count();
+    assert_eq!(note_count, 1, "Duplicate scopes should not cause duplicate paths");
+}

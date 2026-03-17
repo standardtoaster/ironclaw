@@ -93,11 +93,19 @@ impl MemoryDocument {
 
     /// Check if this is a well-known identity document.
     pub fn is_identity_document(&self) -> bool {
-        matches!(
-            self.path.as_str(),
-            paths::IDENTITY | paths::SOUL | paths::AGENTS | paths::USER
-        )
+        is_identity_path(&self.path)
     }
+}
+
+/// Paths that are considered identity files (private to their owning scope).
+pub const IDENTITY_PATHS: &[&str] = &[paths::IDENTITY, paths::SOUL, paths::AGENTS, paths::USER];
+
+/// Check if a path refers to a well-known identity file.
+///
+/// Identity files are private to their owning scope and must never be
+/// returned from secondary scopes in multi-scope reads.
+pub fn is_identity_path(path: &str) -> bool {
+    IDENTITY_PATHS.contains(&path)
 }
 
 /// An entry in a workspace directory listing.
