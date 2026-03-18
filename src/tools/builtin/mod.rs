@@ -4,7 +4,7 @@ pub mod ask_user;
 pub mod collections;
 mod create_workspace;
 mod delegate_workspace;
-mod discover_tools;
+pub mod discover_tools;
 mod list_workspaces;
 mod search_workspace_history;
 mod set_workspace_topic;

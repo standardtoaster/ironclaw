@@ -887,6 +887,14 @@ impl AppBuilder {
             Arc::new(ServiceCache::new(cache_dir))
         });
 
+        // Register discover_tools with service awareness (Phase 1 + Phase 2)
+        tools
+            .register_discover_tools_with_services(
+                service_registry.clone(),
+                service_cache.clone(),
+            )
+            .await;
+
         Ok((
             mcp_session_manager,
             mcp_process_manager,
