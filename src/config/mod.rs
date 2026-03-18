@@ -92,6 +92,9 @@ pub struct Config {
     /// All other registered tools are discoverable but not sent unless loaded.
     /// If empty/unset, ALL tools are sent (backward compatible).
     pub core_tools: Vec<String>,
+    /// Path to a JSON file containing MCP service configs for discovery.
+    /// Set via `SERVICES_CONFIG` env var (typically `generated/services.json`).
+    pub services_config_path: Option<String>,
 }
 
 impl Config {
@@ -165,6 +168,7 @@ impl Config {
             transcription: TranscriptionConfig::default(),
             observability: crate::observability::ObservabilityConfig::default(),
             core_tools: Vec::new(),
+            services_config_path: None,
         }
     }
 
@@ -323,6 +327,7 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
                 .unwrap_or_default(),
+            services_config_path: std::env::var("SERVICES_CONFIG").ok(),
         })
     }
 }
