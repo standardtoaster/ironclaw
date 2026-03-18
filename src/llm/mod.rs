@@ -370,6 +370,7 @@ async fn create_tier_provider(
                 .unwrap_or_else(|_| "claude".to_string()),
             spawn_timeout_secs: 30,
             request_timeout_secs: 300,
+            skip_permissions: true,
         };
         tracing::info!(
             tier = %tier.name,
@@ -911,6 +912,7 @@ pub fn create_provider_from_user_config(
                     .unwrap_or_else(|_| "claude".to_string()),
                 spawn_timeout_secs: 30,
                 request_timeout_secs: 300,
+                skip_permissions: true,
             };
             tracing::info!(
                 user_model = %user_config.model,
