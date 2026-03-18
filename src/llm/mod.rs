@@ -13,6 +13,7 @@ mod anthropic_oauth;
 mod bedrock;
 pub mod circuit_breaker;
 mod cleaning_provider;
+pub mod claude_sidecar;
 pub(crate) mod codex_auth;
 mod codex_chatgpt;
 pub mod config;
