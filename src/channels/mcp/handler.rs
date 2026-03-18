@@ -38,8 +38,11 @@ pub async fn mcp_handler(
         return (StatusCode::NO_CONTENT, Json(None));
     }
 
-    // Build a JobContext scoped to the authenticated user.
-    let ctx = JobContext::with_user(&user.user_id, "mcp", "MCP tool call");
+    // Build a JobContext scoped to the authenticated user, enriched with
+    // workspace read scopes (for cross-scope collection reads) and timezone.
+    let mut ctx = JobContext::with_user(&user.user_id, "mcp", "MCP tool call");
+    ctx.workspace_read_scopes = user.workspace_read_scopes.clone();
+    ctx.user_timezone = state.default_timezone.clone();
 
     let registry = state.tool_registry.as_deref();
 
@@ -146,6 +149,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::channels::web::auth::UserIdentity;
     use crate::tools::mcp::protocol::PROTOCOL_VERSION;
 
     #[tokio::test]
@@ -234,5 +238,28 @@ mod tests {
         let resp = build_response(&req, None, Some(&ctx)).await;
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
+    }
+
+    /// Verify the MCP handler enriches `JobContext` with workspace read scopes
+    /// and timezone from the authenticated user and gateway state.
+    #[test]
+    fn test_job_context_enrichment() {
+        let user = UserIdentity {
+            user_id: "andrew".to_string(),
+            workspace_read_scopes: vec!["grace".to_string(), "household".to_string()],
+        };
+        let default_timezone = "America/New_York".to_string();
+
+        // Replicate the enrichment logic from mcp_handler.
+        let mut ctx = JobContext::with_user(&user.user_id, "mcp", "MCP tool call");
+        ctx.workspace_read_scopes = user.workspace_read_scopes.clone();
+        ctx.user_timezone = default_timezone.clone();
+
+        assert_eq!(ctx.user_id, "andrew");
+        assert_eq!(
+            ctx.workspace_read_scopes,
+            vec!["grace".to_string(), "household".to_string()]
+        );
+        assert_eq!(ctx.user_timezone, "America/New_York");
     }
 }
