@@ -788,6 +788,33 @@ impl AppBuilder {
             tools.register_dev_tools();
         }
 
+        // Load Percy service registry (if configured via SERVICES_CONFIG)
+        let service_registry = match self.config.services_config_path.as_ref() {
+            Some(path) => {
+                match ServiceRegistry::load_from_file(std::path::Path::new(path)) {
+                    Ok(registry) => {
+                        tracing::info!(
+                            "Loaded {} MCP service(s) from {}",
+                            registry.len(),
+                            path
+                        );
+                        Some(Arc::new(registry))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load service registry from {}: {}", path, e);
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let service_cache = service_registry.as_ref().map(|_| {
+            let cache_dir = crate::bootstrap::ironclaw_base_dir().join("mcp-cache");
+            Arc::new(ServiceCache::new(cache_dir))
+        });
+
+
         Ok((
             mcp_session_manager,
             mcp_process_manager,
