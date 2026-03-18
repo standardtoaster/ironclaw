@@ -180,6 +180,10 @@ pub struct LlmConfig {
     /// Enable cascade mode for smart routing (retry with primary if cheap model
     /// response seems uncertain). Default: true. Set via `SMART_ROUTING_CASCADE`.
     pub smart_routing_cascade: bool,
+    /// Escalation tiers for tool-based model escalation (`LLM_ESCALATION_TIERS`).
+    /// Ordered cheapest-first. The first tier is the default.
+    /// Empty vec means escalation is not configured (single-tier fallback).
+    pub escalation_tiers: Vec<crate::config::TierConfig>,
 }
 
 impl LlmConfig {

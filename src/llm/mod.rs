@@ -76,6 +76,7 @@ pub use retry::{RetryConfig, RetryProvider};
 pub use rig_adapter::RigAdapter;
 pub use session::{SessionConfig, SessionManager, create_session_manager};
 pub use smart_routing::{SmartRoutingConfig, SmartRoutingProvider, TaskComplexity};
+pub use tier::{TierEntry, TierMap};
 pub use token_refreshing::TokenRefreshingProvider;
 
 use std::sync::Arc;
@@ -696,6 +697,80 @@ pub async fn build_provider_chain(
     }
 
     Ok((llm, cheap_llm, recording_handle))
+}
+
+/// Build a `TierMap` for tool-based escalation.
+///
+/// If `LLM_ESCALATION_TIERS` is configured, builds a provider per tier and
+/// returns a multi-tier map (first tier is default). Otherwise, wraps the
+/// given `primary` provider in a single-tier map for backward compatibility.
+pub async fn create_escalation_tier_map(
+    config: &LlmConfig,
+    session: Arc<SessionManager>,
+    primary: Arc<dyn LlmProvider>,
+) -> Result<Arc<TierMap>, LlmError> {
+    if config.escalation_tiers.is_empty() {
+        // Single-tier fallback: wrap the existing provider.
+        let entry = TierEntry {
+            name: "default".to_string(),
+            is_default: true,
+            provider: primary,
+        };
+        return TierMap::new(vec![entry])
+            .map(Arc::new)
+            .map_err(|e| LlmError::RequestFailed {
+                provider: "tier_map".to_string(),
+                reason: e,
+            });
+    }
+
+    let mut entries = Vec::with_capacity(config.escalation_tiers.len());
+    for (i, tier) in config.escalation_tiers.iter().enumerate() {
+        // Build a minimal LlmConfig for this tier.
+        let tier_config = LlmConfig {
+            backend: format!("{}", tier.backend),
+            session: config.session.clone(),
+            nearai: config.nearai.clone(),
+            provider: Some(config::RegistryProviderConfig {
+                backend_id: format!("{}", tier.backend),
+                protocol: crate::llm::registry::ProviderProtocol::OpenAiChat,
+                model: tier.model.clone(),
+                base_url: tier.base_url.clone().unwrap_or_default(),
+                api_key: tier.api_key.clone(),
+                extra_headers: Vec::new(),
+                unsupported_params: Vec::new(),
+            }),
+            bedrock: None,
+            gemini_oauth: None,
+            openai_codex: None,
+            request_timeout_secs: config.request_timeout_secs,
+            cheap_model: None,
+            smart_routing_cascade: false,
+            escalation_tiers: Vec::new(),
+        };
+        let provider = create_llm_provider(&tier_config, session.clone()).await?;
+        // Wrap with CleaningProvider for thinking-tag stripping
+        let provider: Arc<dyn LlmProvider> = Arc::new(CleaningProvider::new(provider));
+        tracing::info!(
+            tier = %tier.name,
+            backend = %tier.backend,
+            model = %tier.model,
+            is_default = (i == 0),
+            "Escalation tier initialized"
+        );
+        entries.push(TierEntry {
+            name: tier.name.clone(),
+            is_default: i == 0, // first tier is default
+            provider,
+        });
+    }
+
+    TierMap::new(entries)
+        .map(Arc::new)
+        .map_err(|e| LlmError::RequestFailed {
+            provider: "tier_map".to_string(),
+            reason: e,
+        })
 }
 
 pub fn create_gemini_oauth_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, LlmError> {
