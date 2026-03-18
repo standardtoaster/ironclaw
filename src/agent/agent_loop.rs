@@ -1649,6 +1649,11 @@ impl Agent {
                 // respond() (no duplicate text).
                 Ok(Some(String::new()))
             }
+            SubmissionResult::NeedUserInput { .. } => {
+                // SSE event was already emitted in thread_ops.
+                // Empty string signals the caller to skip respond().
+                Ok(Some(String::new()))
+            }
         }
     }
 }

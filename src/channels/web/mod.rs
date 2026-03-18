@@ -677,6 +677,38 @@ impl Channel for GatewayChannel {
                 skill_names,
                 thread_id,
             },
+            StatusUpdate::UserInputNeeded {
+                request_id,
+                question,
+                options,
+                metadata: meta,
+            } => AppEvent::UserInputNeeded {
+                request_id,
+                question,
+                options,
+                metadata: meta,
+                thread_id,
+            },
+            StatusUpdate::Escalated {
+                tier,
+                reason,
+                previous_tier,
+            } => AppEvent::Escalated {
+                tier,
+                reason,
+                previous_tier,
+                thread_id,
+            },
+            StatusUpdate::DeEscalated {
+                tier,
+                reason,
+                previous_tier,
+            } => AppEvent::DeEscalated {
+                tier,
+                reason,
+                previous_tier,
+                thread_id,
+            },
         };
 
         self.state.sse.broadcast(event);

@@ -656,6 +656,78 @@ impl Agent {
                     allow_always,
                 })
             }
+            Ok(AgenticLoopResult::NeedUserInput { pending }) => {
+                let request_id = pending.request_id;
+                let question = pending.question.clone();
+                let options = pending.options.clone();
+                let metadata = pending.metadata.clone();
+                thread.await_user_input(pending);
+                let _ = self
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::UserInputNeeded {
+                            request_id: request_id.to_string(),
+                            question: question.clone(),
+                            options: options.clone(),
+                            metadata: metadata.clone(),
+                        },
+                        &message.metadata,
+                    )
+                    .await;
+                Ok(SubmissionResult::NeedUserInput {
+                    request_id,
+                    question,
+                    options,
+                    metadata,
+                })
+            }
+            Ok(AgenticLoopResult::Escalate { reason, tier }) => {
+                // For now, log and return as a status message.
+                // Full provider swap will be wired in a later task.
+                tracing::info!(
+                    reason = %reason,
+                    tier = ?tier,
+                    "Escalation requested by model"
+                );
+                let _ = self
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::Escalated {
+                            tier: tier.clone().unwrap_or_else(|| "next".to_string()),
+                            reason: reason.clone(),
+                            previous_tier: "default".to_string(),
+                        },
+                        &message.metadata,
+                    )
+                    .await;
+                // Complete the turn with a status message for now
+                let msg = format!("Escalated to {}: {}", tier.unwrap_or_else(|| "next tier".to_string()), reason);
+                thread.complete_turn(&msg);
+                Ok(SubmissionResult::response(msg))
+            }
+            Ok(AgenticLoopResult::DeEscalate { reason }) => {
+                tracing::info!(
+                    reason = ?reason,
+                    "De-escalation requested by model"
+                );
+                let _ = self
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::DeEscalated {
+                            tier: "default".to_string(),
+                            reason: reason.clone(),
+                            previous_tier: "escalated".to_string(),
+                        },
+                        &message.metadata,
+                    )
+                    .await;
+                let msg = reason.unwrap_or_else(|| "De-escalated to default model".to_string());
+                thread.complete_turn(&msg);
+                Ok(SubmissionResult::response(msg))
+            }
             Err(e) => {
                 thread.fail_turn(e.to_string());
                 // User message already persisted at turn start; nothing else to save
@@ -1606,6 +1678,29 @@ impl Agent {
                         parameters,
                         allow_always,
                     })
+                }
+                Ok(AgenticLoopResult::NeedUserInput { pending: ui_pending }) => {
+                    let request_id = ui_pending.request_id;
+                    let question = ui_pending.question.clone();
+                    let options = ui_pending.options.clone();
+                    let meta = ui_pending.metadata.clone();
+                    thread.await_user_input(ui_pending);
+                    Ok(SubmissionResult::NeedUserInput {
+                        request_id,
+                        question,
+                        options,
+                        metadata: meta,
+                    })
+                }
+                Ok(AgenticLoopResult::Escalate { reason, tier }) => {
+                    let msg = format!("Escalated to {}: {}", tier.unwrap_or_else(|| "next tier".to_string()), reason);
+                    thread.complete_turn(&msg);
+                    Ok(SubmissionResult::response(msg))
+                }
+                Ok(AgenticLoopResult::DeEscalate { reason }) => {
+                    let msg = reason.unwrap_or_else(|| "De-escalated to default model".to_string());
+                    thread.complete_turn(&msg);
+                    Ok(SubmissionResult::response(msg))
                 }
                 Err(e) => {
                     thread.fail_turn(e.to_string());

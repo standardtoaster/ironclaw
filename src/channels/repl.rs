@@ -889,6 +889,21 @@ impl Channel for ReplChannel {
                     );
                 }
             }
+            StatusUpdate::UserInputNeeded { question, options, .. } => {
+                eprintln!("\x1b[33m  [ask_user] {question}\x1b[0m");
+                if let Some(opts) = options {
+                    for (i, opt) in opts.iter().enumerate() {
+                        eprintln!("  {}. {}", i + 1, opt);
+                    }
+                }
+            }
+            StatusUpdate::Escalated { tier, reason, .. } => {
+                eprintln!("\x1b[33m  [escalated] → {tier}: {reason}\x1b[0m");
+            }
+            StatusUpdate::DeEscalated { tier, reason, .. } => {
+                let r = reason.as_deref().unwrap_or("done");
+                eprintln!("\x1b[33m  [de-escalated] → {tier}: {r}\x1b[0m");
+            }
         }
         Ok(())
     }

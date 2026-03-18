@@ -369,6 +369,25 @@ pub enum StatusUpdate {
     },
     /// Skills activated for this conversation turn.
     SkillActivated { skill_names: Vec<String> },
+    /// Agent needs user input to proceed (ask_user tool).
+    UserInputNeeded {
+        request_id: String,
+        question: String,
+        options: Option<Vec<String>>,
+        metadata: Option<serde_json::Value>,
+    },
+    /// Model escalated to a higher tier.
+    Escalated {
+        tier: String,
+        reason: String,
+        previous_tier: String,
+    },
+    /// Model de-escalated to the default tier.
+    DeEscalated {
+        tier: String,
+        reason: Option<String>,
+        previous_tier: String,
+    },
 }
 
 /// Shared chat-style approval prompt formatting used by non-web channels.

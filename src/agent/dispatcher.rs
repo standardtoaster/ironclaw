@@ -31,6 +31,20 @@ pub(super) enum AgenticLoopResult {
         /// The pending approval request to store.
         pending: Box<PendingApproval>,
     },
+    /// A tool needs user input before continuing.
+    NeedUserInput {
+        /// The pending user input request.
+        pending: crate::agent::session::PendingUserInput,
+    },
+    /// Model requests escalation to a higher tier.
+    Escalate {
+        reason: String,
+        tier: Option<String>,
+    },
+    /// Model requests de-escalation back to the default tier.
+    DeEscalate {
+        reason: String,
+    },
 }
 
 impl Agent {
