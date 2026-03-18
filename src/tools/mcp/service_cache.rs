@@ -112,4 +112,31 @@ mod tests {
         cache.put("home_assistant", &tools, 0);
         assert!(cache.get("home_assistant").is_none());
     }
+
+    #[test]
+    fn test_get_stale_returns_expired_entries() {
+        let dir = TempDir::new().unwrap();
+        let cache = ServiceCache::new(dir.path().to_path_buf());
+        let tools = vec![CachedTool {
+            name: "ha_turn_on".to_string(),
+            description: "Turn on entity".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        // TTL of 0 seconds -- immediately expired
+        cache.put("home_assistant", &tools, 0);
+        // get() returns None (expired), but get_stale() returns the data
+        assert!(cache.get("home_assistant").is_none());
+        let stale = cache.get_stale("home_assistant");
+        assert!(stale.is_some());
+        let stale = stale.unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].name, "ha_turn_on");
+    }
+
+    #[test]
+    fn test_get_stale_returns_none_for_missing() {
+        let dir = TempDir::new().unwrap();
+        let cache = ServiceCache::new(dir.path().to_path_buf());
+        assert!(cache.get_stale("nonexistent").is_none());
+    }
 }
