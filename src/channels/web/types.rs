@@ -277,6 +277,40 @@ pub enum SseEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+
+    /// Model escalated to a higher tier.
+    #[serde(rename = "escalated")]
+    Escalated {
+        tier: String,
+        reason: String,
+        previous_tier: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+    },
+
+    /// Model de-escalated to the default tier.
+    #[serde(rename = "de_escalated")]
+    DeEscalated {
+        tier: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        previous_tier: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+    },
+
+    /// Agent needs user input to proceed (ask_user tool).
+    #[serde(rename = "user_input_needed")]
+    UserInputNeeded {
+        request_id: String,
+        question: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        options: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+    },
 }
 
 // --- Memory ---
@@ -817,6 +851,9 @@ impl WsServerMessage {
             SseEvent::Suggestions { .. } => "suggestions",
             SseEvent::TurnCost { .. } => "turn_cost",
             SseEvent::ExtensionStatus { .. } => "extension_status",
+            SseEvent::Escalated { .. } => "escalated",
+            SseEvent::DeEscalated { .. } => "de_escalated",
+            SseEvent::UserInputNeeded { .. } => "user_input_needed",
         };
         let data = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
         WsServerMessage::Event {
