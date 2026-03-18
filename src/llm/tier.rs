@@ -283,4 +283,87 @@ mod tests {
         let map = two_tier_map();
         assert_eq!(map.tier_names(), vec!["local", "claude"]);
     }
+
+    /// Full escalation flow E2E test:
+    /// 1. Start on "local" tier (default)
+    /// 2. Escalate to "claude"
+    /// 3. Verify provider swapped
+    /// 4. Verify sticky (stays on claude)
+    /// 5. De-escalate
+    /// 6. Verify reverted to "local"
+    /// 7. Verify escalate_to(None) works (next tier up)
+    #[test]
+    fn test_full_escalation_flow_e2e() {
+        let map = TierMap::new(vec![
+            TierEntry {
+                name: "local".into(),
+                is_default: true,
+                provider: mock_provider("local-model"),
+            },
+            TierEntry {
+                name: "claude".into(),
+                is_default: false,
+                provider: mock_provider("claude-sonnet"),
+            },
+            TierEntry {
+                name: "opus".into(),
+                is_default: false,
+                provider: mock_provider("claude-opus"),
+            },
+        ])
+        .unwrap();
+
+        // 1. Starts on default tier
+        assert_eq!(map.current_tier(), "local");
+        assert_eq!(map.current_provider().model_name(), "local-model");
+
+        // 2. Escalate by name to "claude"
+        let new_tier = map.escalate_to(Some("claude")).unwrap();
+        assert_eq!(new_tier, "claude");
+
+        // 3. Provider swapped
+        assert_eq!(map.current_provider().model_name(), "claude-sonnet");
+
+        // 4. Sticky: stays on claude
+        assert_eq!(map.current_tier(), "claude");
+        assert_eq!(map.current_provider().model_name(), "claude-sonnet");
+
+        // 4b. Escalate further to opus
+        let new_tier = map.escalate_to(Some("opus")).unwrap();
+        assert_eq!(new_tier, "opus");
+        assert_eq!(map.current_provider().model_name(), "claude-opus");
+
+        // 5. De-escalate reverts to default, not one step down
+        let reverted = map.de_escalate();
+        assert_eq!(reverted, "local");
+
+        // 6. Back on local
+        assert_eq!(map.current_tier(), "local");
+        assert_eq!(map.current_provider().model_name(), "local-model");
+
+        // 7. Escalate with None = next tier up
+        let next = map.escalate_to(None).unwrap();
+        assert_eq!(next, "claude");
+        assert_eq!(map.current_provider().model_name(), "claude-sonnet");
+
+        // 8. Escalate with None again = next tier up (opus)
+        let next = map.escalate_to(None).unwrap();
+        assert_eq!(next, "opus");
+        assert_eq!(map.current_provider().model_name(), "claude-opus");
+
+        // 9. At highest, escalate None fails
+        let err = map.escalate_to(None);
+        assert!(err.is_err());
+
+        // 10. But can still de-escalate
+        map.de_escalate();
+        assert_eq!(map.current_tier(), "local");
+    }
+
+    /// Test that TierMap is thread-safe (can be shared across async tasks).
+    #[test]
+    fn test_tier_map_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TierMap>();
+    }
 }
