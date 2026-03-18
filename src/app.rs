@@ -22,7 +22,7 @@ use crate::secrets::SecretsStore;
 use crate::skills::SkillRegistry;
 use crate::skills::catalog::SkillCatalog;
 use crate::tools::ToolRegistry;
-use crate::tools::mcp::{McpProcessManager, McpSessionManager};
+use crate::tools::mcp::{McpProcessManager, McpSessionManager, ServiceCache, ServiceRegistry};
 use crate::tools::wasm::SharedCredentialRegistry;
 use crate::tools::wasm::WasmToolRuntime;
 use crate::workspace::{EmbeddingCacheConfig, EmbeddingProvider, Workspace};
@@ -57,6 +57,8 @@ pub struct AppComponents {
     pub catalog_entries: Vec<crate::extensions::RegistryEntry>,
     pub dev_loaded_tool_names: Vec<String>,
     pub builder: Option<Arc<dyn crate::tools::SoftwareBuilder>>,
+    pub service_registry: Option<Arc<ServiceRegistry>>,
+    pub service_cache: Option<Arc<ServiceCache>>,
 }
 
 /// Options that control optional init phases.
@@ -436,6 +438,7 @@ impl AppBuilder {
     }
 
     /// Phase 5: Load WASM tools, MCP servers, and create extension manager.
+    #[allow(clippy::type_complexity)]
     pub async fn init_extensions(
         &self,
         tools: &Arc<ToolRegistry>,
@@ -448,6 +451,8 @@ impl AppBuilder {
             Option<Arc<ExtensionManager>>,
             Vec<crate::extensions::RegistryEntry>,
             Vec<String>,
+            Option<Arc<ServiceRegistry>>,
+            Option<Arc<ServiceCache>>,
         ),
         anyhow::Error,
     > {
@@ -780,7 +785,6 @@ impl AppBuilder {
             Arc::new(ServiceCache::new(cache_dir))
         });
 
-
         Ok((
             mcp_session_manager,
             mcp_process_manager,
@@ -788,6 +792,8 @@ impl AppBuilder {
             extension_manager,
             catalog_entries,
             dev_loaded_tool_names,
+            service_registry,
+            service_cache,
         ))
     }
 
@@ -830,7 +836,9 @@ impl AppBuilder {
             extension_manager,
             catalog_entries,
             dev_loaded_tool_names,
-        ) = self.init_extensions(&tools, &hooks).await?;
+            service_registry,
+            service_cache,
+        ) = self.init_extensions(&tools, &hooks, &workspace).await?;
 
         // Load bootstrap-completed flag from settings so that existing users
         // who already completed onboarding don't re-get bootstrap injection.
@@ -948,6 +956,8 @@ impl AppBuilder {
             catalog_entries,
             dev_loaded_tool_names,
             builder,
+            service_registry,
+            service_cache,
         })
     }
 }
