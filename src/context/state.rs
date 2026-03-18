@@ -164,6 +164,13 @@ pub struct JobContext {
     /// previous results by ID via `$tool_call_id` parameter syntax.
     #[serde(skip)]
     pub tool_output_stash: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
+    /// Stash of tool signals keyed by tool name.
+    ///
+    /// When a tool returns a `ToolSignal` (e.g., `UserInputNeeded`, `Escalate`),
+    /// it is stored here by `execute_chat_tool_standalone` so the dispatcher
+    /// can intercept it in the post-flight phase.
+    #[serde(skip)]
+    pub tool_signal_stash: Arc<tokio::sync::RwLock<HashMap<String, crate::tools::ToolSignal>>>,
     /// User's preferred timezone (IANA name, e.g. "America/New_York"). Defaults to "UTC".
     pub user_timezone: String,
     /// Additional user scopes this user can read from (e.g. other lenses' collections).
@@ -209,6 +216,7 @@ impl JobContext {
             http_interceptor: None,
             metadata: serde_json::Value::Null,
             tool_output_stash: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            tool_signal_stash: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             user_timezone: "UTC".to_string(),
             workspace_read_scopes: Vec::new(),
         }

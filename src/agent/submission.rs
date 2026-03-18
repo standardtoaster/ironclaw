@@ -417,6 +417,18 @@ pub enum SubmissionResult {
         parameters: serde_json::Value,
     },
 
+    /// Need user input before continuing (ask_user tool).
+    NeedUserInput {
+        /// ID of the user input request.
+        request_id: Uuid,
+        /// The question being asked.
+        question: String,
+        /// Named choices (if any).
+        options: Option<Vec<String>>,
+        /// Arbitrary metadata for renderers.
+        metadata: Option<serde_json::Value>,
+    },
+
     /// Successfully processed (for control commands).
     Ok {
         /// Optional message.

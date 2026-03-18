@@ -238,6 +238,25 @@ pub enum StatusUpdate {
         /// Optional workspace path where the image was saved.
         path: Option<String>,
     },
+    /// Agent needs user input to proceed (ask_user tool).
+    UserInputNeeded {
+        request_id: String,
+        question: String,
+        options: Option<Vec<String>>,
+        metadata: Option<serde_json::Value>,
+    },
+    /// Model escalated to a higher tier.
+    Escalated {
+        tier: String,
+        reason: String,
+        previous_tier: String,
+    },
+    /// Model de-escalated to the default tier.
+    DeEscalated {
+        tier: String,
+        reason: Option<String>,
+        previous_tier: String,
+    },
 }
 
 impl StatusUpdate {

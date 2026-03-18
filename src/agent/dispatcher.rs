@@ -26,6 +26,20 @@ pub(super) enum AgenticLoopResult {
         /// The pending approval request to store.
         pending: PendingApproval,
     },
+    /// The `ask_user` tool needs user input before continuing.
+    NeedUserInput {
+        /// The pending user input request to store.
+        pending: crate::agent::session::PendingUserInput,
+    },
+    /// The `escalate` tool wants to swap to a higher-tier provider.
+    Escalate {
+        reason: String,
+        tier: Option<String>,
+    },
+    /// The `de_escalate` tool wants to revert to the default provider.
+    DeEscalate {
+        reason: Option<String>,
+    },
 }
 
 impl Agent {
@@ -995,6 +1009,54 @@ impl Agent {
                         return Ok(AgenticLoopResult::Response(instructions));
                     }
 
+                    // Check for tool signals (escalation, user input, etc.)
+                    {
+                        let mut stash = job_ctx.tool_signal_stash.write().await;
+                        if let Some((_tool, signal)) = stash.drain().next() {
+                            match signal {
+                                crate::tools::ToolSignal::UserInputNeeded {
+                                    question,
+                                    options,
+                                    metadata,
+                                } => {
+                                    // Find the tool call that emitted the signal
+                                    // (it's the ask_user call from the current batch)
+                                    let ask_user_tc = tool_calls
+                                        .iter()
+                                        .find(|tc| tc.name == "ask_user");
+                                    let tool_call_id = ask_user_tc
+                                        .map(|tc| tc.id.clone())
+                                        .unwrap_or_default();
+                                    let pending =
+                                        crate::agent::session::PendingUserInput {
+                                            request_id: Uuid::new_v4(),
+                                            question,
+                                            options,
+                                            metadata,
+                                            tool_call_id,
+                                            context_messages: context_messages.clone(),
+                                            deferred_tool_calls: Vec::new(),
+                                            user_timezone: Some(
+                                                user_tz.name().to_string(),
+                                            ),
+                                        };
+                                    return Ok(AgenticLoopResult::NeedUserInput {
+                                        pending,
+                                    });
+                                }
+                                crate::tools::ToolSignal::Escalate { reason, tier } => {
+                                    return Ok(AgenticLoopResult::Escalate {
+                                        reason,
+                                        tier,
+                                    });
+                                }
+                                crate::tools::ToolSignal::DeEscalate { reason } => {
+                                    return Ok(AgenticLoopResult::DeEscalate { reason });
+                                }
+                            }
+                        }
+                    }
+
                     // Handle approval if a tool needed it
                     if let Some((approval_idx, tc, tool)) = approval_needed {
                         // Show redacted params in the approval UI — the user already knows
@@ -1132,7 +1194,7 @@ pub(super) async fn execute_chat_tool_standalone(
         }
     }
 
-    let result = result
+    let output = result
         .map_err(|_| crate::error::ToolError::Timeout {
             name: tool_name.to_string(),
             timeout,
@@ -1142,7 +1204,16 @@ pub(super) async fn execute_chat_tool_standalone(
             reason: e.to_string(),
         })?;
 
-    serde_json::to_string_pretty(&result.result).map_err(|e| {
+    // Stash signal in job context for the dispatcher to intercept.
+    if let Some(signal) = output.signal {
+        job_ctx
+            .tool_signal_stash
+            .write()
+            .await
+            .insert(tool_name.to_string(), signal);
+    }
+
+    serde_json::to_string_pretty(&output.result).map_err(|e| {
         crate::error::ToolError::ExecutionFailed {
             name: tool_name.to_string(),
             reason: format!("Failed to serialize result: {}", e),
@@ -2365,8 +2436,8 @@ mod tests {
             super::AgenticLoopResult::Response(text) => {
                 assert!(!text.is_empty(), "Expected non-empty forced text response");
             }
-            super::AgenticLoopResult::NeedApproval { .. } => {
-                panic!("Expected text response, got NeedApproval");
+            other => {
+                panic!("Expected text response, got {:?}", std::mem::discriminant(&other));
             }
         }
     }

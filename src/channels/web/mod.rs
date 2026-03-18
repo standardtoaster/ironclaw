@@ -466,6 +466,38 @@ impl Channel for GatewayChannel {
                 path,
                 thread_id,
             },
+            StatusUpdate::UserInputNeeded {
+                request_id,
+                question,
+                options,
+                metadata: meta,
+            } => SseEvent::UserInputNeeded {
+                request_id,
+                question,
+                options,
+                metadata: meta,
+                thread_id,
+            },
+            StatusUpdate::Escalated {
+                tier,
+                reason,
+                previous_tier,
+            } => SseEvent::Escalated {
+                tier,
+                reason,
+                previous_tier,
+                thread_id,
+            },
+            StatusUpdate::DeEscalated {
+                tier,
+                reason,
+                previous_tier,
+            } => SseEvent::DeEscalated {
+                tier,
+                reason,
+                previous_tier,
+                thread_id,
+            },
         };
 
         // Scope events to the user when user_id is available in metadata.
