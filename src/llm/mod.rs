@@ -28,6 +28,7 @@ pub mod retry;
 mod rig_adapter;
 pub mod session;
 pub mod smart_routing;
+pub mod tier;
 
 pub mod image_models;
 pub mod vision_models;
