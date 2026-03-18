@@ -180,6 +180,9 @@ impl SseManager {
                     SseEvent::ImageGenerated { .. } => "image_generated",
                     SseEvent::ExtensionStatus { .. } => "extension_status",
                     SseEvent::WorkspaceRouted { .. } => "workspace_routed",
+                    SseEvent::Escalated { .. } => "escalated",
+                    SseEvent::DeEscalated { .. } => "de_escalated",
+                    SseEvent::UserInputNeeded { .. } => "user_input_needed",
                 };
                 Ok(Event::default().event(event_type).data(data))
             });
