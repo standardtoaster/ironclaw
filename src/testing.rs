@@ -458,6 +458,7 @@ impl TestHarnessBuilder {
             core_tools: Vec::new(),
             organize_rx: None,
             workspace_pool: None,
+            tier_map: None,
         };
 
         TestHarness {

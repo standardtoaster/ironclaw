@@ -132,6 +132,10 @@ pub struct LlmConfig {
     /// N-tier routing tiers (populated when `LLM_ROUTING_TIERS` is set).
     /// Ordered cheapest-first. Empty vec means N-tier routing is not configured.
     pub routing_tiers: Vec<crate::config::TierConfig>,
+    /// Escalation tiers for tool-based model escalation (`LLM_ESCALATION_TIERS`).
+    /// Ordered cheapest-first. The first tier is the default.
+    /// Empty vec means escalation is not configured (single-tier fallback).
+    pub escalation_tiers: Vec<crate::config::TierConfig>,
 }
 
 /// NEAR AI configuration.

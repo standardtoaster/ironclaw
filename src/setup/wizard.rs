@@ -1613,6 +1613,7 @@ impl SetupWizard {
             bedrock: None,
             request_timeout_secs: 120,
             routing_tiers: Vec::new(),
+            escalation_tiers: Vec::new(),
         };
 
         match create_llm_provider(&config, session).await {

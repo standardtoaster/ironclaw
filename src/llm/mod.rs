@@ -64,6 +64,8 @@ pub use smart_routing::{
     TaskComplexity, META_ROUTING_OPERATION, META_ROUTING_SKILL_HINTS,
 };
 
+pub use tier::{TierEntry, TierMap};
+
 use std::sync::Arc;
 
 use rig::client::CompletionClient;
@@ -383,6 +385,7 @@ async fn create_tier_provider(
             bedrock: None,
             request_timeout_secs: 300,
             routing_tiers: Vec::new(),
+            escalation_tiers: Vec::new(),
         };
         return create_llm_provider(&config, session).await;
     }
@@ -423,6 +426,7 @@ async fn create_tier_provider(
         bedrock: None,
         request_timeout_secs: 300,
         routing_tiers: Vec::new(),
+        escalation_tiers: Vec::new(),
     };
 
     create_llm_provider(&config, session).await
@@ -656,6 +660,58 @@ pub async fn build_provider_chain(
     Ok((llm, cheap_llm, recording_handle))
 }
 
+/// Build a `TierMap` for tool-based escalation.
+///
+/// If `LLM_ESCALATION_TIERS` is configured, builds a provider per tier and
+/// returns a multi-tier map (first tier is default). Otherwise, wraps the
+/// given `primary` provider in a single-tier map for backward compatibility.
+pub async fn create_escalation_tier_map(
+    config: &LlmConfig,
+    session: Arc<SessionManager>,
+    primary: Arc<dyn LlmProvider>,
+) -> Result<Arc<TierMap>, LlmError> {
+    if config.escalation_tiers.is_empty() {
+        // Single-tier fallback: wrap the existing provider.
+        let entry = TierEntry {
+            name: "default".to_string(),
+            is_default: true,
+            provider: primary,
+        };
+        return TierMap::new(vec![entry])
+            .map(Arc::new)
+            .map_err(|e| LlmError::RequestFailed {
+                provider: "tier_map".to_string(),
+                reason: e,
+            });
+    }
+
+    let mut entries = Vec::with_capacity(config.escalation_tiers.len());
+    for (i, tier) in config.escalation_tiers.iter().enumerate() {
+        let provider = create_tier_provider(tier, session.clone()).await?;
+        // Wrap with CleaningProvider for thinking-tag stripping
+        let provider: Arc<dyn LlmProvider> = Arc::new(CleaningProvider::new(provider));
+        tracing::info!(
+            tier = %tier.name,
+            backend = %tier.backend,
+            model = %tier.model,
+            is_default = (i == 0),
+            "Escalation tier initialized"
+        );
+        entries.push(TierEntry {
+            name: tier.name.clone(),
+            is_default: i == 0, // first tier is default
+            provider,
+        });
+    }
+
+    TierMap::new(entries)
+        .map(Arc::new)
+        .map_err(|e| LlmError::RequestFailed {
+            provider: "tier_map".to_string(),
+            reason: e,
+        })
+}
+
 /// Create an LLM provider from a per-user LLM config.
 ///
 /// This builds a minimal provider (no retry, failover, smart routing, or cache)
@@ -861,6 +917,7 @@ mod tests {
             bedrock: None,
             request_timeout_secs: 300,
             routing_tiers: Vec::new(),
+            escalation_tiers: Vec::new(),
         }
     }
 
@@ -899,5 +956,25 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_create_escalation_tier_map_single_tier_fallback() {
+        // When no escalation tiers configured, wraps primary in a single-tier map.
+        let config = test_llm_config();
+        let session = Arc::new(SessionManager::new(SessionConfig::default()));
+        let primary = create_llm_provider_with_config(
+            &config.nearai,
+            session.clone(),
+            config.request_timeout_secs,
+        )
+        .expect("should create provider");
+
+        let tier_map = create_escalation_tier_map(&config, session, primary)
+            .await
+            .expect("should create tier map");
+        assert_eq!(tier_map.tier_count(), 1);
+        assert_eq!(tier_map.default_tier(), "default");
+        assert_eq!(tier_map.current_tier(), "default");
     }
 }

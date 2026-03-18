@@ -263,9 +263,10 @@ impl Agent {
             None
         };
 
-        let mut reasoning = Reasoning::new(self.llm().clone())
+        let active_provider = self.active_llm();
+        let mut reasoning = Reasoning::new(active_provider.clone())
             .with_channel(message.channel.clone())
-            .with_model_name(self.llm().active_model_name())
+            .with_model_name(active_provider.active_model_name())
             .with_group_chat(is_group_chat);
 
         // Pass channel-specific conversation context to the LLM.
@@ -488,9 +489,9 @@ impl Agent {
             };
 
             // Record cost and track token usage
-            let model_name = self.llm().active_model_name();
-            let read_discount = self.llm().cache_read_discount();
-            let write_multiplier = self.llm().cache_write_multiplier();
+            let model_name = active_provider.active_model_name();
+            let read_discount = active_provider.cache_read_discount();
+            let write_multiplier = active_provider.cache_write_multiplier();
             let call_cost = self
                 .cost_guard()
                 .record_llm_call(
@@ -501,7 +502,7 @@ impl Agent {
                     output.usage.cache_creation_input_tokens,
                     read_discount,
                     write_multiplier,
-                    Some(self.llm().cost_per_token()),
+                    Some(active_provider.cost_per_token()),
                 )
                 .await;
             tracing::debug!(
@@ -1494,6 +1495,7 @@ mod tests {
             core_tools: Vec::new(),
             organize_rx: None,
             workspace_pool: None,
+            tier_map: None,
         };
 
         Agent::new(
@@ -2248,6 +2250,7 @@ mod tests {
             core_tools: Vec::new(),
             organize_rx: None,
             workspace_pool: None,
+            tier_map: None,
         };
 
         Agent::new(
@@ -2370,6 +2373,7 @@ mod tests {
                 core_tools: Vec::new(),
                 organize_rx: None,
                 workspace_pool: None,
+                tier_map: None,
             };
 
             Agent::new(

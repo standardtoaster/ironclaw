@@ -424,48 +424,155 @@ impl Agent {
                 })
             }
             Ok(AgenticLoopResult::Escalate { reason, tier }) => {
-                // For now, log and return as a status message.
-                // Full provider swap will be wired in a later task.
+                let previous_tier = self
+                    .tier_map()
+                    .map(|tm| tm.current_tier())
+                    .unwrap_or_else(|| "default".to_string());
+
+                // Perform the actual provider swap via TierMap.
+                let new_tier = if let Some(ref tier_map) = self.deps.tier_map {
+                    match tier_map.escalate_to(tier.as_deref()) {
+                        Ok(name) => name,
+                        Err(e) => {
+                            tracing::warn!(
+                                reason = %reason,
+                                error = %e,
+                                "Escalation failed"
+                            );
+                            let msg = format!("Escalation failed: {e}");
+                            thread.complete_turn(&msg);
+                            return Ok(SubmissionResult::response(msg));
+                        }
+                    }
+                } else {
+                    tracing::info!(
+                        reason = %reason,
+                        tier = ?tier,
+                        "Escalation requested but no tier map configured"
+                    );
+                    let msg = format!(
+                        "Escalation requested ({}) but no escalation tiers configured",
+                        reason
+                    );
+                    thread.complete_turn(&msg);
+                    return Ok(SubmissionResult::response(msg));
+                };
+
                 tracing::info!(
                     reason = %reason,
-                    tier = ?tier,
-                    "Escalation requested by model"
+                    previous_tier = %previous_tier,
+                    new_tier = %new_tier,
+                    "Escalated to higher-tier provider"
                 );
+
                 let _ = self
                     .channels
                     .send_status(
                         &message.channel,
                         StatusUpdate::Escalated {
-                            tier: tier.clone().unwrap_or_else(|| "next".to_string()),
+                            tier: new_tier.clone(),
                             reason: reason.clone(),
-                            previous_tier: "default".to_string(),
+                            previous_tier: previous_tier.clone(),
                         },
                         &message.metadata,
                     )
                     .await;
-                // Complete the turn with a status message for now
-                let msg = format!("Escalated to {}: {}", tier.unwrap_or_else(|| "next tier".to_string()), reason);
-                thread.complete_turn(&msg);
-                Ok(SubmissionResult::response(msg))
+
+                // Discard the escalating model's partial response and
+                // re-run the agentic loop on the new (escalated) provider.
+                // We keep the turn (already started) and just re-run the LLM.
+                let turn_messages = thread.messages();
+                // Reset turn state so the loop can complete it
+                thread.state = ThreadState::Processing;
+                drop(sess);
+
+                // Re-run the agentic loop with the escalated provider.
+                // The dispatcher will pick up the new provider via active_llm().
+                let replay_result = self
+                    .run_agentic_loop(message, session.clone(), thread_id, turn_messages)
+                    .await;
+
+                // Re-acquire lock and handle the replayed result
+                let mut sess = session.lock().await;
+                let thread = sess
+                    .threads
+                    .get_mut(&thread_id)
+                    .ok_or_else(|| {
+                        Error::from(crate::error::JobError::NotFound { id: thread_id })
+                    })?;
+
+                match replay_result {
+                    Ok(AgenticLoopResult::Response(response)) => {
+                        thread.complete_turn(&response);
+                        let (turn_number, tool_calls) = thread
+                            .turns
+                            .last()
+                            .map(|t| (t.turn_number, t.tool_calls.clone()))
+                            .unwrap_or_default();
+                        self.persist_tool_calls(
+                            thread_id,
+                            &message.user_id,
+                            turn_number,
+                            &tool_calls,
+                        )
+                        .await;
+                        self.persist_assistant_response(
+                            thread_id,
+                            &message.user_id,
+                            &response,
+                        )
+                        .await;
+                        Ok(SubmissionResult::response(response))
+                    }
+                    Ok(_other) => {
+                        // For any other result (approval, user input, nested
+                        // escalation, de-escalation), complete with a status msg.
+                        let msg = format!("Escalated to {new_tier}, awaiting further processing");
+                        thread.complete_turn(&msg);
+                        Ok(SubmissionResult::response(msg))
+                    }
+                    Err(e) => {
+                        thread.fail_turn(e.to_string());
+                        Ok(SubmissionResult::error(e.to_string()))
+                    }
+                }
             }
             Ok(AgenticLoopResult::DeEscalate { reason }) => {
+                let previous_tier = self
+                    .tier_map()
+                    .map(|tm| tm.current_tier())
+                    .unwrap_or_else(|| "default".to_string());
+
+                // Perform the actual de-escalation.
+                let new_tier = if let Some(ref tier_map) = self.deps.tier_map {
+                    tier_map.de_escalate()
+                } else {
+                    "default".to_string()
+                };
+
                 tracing::info!(
                     reason = ?reason,
-                    "De-escalation requested by model"
+                    previous_tier = %previous_tier,
+                    new_tier = %new_tier,
+                    "De-escalated to default provider"
                 );
+
                 let _ = self
                     .channels
                     .send_status(
                         &message.channel,
                         StatusUpdate::DeEscalated {
-                            tier: "default".to_string(),
+                            tier: new_tier.clone(),
                             reason: reason.clone(),
-                            previous_tier: "escalated".to_string(),
+                            previous_tier: previous_tier.clone(),
                         },
                         &message.metadata,
                     )
                     .await;
-                let msg = reason.unwrap_or_else(|| "De-escalated to default model".to_string());
+
+                let msg = reason.unwrap_or_else(|| {
+                    format!("De-escalated to {} model", new_tier)
+                });
                 thread.complete_turn(&msg);
                 Ok(SubmissionResult::response(msg))
             }
@@ -1331,11 +1438,23 @@ impl Agent {
                     })
                 }
                 Ok(AgenticLoopResult::Escalate { reason, tier }) => {
-                    let msg = format!("Escalated to {}: {}", tier.unwrap_or_else(|| "next tier".to_string()), reason);
+                    // Perform actual provider swap during approval-resume path.
+                    if let Some(ref tier_map) = self.deps.tier_map
+                        && let Err(e) = tier_map.escalate_to(tier.as_deref())
+                    {
+                        let msg = format!("Escalation failed: {e}");
+                        thread.complete_turn(&msg);
+                        return Ok(SubmissionResult::response(msg));
+                    }
+                    let new_tier = tier.unwrap_or_else(|| "next tier".to_string());
+                    let msg = format!("Escalated to {new_tier}: {reason}");
                     thread.complete_turn(&msg);
                     Ok(SubmissionResult::response(msg))
                 }
                 Ok(AgenticLoopResult::DeEscalate { reason }) => {
+                    if let Some(ref tier_map) = self.deps.tier_map {
+                        tier_map.de_escalate();
+                    }
                     let msg = reason.unwrap_or_else(|| "De-escalated to default model".to_string());
                     thread.complete_turn(&msg);
                     Ok(SubmissionResult::response(msg))

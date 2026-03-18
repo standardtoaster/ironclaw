@@ -823,7 +823,7 @@ async fn async_main() -> anyhow::Result<()> {
         ))
     });
 
-    let deps = AgentDeps {
+    let mut deps = AgentDeps {
         store: components.db,
         llm: components.llm,
         cheap_llm: components.cheap_llm,
@@ -850,7 +850,34 @@ async fn async_main() -> anyhow::Result<()> {
         core_tools: config.core_tools.clone(),
         organize_rx: Some(organize_rx),
         workspace_pool: agent_workspace_pool,
+        tier_map: None,
     };
+
+    // Initialize escalation tier map if configured.
+    if !config.llm.escalation_tiers.is_empty() {
+        match ironclaw::llm::create_escalation_tier_map(
+            &config.llm,
+            session.clone(),
+            deps.llm.clone(),
+        )
+        .await
+        {
+            Ok(tier_map) => {
+                tracing::info!(
+                    tiers = ?tier_map.tier_names(),
+                    default = %tier_map.default_tier(),
+                    "Escalation tier map initialized"
+                );
+                deps.tier_map = Some(tier_map);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to initialize escalation tiers, escalation tools will be no-ops"
+                );
+            }
+        }
+    }
 
     let mut agent = Agent::new(
         config.agent.clone(),
