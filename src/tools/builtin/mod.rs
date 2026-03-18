@@ -5,6 +5,7 @@ pub mod collections;
 mod conversation;
 pub mod generic_collections;
 mod echo;
+pub mod escalate;
 pub mod extension_tools;
 mod file;
 mod http;
@@ -24,6 +25,7 @@ mod tool_info;
 
 pub use conversation::ConversationLoadTool;
 pub use echo::EchoTool;
+pub use escalate::{DeescalateTool, EscalateTool};
 pub use extension_tools::{
     ExtensionInfoTool, ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool,
     ToolRemoveTool, ToolSearchTool, ToolUpgradeTool,
