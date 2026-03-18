@@ -354,4 +354,169 @@ mod tests {
         let output = result.unwrap();
         assert!(output.result.as_str().unwrap_or("").contains("No tools found"));
     }
+
+    #[test]
+    fn test_with_services_constructor() {
+        let registry = Arc::new(ToolRegistry::new());
+        let svc_registry = Arc::new(ServiceRegistry::from_configs(vec![]));
+        let tool = DiscoverToolsTool::with_services(
+            registry,
+            Some(svc_registry),
+            None,
+        );
+        assert_eq!(tool.name(), "discover_tools");
+        assert!(tool.service_registry.is_some());
+        assert!(tool.service_cache.is_none());
+    }
+
+    #[test]
+    fn test_build_mcp_client_bearer_auth() {
+        use crate::tools::mcp::service_registry::ServiceAuth;
+        let service = ServiceConfig {
+            name: "test_svc".to_string(),
+            description: "Test".to_string(),
+            url: "http://localhost:8080/mcp".to_string(),
+            auth: ServiceAuth::Bearer {
+                credential: "my-token".to_string(),
+            },
+            scopes: vec![],
+            keywords: vec![],
+            allow: vec!["*".to_string()],
+            deny: vec![],
+            tier: "read".to_string(),
+            lens_overrides: HashMap::new(),
+        };
+        let client = DiscoverToolsTool::build_mcp_client_for_service(&service);
+        assert_eq!(client.server_name(), "test_svc");
+        assert_eq!(client.server_url(), "http://localhost:8080/mcp");
+    }
+
+    #[test]
+    fn test_build_mcp_client_header_auth() {
+        use crate::tools::mcp::service_registry::ServiceAuth;
+        let service = ServiceConfig {
+            name: "custom_svc".to_string(),
+            description: "Test".to_string(),
+            url: "http://localhost:9090/api".to_string(),
+            auth: ServiceAuth::Header {
+                key: "X-Api-Key".to_string(),
+                credential: "secret-key".to_string(),
+            },
+            scopes: vec![],
+            keywords: vec![],
+            allow: vec!["*".to_string()],
+            deny: vec![],
+            tier: "read".to_string(),
+            lens_overrides: HashMap::new(),
+        };
+        let client = DiscoverToolsTool::build_mcp_client_for_service(&service);
+        assert_eq!(client.server_name(), "custom_svc");
+    }
+
+    #[tokio::test]
+    async fn test_phase2_search_only_mode_with_cache() {
+        // Test Phase 2 in search-only mode (load=false) using cached tools
+        let registry = Arc::new(ToolRegistry::new());
+
+        let svc_config = ServiceConfig {
+            name: "test_ha".to_string(),
+            description: "Smart home control".to_string(),
+            url: "http://localhost:9999/mcp".to_string(),
+            auth: ServiceAuth::Bearer {
+                credential: "token".to_string(),
+            },
+            scopes: vec!["andrew".to_string()],
+            keywords: vec!["light".to_string(), "home".to_string()],
+            allow: vec!["*".to_string()],
+            deny: vec!["delete_*".to_string()],
+            tier: "read".to_string(),
+            lens_overrides: HashMap::new(),
+        };
+
+        let svc_registry = Arc::new(ServiceRegistry::from_configs(vec![svc_config]));
+
+        // Pre-populate cache with tool definitions
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = Arc::new(ServiceCache::new(cache_dir.path().to_path_buf()));
+        cache.put(
+            "test_ha",
+            &[
+                CachedTool {
+                    name: "turn_on".to_string(),
+                    description: "Turn on an entity".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                CachedTool {
+                    name: "delete_entity".to_string(),
+                    description: "Delete an entity".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+            ],
+            3600,
+        );
+
+        let tool = DiscoverToolsTool::with_services(
+            Arc::clone(&registry),
+            Some(svc_registry),
+            Some(cache),
+        );
+
+        let ctx = crate::context::JobContext::with_user("andrew", "test", "test");
+        let params = serde_json::json!({"query": "light", "load": false});
+        let result = tool.execute(params, &ctx).await;
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        let text = output.result.as_str().unwrap_or("");
+        // Should find turn_on (allowed) but NOT delete_entity (denied by delete_*)
+        assert!(text.contains("test_ha_turn_on"), "should list turn_on: {}", text);
+        assert!(!text.contains("delete_entity"), "should filter out delete_entity: {}", text);
+    }
+
+    #[tokio::test]
+    async fn test_phase2_respects_scope() {
+        let registry = Arc::new(ToolRegistry::new());
+
+        let svc_config = ServiceConfig {
+            name: "test_ha".to_string(),
+            description: "Smart home".to_string(),
+            url: "http://localhost:9999/mcp".to_string(),
+            auth: ServiceAuth::Bearer {
+                credential: "token".to_string(),
+            },
+            scopes: vec!["andrew".to_string()],
+            keywords: vec!["light".to_string()],
+            allow: vec!["*".to_string()],
+            deny: vec![],
+            tier: "read".to_string(),
+            lens_overrides: HashMap::new(),
+        };
+
+        let svc_registry = Arc::new(ServiceRegistry::from_configs(vec![svc_config]));
+
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = Arc::new(ServiceCache::new(cache_dir.path().to_path_buf()));
+        cache.put(
+            "test_ha",
+            &[CachedTool {
+                name: "turn_on".to_string(),
+                description: "Turn on".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            3600,
+        );
+
+        let tool = DiscoverToolsTool::with_services(
+            Arc::clone(&registry),
+            Some(svc_registry),
+            Some(cache),
+        );
+
+        // Grace is not in scopes — should find nothing from Phase 2
+        let ctx = crate::context::JobContext::with_user("grace", "test", "test");
+        let params = serde_json::json!({"query": "light"});
+        let result = tool.execute(params, &ctx).await;
+        assert!(result.is_ok());
+        let text = result.unwrap().result.as_str().unwrap_or("").to_string();
+        assert!(!text.contains("test_ha"), "grace should not see HA tools: {}", text);
+    }
 }
