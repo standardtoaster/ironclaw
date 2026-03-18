@@ -3061,6 +3061,25 @@ fn status_to_wit(
         },
         // Suggestions and turn cost are web-gateway-only; skip for WASM channels
         StatusUpdate::Suggestions { .. } | StatusUpdate::TurnCost { .. } => return None,
+        StatusUpdate::UserInputNeeded { question, .. } => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::Status,
+            message: format!("[ask_user] {}", question),
+            metadata_json,
+        },
+        StatusUpdate::Escalated { tier, reason, .. } => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::Status,
+            message: format!("[escalated] → {}: {}", tier, reason),
+            metadata_json,
+        },
+        StatusUpdate::DeEscalated { tier, reason, .. } => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::Status,
+            message: format!(
+                "[de-escalated] → {}: {}",
+                tier,
+                reason.as_deref().unwrap_or("done")
+            ),
+            metadata_json,
+        },
     })
 }
 
