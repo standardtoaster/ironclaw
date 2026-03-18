@@ -10,6 +10,24 @@ use crate::llm::registry::{ProviderProtocol, ProviderRegistry};
 use crate::llm::session::SessionConfig;
 use crate::settings::Settings;
 
+/// Per-tier configuration for N-tier model routing and escalation.
+///
+/// Each tier represents a backend+model combination ordered by cost (cheapest first).
+/// Parsed from `LLM_ESCALATION_TIERS` + per-tier env vars.
+#[derive(Debug, Clone)]
+pub struct TierConfig {
+    /// Tier name (e.g., "local", "standard", "premium").
+    pub name: String,
+    /// Which backend to use for this tier.
+    pub backend: LlmBackend,
+    /// Model identifier.
+    pub model: String,
+    /// Optional base URL override.
+    pub base_url: Option<String>,
+    /// Optional API key.
+    pub api_key: Option<SecretString>,
+}
+
 impl LlmConfig {
     /// Create a test-friendly config without reading env vars.
     #[cfg(feature = "libsql")]
@@ -43,6 +61,7 @@ impl LlmConfig {
             request_timeout_secs: 120,
             cheap_model: None,
             smart_routing_cascade: false,
+            escalation_tiers: Vec::new(),
         }
     }
 
@@ -241,6 +260,9 @@ impl LlmConfig {
         // Defaults to true. Overrides NearAI-specific smart_routing_cascade.
         let smart_routing_cascade = parse_optional_env("SMART_ROUTING_CASCADE", true)?;
 
+        // Tool-based escalation: LLM_ESCALATION_TIERS=local,claude
+        let escalation_tiers = parse_escalation_tiers()?;
+
         Ok(Self {
             backend: if is_nearai {
                 "nearai".to_string()
@@ -264,6 +286,7 @@ impl LlmConfig {
             request_timeout_secs,
             cheap_model,
             smart_routing_cascade,
+            escalation_tiers,
         })
     }
 
@@ -469,6 +492,71 @@ impl LlmConfig {
             unsupported_params,
         })
     }
+}
+
+/// Parse tool-based escalation tiers from env vars.
+///
+/// Format (same per-tier env vars as routing tiers):
+/// ```text
+/// LLM_ESCALATION_TIERS=local,claude
+/// LLM_TIER_LOCAL_BACKEND=openai_compatible
+/// LLM_TIER_LOCAL_MODEL=percy-instruct
+/// LLM_TIER_LOCAL_BASE_URL=http://localhost:8080/v1
+/// LLM_TIER_CLAUDE_BACKEND=anthropic
+/// LLM_TIER_CLAUDE_MODEL=claude-sonnet-4-20250514
+/// LLM_TIER_CLAUDE_API_KEY=sk-ant-...
+/// ```
+///
+/// Unlike routing tiers, a single tier is valid (the default provider wrapped
+/// in a TierMap for backward compatibility). Empty means no escalation config.
+fn parse_escalation_tiers() -> Result<Vec<TierConfig>, ConfigError> {
+    let Some(tiers_str) = optional_env("LLM_ESCALATION_TIERS")? else {
+        return Ok(Vec::new());
+    };
+
+    let tier_names: Vec<&str> = tiers_str
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if tier_names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut tiers = Vec::with_capacity(tier_names.len());
+    for name in tier_names {
+        let prefix = format!("LLM_TIER_{}", name.to_uppercase());
+
+        let backend_key = format!("{prefix}_BACKEND");
+        let backend_str =
+            optional_env(&backend_key)?.ok_or_else(|| ConfigError::MissingRequired {
+                key: backend_key.clone(),
+                hint: format!("Each tier in LLM_ESCALATION_TIERS needs {prefix}_BACKEND"),
+            })?;
+        let backend: LlmBackend = backend_str.parse().map_err(|e| ConfigError::InvalidValue {
+            key: backend_key,
+            message: e,
+        })?;
+
+        let model_key = format!("{prefix}_MODEL");
+        let model = optional_env(&model_key)?.ok_or_else(|| ConfigError::MissingRequired {
+            key: model_key,
+            hint: format!("Each tier in LLM_ESCALATION_TIERS needs {prefix}_MODEL"),
+        })?;
+
+        let base_url = optional_env(&format!("{prefix}_BASE_URL"))?;
+        let api_key = optional_env(&format!("{prefix}_API_KEY"))?.map(SecretString::from);
+
+        tiers.push(TierConfig {
+            name: name.to_string(),
+            backend,
+            model,
+            base_url,
+            api_key,
+        });
+    }
+
+    Ok(tiers)
 }
 
 /// Parse `LLM_EXTRA_HEADERS` value into a list of (key, value) pairs.
@@ -1393,5 +1481,90 @@ mod tests {
         unsafe {
             std::env::remove_var("OPENAI_CODEX_AUTH_URL");
         }
+    }
+
+    // ── Escalation tier tests ──────────────────────────────────────
+
+    /// Clear all escalation tier env vars.
+    fn clear_escalation_tier_env() {
+        // SAFETY: Only called under ENV_MUTEX in tests.
+        unsafe {
+            std::env::remove_var("LLM_ESCALATION_TIERS");
+            for name in ["LOCAL", "CLAUDE", "PREMIUM"] {
+                std::env::remove_var(format!("LLM_TIER_{name}_BACKEND"));
+                std::env::remove_var(format!("LLM_TIER_{name}_MODEL"));
+                std::env::remove_var(format!("LLM_TIER_{name}_BASE_URL"));
+                std::env::remove_var(format!("LLM_TIER_{name}_API_KEY"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_escalation_tiers_not_set_returns_empty() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_escalation_tier_env();
+
+        let tiers = parse_escalation_tiers().expect("should succeed");
+        assert!(tiers.is_empty());
+    }
+
+    #[test]
+    fn test_escalation_tiers_single_tier_allowed() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_escalation_tier_env();
+        unsafe {
+            std::env::set_var("LLM_ESCALATION_TIERS", "local");
+            std::env::set_var("LLM_TIER_LOCAL_BACKEND", "ollama");
+            std::env::set_var("LLM_TIER_LOCAL_MODEL", "llama3.1:8b");
+        }
+
+        // Unlike routing tiers, a single escalation tier is valid (backward compat)
+        let tiers = parse_escalation_tiers().expect("should succeed");
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0].name, "local");
+
+        clear_escalation_tier_env();
+    }
+
+    #[test]
+    fn test_escalation_tiers_two_tiers_parsed() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_escalation_tier_env();
+        unsafe {
+            std::env::set_var("LLM_ESCALATION_TIERS", "local,claude");
+            std::env::set_var("LLM_TIER_LOCAL_BACKEND", "openai_compatible");
+            std::env::set_var("LLM_TIER_LOCAL_MODEL", "percy-instruct");
+            std::env::set_var("LLM_TIER_LOCAL_BASE_URL", "http://localhost:8080/v1");
+            std::env::set_var("LLM_TIER_CLAUDE_BACKEND", "anthropic");
+            std::env::set_var("LLM_TIER_CLAUDE_MODEL", "claude-sonnet-4-20250514");
+            std::env::set_var("LLM_TIER_CLAUDE_API_KEY", "sk-ant-test");
+        }
+
+        let tiers = parse_escalation_tiers().expect("should succeed");
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0].name, "local");
+        assert_eq!(tiers[0].backend, LlmBackend::OpenAiCompatible);
+        assert_eq!(tiers[1].name, "claude");
+        assert_eq!(tiers[1].backend, LlmBackend::Anthropic);
+        assert!(tiers[1].api_key.is_some());
+
+        clear_escalation_tier_env();
+    }
+
+    #[test]
+    fn test_escalation_tiers_missing_backend_errors() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_escalation_tier_env();
+        unsafe {
+            std::env::set_var("LLM_ESCALATION_TIERS", "local,claude");
+            std::env::set_var("LLM_TIER_LOCAL_BACKEND", "ollama");
+            std::env::set_var("LLM_TIER_LOCAL_MODEL", "llama3.1:8b");
+            // Missing CLAUDE backend/model
+        }
+
+        let result = parse_escalation_tiers();
+        assert!(result.is_err());
+
+        clear_escalation_tier_env();
     }
 }

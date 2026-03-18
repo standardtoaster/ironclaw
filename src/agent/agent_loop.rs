@@ -26,7 +26,7 @@ use crate::db::Database;
 use crate::error::{ChannelError, Error};
 use crate::extensions::ExtensionManager;
 use crate::hooks::HookRegistry;
-use crate::llm::LlmProvider;
+use crate::llm::{LlmProvider, TierMap};
 use crate::safety::SafetyLayer;
 use crate::skills::SkillRegistry;
 use crate::tools::ToolRegistry;
@@ -183,6 +183,10 @@ pub struct AgentDeps {
     /// Resolved LLM backend identifier (e.g., "nearai", "openai", "groq").
     /// Used by `/model` persistence to determine which env var to update.
     pub llm_backend: String,
+    /// Tier map for tool-based model escalation.
+    /// When configured with multiple tiers, `escalate`/`de_escalate` tools
+    /// swap the active provider. When `None`, escalation tools are no-ops.
+    pub tier_map: Option<Arc<TierMap>>,
 }
 
 /// The main agent that coordinates all components.
@@ -299,6 +303,23 @@ impl Agent {
 
     pub(super) fn llm(&self) -> &Arc<dyn LlmProvider> {
         &self.deps.llm
+    }
+
+    /// Get the currently active LLM provider, accounting for escalation.
+    ///
+    /// If a tier map is configured, returns the current tier's provider.
+    /// Otherwise, falls back to the default provider from `deps.llm`.
+    pub(super) fn active_llm(&self) -> Arc<dyn LlmProvider> {
+        if let Some(ref tier_map) = self.deps.tier_map {
+            tier_map.current_provider()
+        } else {
+            self.deps.llm.clone()
+        }
+    }
+
+    /// Get the tier map for model escalation (if configured).
+    pub(super) fn tier_map(&self) -> Option<&Arc<TierMap>> {
+        self.deps.tier_map.as_ref()
     }
 
     /// Get the cheap/fast LLM provider, falling back to the main one.
