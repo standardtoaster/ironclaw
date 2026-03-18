@@ -17,7 +17,8 @@ use crate::tools::builder::{
     BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder, SoftwareBuilder,
 };
 use crate::tools::builtin::{
-    ApplyPatchTool, CancelJobTool, ConversationLoadTool, CreateJobTool, EchoTool,
+    ApplyPatchTool, AskUserTool, CancelJobTool, ConversationLoadTool, CreateJobTool,
+    DeescalateTool, EchoTool, EscalateTool,
     ExtensionInfoTool, HttpTool, JobEventsTool, JobPromptTool, JobStatusTool, JsonTool,
     ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool,
     PromptQueue, ReadFileTool, ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool,
@@ -291,6 +292,14 @@ impl ToolRegistry {
             http = http.with_credentials(Arc::clone(cr), Arc::clone(ss));
         }
         self.register_sync(Arc::new(http));
+
+        // User interaction tool (always available)
+        self.register_sync(Arc::new(AskUserTool));
+
+        // Escalation tools (always registered; signals are handled by the
+        // dispatcher even without a TierMap — they'll just be no-ops)
+        self.register_sync(Arc::new(EscalateTool));
+        self.register_sync(Arc::new(DeescalateTool));
 
         tracing::debug!("Registered {} built-in tools", self.count());
     }
