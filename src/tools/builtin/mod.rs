@@ -10,6 +10,7 @@ mod search_workspace_history;
 mod set_workspace_topic;
 mod workspace_summary;
 mod echo;
+pub mod escalate;
 pub mod extension_tools;
 mod file;
 mod http;
@@ -37,6 +38,7 @@ pub use search_workspace_history::SearchWorkspaceHistoryTool;
 pub use set_workspace_topic::SetWorkspaceTopicTool;
 pub use workspace_summary::WorkspaceSummaryTool;
 pub use echo::EchoTool;
+pub use escalate::{DeescalateTool, EscalateTool};
 pub use extension_tools::{
     ExtensionInfoTool, ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool,
     ToolRemoveTool, ToolSearchTool, ToolUpgradeTool,
