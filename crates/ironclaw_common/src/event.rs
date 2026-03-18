@@ -299,6 +299,40 @@ pub enum AppEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         thread_id: Option<String>,
     },
+
+    /// Model escalated to a higher tier.
+    #[serde(rename = "escalated")]
+    Escalated {
+        tier: String,
+        reason: String,
+        previous_tier: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+    },
+
+    /// Model de-escalated to the default tier.
+    #[serde(rename = "de_escalated")]
+    DeEscalated {
+        tier: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        previous_tier: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+    },
+
+    /// Agent needs user input to proceed (ask_user tool).
+    #[serde(rename = "user_input_needed")]
+    UserInputNeeded {
+        request_id: String,
+        question: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        options: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+    },
 }
 
 impl AppEvent {
@@ -336,6 +370,9 @@ impl AppEvent {
             Self::ChildThreadSpawned { .. } => "child_thread_spawned",
             Self::MissionThreadSpawned { .. } => "mission_thread_spawned",
             Self::PlanUpdate { .. } => "plan_update",
+            Self::Escalated { .. } => "escalated",
+            Self::DeEscalated { .. } => "de_escalated",
+            Self::UserInputNeeded { .. } => "user_input_needed",
         }
     }
 }
