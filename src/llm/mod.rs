@@ -12,6 +12,7 @@ mod anthropic_oauth;
 #[cfg(feature = "bedrock")]
 mod bedrock;
 pub mod circuit_breaker;
+pub mod claude_sidecar;
 mod cleaning_provider;
 pub mod config;
 pub mod costs;
@@ -357,6 +358,28 @@ async fn create_tier_provider(
         .unwrap_or(crate::llm::registry::ProviderProtocol::OpenAiCompletions);
 
     let default_base_url = def.and_then(|d| d.default_base_url.clone()).unwrap_or_default();
+
+    // Claude sidecar doesn't use the registry/HTTP path -- build directly.
+    if tier.backend == LlmBackend::ClaudeSidecar {
+        let sidecar_config = claude_sidecar::SidecarConfig {
+            model: tier.model.clone(),
+            system_prompt_append: None,
+            mcp_config_path: None,
+            working_dir: None,
+            claude_binary: std::env::var("CLAUDE_BINARY")
+                .unwrap_or_else(|_| "claude".to_string()),
+            spawn_timeout_secs: 30,
+            request_timeout_secs: 300,
+        };
+        tracing::info!(
+            tier = %tier.name,
+            model = %tier.model,
+            "Claude sidecar tier provider created"
+        );
+        return Ok(Arc::new(claude_sidecar::ClaudeSidecarProvider::new(
+            sidecar_config,
+        )));
+    }
 
     // Build a minimal LlmConfig for this tier.
     if tier.backend == LlmBackend::NearAi {
@@ -874,9 +897,27 @@ pub fn create_provider_from_user_config(
             return Err(LlmError::RequestFailed {
                 provider: "nearai".to_string(),
                 reason: "NearAI backend is not supported for per-user LLM config; \
-                         use anthropic, openai, ollama, openai_compatible, or tinfoil"
+                         use anthropic, openai, ollama, openai_compatible, tinfoil, or claude_sidecar"
                     .to_string(),
             });
+        }
+        LlmBackend::ClaudeSidecar => {
+            let sidecar_config = claude_sidecar::SidecarConfig {
+                model: user_config.model.clone(),
+                system_prompt_append: None,
+                mcp_config_path: None,
+                working_dir: None,
+                claude_binary: std::env::var("CLAUDE_BINARY")
+                    .unwrap_or_else(|_| "claude".to_string()),
+                spawn_timeout_secs: 30,
+                request_timeout_secs: 300,
+            };
+            tracing::info!(
+                user_model = %user_config.model,
+                "Per-user Claude sidecar provider created"
+            );
+            Arc::new(claude_sidecar::ClaudeSidecarProvider::new(sidecar_config))
+                as Arc<dyn LlmProvider>
         }
     };
 

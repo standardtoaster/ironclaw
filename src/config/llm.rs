@@ -46,6 +46,8 @@ pub enum LlmBackend {
     OpenAiCompatible,
     /// Tinfoil private inference
     Tinfoil,
+    /// Claude Code CLI sidecar (managed subprocess)
+    ClaudeSidecar,
 }
 
 impl std::str::FromStr for LlmBackend {
@@ -59,8 +61,9 @@ impl std::str::FromStr for LlmBackend {
             "ollama" => Ok(Self::Ollama),
             "openai_compatible" | "openai-compatible" | "compatible" => Ok(Self::OpenAiCompatible),
             "tinfoil" => Ok(Self::Tinfoil),
+            "claude_sidecar" | "claude-sidecar" | "sidecar" => Ok(Self::ClaudeSidecar),
             _ => Err(format!(
-                "invalid LLM backend '{}', expected one of: nearai, openai, anthropic, ollama, openai_compatible, tinfoil",
+                "invalid LLM backend '{}', expected one of: nearai, openai, anthropic, ollama, openai_compatible, tinfoil, claude_sidecar",
                 s
             )),
         }
@@ -76,6 +79,7 @@ impl std::fmt::Display for LlmBackend {
             Self::Ollama => write!(f, "ollama"),
             Self::OpenAiCompatible => write!(f, "openai_compatible"),
             Self::Tinfoil => write!(f, "tinfoil"),
+            Self::ClaudeSidecar => write!(f, "claude_sidecar"),
         }
     }
 }
