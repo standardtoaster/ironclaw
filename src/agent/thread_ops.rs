@@ -278,11 +278,11 @@ impl Agent {
                     return Ok(SubmissionResult::error("Thread no longer exists."));
                 }
             }
-            ThreadState::AwaitingApproval => {
+            ThreadState::AwaitingApproval | ThreadState::AwaitingUserInput => {
                 tracing::warn!(
                     message_id = %message.id,
                     thread_id = %thread_id,
-                    "Thread awaiting approval, rejecting new input"
+                    "Thread awaiting approval/input, rejecting new input"
                 );
                 let msg = match approval_context {
                     Some((tool_name, desc_preview)) => format!(
