@@ -103,6 +103,12 @@ pub struct ServiceRegistry {
     services: Vec<ServiceConfig>,
 }
 
+impl Default for ServiceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ServiceRegistry {
     pub fn new() -> Self {
         Self { services: vec![] }
@@ -148,6 +154,16 @@ impl ServiceRegistry {
         self.services
             .iter()
             .find(|s| s.name == name && self.user_in_scope(s, user_id))
+    }
+
+    /// Return the number of registered services.
+    pub fn len(&self) -> usize {
+        self.services.len()
+    }
+
+    /// Return true if no services are registered.
+    pub fn is_empty(&self) -> bool {
+        self.services.is_empty()
     }
 
     fn user_in_scope(&self, service: &ServiceConfig, user_id: &str) -> bool {
