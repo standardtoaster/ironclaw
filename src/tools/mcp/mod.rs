@@ -47,5 +47,5 @@ pub use config::{McpServerConfig, McpServersFile, OAuthConfig};
 pub use process::McpProcessManager;
 pub use protocol::{InitializeResult, McpRequest, McpResponse, McpTool};
 pub use session::McpSessionManager;
-pub use service_registry::ServiceConfig;
+pub use service_registry::{ServiceConfig, ServiceRegistry};
 pub use transport::McpTransport;
