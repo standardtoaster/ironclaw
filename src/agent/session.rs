@@ -124,6 +124,8 @@ pub enum ThreadState {
     Processing,
     /// Thread is waiting for user approval.
     AwaitingApproval,
+    /// Thread is waiting for user input (ask_user tool).
+    AwaitingUserInput,
     /// Thread has completed (no more turns expected).
     Completed,
     /// Thread was interrupted.
@@ -171,6 +173,37 @@ pub struct PendingApproval {
     pub user_timezone: Option<String>,
 }
 
+/// Pending user input request stored on a thread.
+///
+/// Created when the `ask_user` tool is called. The agent loop pauses and waits
+/// for the user to respond via the `/api/chat/user-input` endpoint or inline
+/// message. Similar to `PendingApproval` but supports structured choices and
+/// arbitrary metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingUserInput {
+    /// Unique request ID.
+    pub request_id: Uuid,
+    /// The question to ask the user.
+    pub question: String,
+    /// Named choices for the user. `None` means freeform text input.
+    #[serde(default)]
+    pub options: Option<Vec<String>>,
+    /// Arbitrary data for client renderers (e.g., cost, model name).
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    /// Tool call ID from LLM (for proper context continuation).
+    pub tool_call_id: String,
+    /// Context messages at the time of the request (to resume from).
+    pub context_messages: Vec<ChatMessage>,
+    /// Remaining tool calls from the same assistant message that were not
+    /// executed yet when the pause was requested.
+    #[serde(default)]
+    pub deferred_tool_calls: Vec<ToolCall>,
+    /// User timezone at the time the request was made.
+    #[serde(default)]
+    pub user_timezone: Option<String>,
+}
+
 /// A conversation thread within a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Thread {
@@ -194,6 +227,9 @@ pub struct Thread {
     /// Pending auth token request (thread is in auth mode).
     #[serde(default)]
     pub pending_auth: Option<PendingAuth>,
+    /// Pending user input request (when state is AwaitingUserInput).
+    #[serde(default)]
+    pub pending_user_input: Option<PendingUserInput>,
 }
 
 impl Thread {
@@ -210,6 +246,7 @@ impl Thread {
             metadata: serde_json::Value::Null,
             pending_approval: None,
             pending_auth: None,
+            pending_user_input: None,
         }
     }
 
@@ -226,6 +263,7 @@ impl Thread {
             metadata: serde_json::Value::Null,
             pending_approval: None,
             pending_auth: None,
+            pending_user_input: None,
         }
     }
 
@@ -288,6 +326,25 @@ impl Thread {
     /// Clear pending approval and return to idle state.
     pub fn clear_pending_approval(&mut self) {
         self.pending_approval = None;
+        self.state = ThreadState::Idle;
+        self.updated_at = Utc::now();
+    }
+
+    /// Mark the thread as awaiting user input with pending request details.
+    pub fn await_user_input(&mut self, pending: PendingUserInput) {
+        self.state = ThreadState::AwaitingUserInput;
+        self.pending_user_input = Some(pending);
+        self.updated_at = Utc::now();
+    }
+
+    /// Take the pending user input (clearing it from the thread).
+    pub fn take_pending_user_input(&mut self) -> Option<PendingUserInput> {
+        self.pending_user_input.take()
+    }
+
+    /// Clear pending user input and return to idle state.
+    pub fn clear_pending_user_input(&mut self) {
+        self.pending_user_input = None;
         self.state = ThreadState::Idle;
         self.updated_at = Utc::now();
     }

@@ -152,7 +152,7 @@ impl Agent {
                     "Turn in progress. Use /interrupt to cancel.",
                 ));
             }
-            ThreadState::AwaitingApproval => {
+            ThreadState::AwaitingApproval | ThreadState::AwaitingUserInput => {
                 return Ok(SubmissionResult::error(
                     "Waiting for approval. Use /interrupt to cancel.",
                 ));
