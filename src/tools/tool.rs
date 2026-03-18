@@ -177,6 +177,28 @@ pub enum ToolError {
     Sandbox(String),
 }
 
+/// Signal from a tool to the agent loop requesting special handling.
+///
+/// Most tool executions have no signal — they return a result and the agent
+/// loop feeds it back to the LLM. These signals let tools request pause/resume
+/// or provider swaps without coupling tools to the agent loop internals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ToolSignal {
+    /// Ask the user a question and wait for their response.
+    UserInputNeeded {
+        question: String,
+        options: Option<Vec<String>>,
+        metadata: Option<serde_json::Value>,
+    },
+    /// Escalate to a higher-tier provider.
+    Escalate {
+        reason: String,
+        tier: Option<String>,
+    },
+    /// De-escalate to the default provider.
+    DeEscalate { reason: Option<String> },
+}
+
 /// Output from a tool execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutput {
@@ -189,6 +211,9 @@ pub struct ToolOutput {
     /// Raw output before sanitization (for debugging).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
+    /// Optional signal to the agent loop (pause, escalate, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<ToolSignal>,
 }
 
 impl ToolOutput {
@@ -199,6 +224,7 @@ impl ToolOutput {
             cost: None,
             duration,
             raw: None,
+            signal: None,
         }
     }
 
@@ -209,7 +235,14 @@ impl ToolOutput {
             cost: None,
             duration,
             raw: None,
+            signal: None,
         }
+    }
+
+    /// Attach a signal to this output.
+    pub fn with_signal(mut self, signal: ToolSignal) -> Self {
+        self.signal = Some(signal);
+        self
     }
 
     /// Set the cost.

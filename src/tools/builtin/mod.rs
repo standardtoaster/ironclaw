@@ -1,5 +1,6 @@
 //! Built-in tools that come with the agent.
 
+pub mod ask_user;
 mod conversation;
 mod echo;
 pub mod extension_tools;
@@ -51,6 +52,7 @@ pub mod image_gen;
 pub use html_converter::convert_html_to_markdown;
 pub use image_analyze::ImageAnalyzeTool;
 pub use image_edit::ImageEditTool;
+pub use ask_user::AskUserTool;
 pub use image_gen::ImageGenerateTool;
 
 /// Detect image media type from file extension via `mime_guess`.
