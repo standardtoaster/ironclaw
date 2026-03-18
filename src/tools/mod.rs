@@ -14,8 +14,8 @@ pub mod rate_limiter;
 pub mod schema_validator;
 pub mod wasm;
 
-mod registry;
-mod tool;
+pub(crate) mod registry;
+pub(crate) mod tool;
 
 pub use builder::{
     BuildPhase, BuildRequirement, BuildResult, BuildSoftwareTool, BuilderConfig, Language,
