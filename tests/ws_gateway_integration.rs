@@ -67,6 +67,7 @@ async fn start_test_server() -> (
         startup_time: std::time::Instant::now(),
         restart_requested: std::sync::atomic::AtomicBool::new(false),
         collection_write_tx: None,
+        default_timezone: "UTC".to_string(),
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

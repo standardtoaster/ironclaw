@@ -110,6 +110,7 @@ impl GatewayChannel {
             startup_time: std::time::Instant::now(),
             restart_requested: std::sync::atomic::AtomicBool::new(false),
             collection_write_tx: None,
+            default_timezone: "UTC".to_string(),
         });
 
         Self {
@@ -151,6 +152,7 @@ impl GatewayChannel {
             startup_time: std::time::Instant::now(),
             restart_requested: std::sync::atomic::AtomicBool::new(false),
             collection_write_tx: None,
+            default_timezone: "UTC".to_string(),
         });
 
         Self {
@@ -192,6 +194,7 @@ impl GatewayChannel {
             startup_time: self.state.startup_time,
             restart_requested: std::sync::atomic::AtomicBool::new(false),
             collection_write_tx: self.state.collection_write_tx.clone(),
+            default_timezone: self.state.default_timezone.clone(),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
@@ -311,6 +314,12 @@ impl GatewayChannel {
         >,
     ) -> Self {
         self.rebuild_state(|s| s.collection_write_tx = Some(tx));
+        self
+    }
+
+    /// Set the default timezone (IANA name) for tool execution contexts.
+    pub fn with_default_timezone(mut self, tz: String) -> Self {
+        self.rebuild_state(|s| s.default_timezone = tz);
         self
     }
 

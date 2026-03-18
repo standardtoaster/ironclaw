@@ -582,6 +582,7 @@ async fn async_main() -> anyhow::Result<()> {
         }
         gw = gw.with_cost_guard(Arc::clone(&components.cost_guard));
         gw = gw.with_collection_write_tx(collection_write_tx.clone());
+        gw = gw.with_default_timezone(config.agent.default_timezone.clone());
         if config.sandbox.enabled {
             gw = gw.with_prompt_queue(Arc::clone(&prompt_queue));
 

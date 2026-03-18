@@ -92,6 +92,7 @@ impl TestGatewayBuilder {
             startup_time: std::time::Instant::now(),
             restart_requested: std::sync::atomic::AtomicBool::new(false),
             collection_write_tx: None,
+            default_timezone: "UTC".to_string(),
         })
     }
 

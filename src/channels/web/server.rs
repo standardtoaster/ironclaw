@@ -291,6 +291,8 @@ pub struct GatewayState {
     /// Broadcast sender for collection write events (fires routine triggers).
     pub collection_write_tx:
         Option<tokio::sync::broadcast::Sender<crate::agent::collection_events::CollectionWriteEvent>>,
+    /// Default timezone (IANA name) for tool execution contexts (e.g. MCP).
+    pub default_timezone: String,
 }
 
 impl GatewayState {
@@ -3058,6 +3060,7 @@ mod tests {
             startup_time: std::time::Instant::now(),
             restart_requested: std::sync::atomic::AtomicBool::new(false),
             collection_write_tx: None,
+            default_timezone: "UTC".to_string(),
         })
     }
 
