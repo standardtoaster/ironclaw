@@ -761,6 +761,12 @@ impl Agent {
                     .map(|tm| tm.current_tier())
                     .unwrap_or_else(|| "default".to_string());
 
+                // Clean up sidecar session for this thread before switching providers.
+                // The current (escalated) provider may hold session state that should
+                // be released when de-escalating.
+                let escalated_provider = self.active_llm();
+                escalated_provider.end_session(thread_id).await;
+
                 // Perform the actual de-escalation.
                 let new_tier = if let Some(ref tier_map) = self.deps.tier_map {
                     tier_map.de_escalate()
@@ -1738,6 +1744,8 @@ impl Agent {
                     Ok(SubmissionResult::response(msg))
                 }
                 Ok(AgenticLoopResult::DeEscalate { reason }) => {
+                    // Clean up sidecar session before switching providers.
+                    self.active_llm().end_session(thread_id).await;
                     if let Some(ref tier_map) = self.deps.tier_map {
                         tier_map.de_escalate();
                     }

@@ -82,6 +82,10 @@ impl LlmProvider for CleaningProvider {
     fn cache_read_discount(&self) -> Decimal {
         self.inner.cache_read_discount()
     }
+
+    async fn end_session(&self, thread_id: uuid::Uuid) {
+        self.inner.end_session(thread_id).await;
+    }
 }
 
 #[cfg(test)]
