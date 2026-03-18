@@ -48,6 +48,57 @@ pub struct LensOverride {
     pub tier: Option<String>,
 }
 
+impl ServiceConfig {
+    /// Check if a tool name passes the allow/deny filters for a given user.
+    /// Deny always takes precedence. Per-lens overrides are checked after base filters.
+    pub fn is_tool_allowed(&self, tool_name: &str, user_id: &str) -> bool {
+        // Base allow/deny
+        if !self.matches_allow(&self.allow, tool_name) {
+            return false;
+        }
+        if self.matches_deny(&self.deny, tool_name) {
+            return false;
+        }
+        // Per-lens overrides
+        if let Some(lens_override) = self.lens_overrides.get(user_id) {
+            if !lens_override.allow.is_empty()
+                && !self.matches_allow(&lens_override.allow, tool_name)
+            {
+                return false;
+            }
+            if self.matches_deny(&lens_override.deny, tool_name) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn matches_allow(&self, patterns: &[String], name: &str) -> bool {
+        if patterns.is_empty() {
+            return true;
+        }
+        patterns.iter().any(|p| glob_match(p, name))
+    }
+
+    fn matches_deny(&self, patterns: &[String], name: &str) -> bool {
+        patterns.iter().any(|p| glob_match(p, name))
+    }
+}
+
+/// Simple glob matching supporting only `*` as wildcard.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        name.starts_with(prefix)
+    } else if let Some(suffix) = pattern.strip_prefix('*') {
+        name.ends_with(suffix)
+    } else {
+        pattern == name
+    }
+}
+
 pub struct ServiceRegistry {
     services: Vec<ServiceConfig>,
 }
@@ -170,6 +221,43 @@ mod tests {
 
         let results = registry.search("movie", "anyone");
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_tool_allowed_by_default() {
+        let config = make_test_config("ha", vec!["light"]);
+        assert!(config.is_tool_allowed("turn_on", "andrew"));
+    }
+
+    #[test]
+    fn test_tool_denied_by_pattern() {
+        let mut config = make_test_config("ha", vec!["light"]);
+        config.deny = vec!["delete_*".to_string()];
+        assert!(!config.is_tool_allowed("delete_entity", "andrew"));
+        assert!(config.is_tool_allowed("turn_on", "andrew"));
+    }
+
+    #[test]
+    fn test_deny_takes_precedence() {
+        let mut config = make_test_config("ha", vec!["light"]);
+        config.allow = vec!["*".to_string()];
+        config.deny = vec!["turn_*".to_string()];
+        assert!(!config.is_tool_allowed("turn_on", "andrew"));
+    }
+
+    #[test]
+    fn test_lens_override_deny() {
+        let mut config = make_test_config("ha", vec!["light"]);
+        config.lens_overrides.insert(
+            "grace".to_string(),
+            LensOverride {
+                allow: vec![],
+                deny: vec!["automation_*".to_string()],
+                tier: None,
+            },
+        );
+        assert!(config.is_tool_allowed("automation_create", "andrew"));
+        assert!(!config.is_tool_allowed("automation_create", "grace"));
     }
 
     fn make_test_config(name: &str, keywords: Vec<&str>) -> ServiceConfig {
