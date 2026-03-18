@@ -21,7 +21,7 @@ use crate::secrets::SecretsStore;
 use crate::skills::SkillRegistry;
 use crate::skills::catalog::SkillCatalog;
 use crate::tools::ToolRegistry;
-use crate::tools::mcp::{McpProcessManager, McpSessionManager};
+use crate::tools::mcp::{McpProcessManager, McpSessionManager, ServiceCache, ServiceRegistry};
 use crate::tools::wasm::SharedCredentialRegistry;
 use crate::tools::wasm::WasmToolRuntime;
 use crate::workspace::{EmbeddingProvider, Workspace};
@@ -53,6 +53,8 @@ pub struct AppComponents {
     pub session: Arc<SessionManager>,
     pub catalog_entries: Vec<crate::extensions::RegistryEntry>,
     pub dev_loaded_tool_names: Vec<String>,
+    pub service_registry: Option<Arc<ServiceRegistry>>,
+    pub service_cache: Option<Arc<ServiceCache>>,
 }
 
 /// Options that control optional init phases.
@@ -517,6 +519,7 @@ impl AppBuilder {
     }
 
     /// Phase 5: Load WASM tools, MCP servers, and create extension manager.
+    #[allow(clippy::type_complexity)]
     pub async fn init_extensions(
         &self,
         tools: &Arc<ToolRegistry>,
@@ -530,6 +533,8 @@ impl AppBuilder {
             Option<Arc<ExtensionManager>>,
             Vec<crate::extensions::RegistryEntry>,
             Vec<String>,
+            Option<Arc<ServiceRegistry>>,
+            Option<Arc<ServiceCache>>,
         ),
         anyhow::Error,
     > {
@@ -856,6 +861,32 @@ impl AppBuilder {
             tools.register_dev_tools();
         }
 
+        // Load Percy service registry (if configured via SERVICES_CONFIG)
+        let service_registry = match self.config.services_config_path.as_ref() {
+            Some(path) => {
+                match ServiceRegistry::load_from_file(std::path::Path::new(path)) {
+                    Ok(registry) => {
+                        tracing::info!(
+                            "Loaded {} MCP service(s) from {}",
+                            registry.len(),
+                            path
+                        );
+                        Some(Arc::new(registry))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load service registry from {}: {}", path, e);
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let service_cache = service_registry.as_ref().map(|_| {
+            let cache_dir = crate::bootstrap::ironclaw_base_dir().join("mcp-cache");
+            Arc::new(ServiceCache::new(cache_dir))
+        });
+
         Ok((
             mcp_session_manager,
             mcp_process_manager,
@@ -863,6 +894,8 @@ impl AppBuilder {
             extension_manager,
             catalog_entries,
             dev_loaded_tool_names,
+            service_registry,
+            service_cache,
         ))
     }
 
@@ -910,6 +943,8 @@ impl AppBuilder {
             extension_manager,
             catalog_entries,
             dev_loaded_tool_names,
+            service_registry,
+            service_cache,
         ) = self.init_extensions(&tools, &hooks, &workspace).await?;
 
         // Seed workspace and backfill embeddings
@@ -1019,6 +1054,8 @@ impl AppBuilder {
             session: self.session,
             catalog_entries,
             dev_loaded_tool_names,
+            service_registry,
+            service_cache,
         })
     }
 }
