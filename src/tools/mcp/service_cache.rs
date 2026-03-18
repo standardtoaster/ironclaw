@@ -56,6 +56,14 @@ impl ServiceCache {
         }
     }
 
+    /// Return cached tools regardless of TTL (for error fallback).
+    pub fn get_stale(&self, service_name: &str) -> Option<Vec<CachedTool>> {
+        let path = self.dir.join(format!("{}.json", service_name));
+        let contents = std::fs::read_to_string(&path).ok()?;
+        let entry: CacheEntry = serde_json::from_str(&contents).ok()?;
+        Some(entry.tools)
+    }
+
     pub fn invalidate(&self, service_name: &str) {
         let path = self.dir.join(format!("{}.json", service_name));
         std::fs::remove_file(&path).ok();
