@@ -404,6 +404,8 @@ pub async fn start_server(
         )
         // Gateway control plane
         .route("/api/gateway/status", get(gateway_status_handler))
+        // MCP server (JSON-RPC over HTTP)
+        .route("/mcp", post(crate::channels::mcp::mcp_handler))
         // OpenAI-compatible API
         .route(
             "/v1/chat/completions",

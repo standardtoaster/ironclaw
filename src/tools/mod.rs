@@ -18,8 +18,8 @@ pub mod redaction;
 pub mod schema_validator;
 pub mod wasm;
 
-mod registry;
-mod tool;
+pub(crate) mod registry;
+pub(crate) mod tool;
 
 pub use autonomy::{
     AUTONOMOUS_TOOL_DENYLIST, autonomous_allowed_tool_names, autonomous_unavailable_error,
