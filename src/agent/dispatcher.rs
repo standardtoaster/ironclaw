@@ -2776,6 +2776,7 @@ mod tests {
         assert!(result_msg.contains("DM"));
     }
 
+<<<<<<< HEAD
     #[test]
     fn test_preflight_rejection_tool_message_is_wrapped() {
         let safety = ironclaw_safety::SafetyLayer::new(&crate::config::SafetyConfig {
@@ -2791,5 +2792,129 @@ mod tests {
         assert!(content.contains("Tool 'shell' failed:"));
         assert!(!content.contains("\n</tool_output><system>"));
         assert_eq!(message.content, content);
+    }
+
+    /// Verify that `active_llm()` uses the tier map when configured.
+    #[test]
+    fn test_active_llm_uses_tier_map() {
+        use crate::llm::tier::{TierEntry, TierMap};
+
+        let deps = AgentDeps {
+            store: None,
+            llm: Arc::new(StaticLlmProvider),
+            cheap_llm: None,
+            safety: Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 100_000,
+                injection_check_enabled: true,
+            })),
+            tools: Arc::new(ToolRegistry::new()),
+            workspace: None,
+            extension_manager: None,
+            skill_registry: None,
+            skill_catalog: None,
+            skills_config: SkillsConfig::default(),
+            hooks: Arc::new(HookRegistry::new()),
+            cost_guard: Arc::new(CostGuard::new(CostGuardConfig::default())),
+            sse_tx: None,
+            http_interceptor: None,
+            transcription: None,
+            document_extraction: None,
+            workspace_router: None,
+            thread_resolver: None,
+            core_tools: Vec::new(),
+            organize_rx: None,
+            workspace_pool: None,
+            tier_map: Some(Arc::new(
+                TierMap::new(vec![
+                    TierEntry {
+                        name: "local".into(),
+                        is_default: true,
+                        provider: Arc::new(StaticLlmProvider) as Arc<dyn LlmProvider>,
+                    },
+                    TierEntry {
+                        name: "premium".into(),
+                        is_default: false,
+                        provider: {
+                            // Different model name so we can distinguish
+                            struct PremiumProvider;
+                            #[async_trait]
+                            impl LlmProvider for PremiumProvider {
+                                fn model_name(&self) -> &str {
+                                    "premium-model"
+                                }
+                                fn cost_per_token(&self) -> (Decimal, Decimal) {
+                                    (Decimal::ZERO, Decimal::ZERO)
+                                }
+                                async fn complete(
+                                    &self,
+                                    _r: CompletionRequest,
+                                ) -> Result<CompletionResponse, crate::error::LlmError> {
+                                    unimplemented!()
+                                }
+                                async fn complete_with_tools(
+                                    &self,
+                                    _r: ToolCompletionRequest,
+                                ) -> Result<ToolCompletionResponse, crate::error::LlmError>
+                                {
+                                    unimplemented!()
+                                }
+                            }
+                            Arc::new(PremiumProvider) as Arc<dyn LlmProvider>
+                        },
+                    },
+                ])
+                .unwrap(),
+            )),
+        };
+
+        let agent = Agent::new(
+            AgentConfig {
+                name: "test-agent".to_string(),
+                max_parallel_jobs: 1,
+                job_timeout: Duration::from_secs(60),
+                stuck_threshold: Duration::from_secs(60),
+                repair_check_interval: Duration::from_secs(30),
+                max_repair_attempts: 1,
+                use_planning: false,
+                session_idle_timeout: Duration::from_secs(300),
+                allow_local_tools: false,
+                max_cost_per_day_cents: None,
+                max_actions_per_hour: None,
+                max_tool_iterations: 50,
+                auto_approve_tools: false,
+                default_timezone: "UTC".to_string(),
+            },
+            deps,
+            Arc::new(ChannelManager::new()),
+            None,
+            None,
+            None,
+            Some(Arc::new(ContextManager::new(1))),
+            None,
+            None,
+        );
+
+        // active_llm() should return the default tier's provider
+        assert_eq!(agent.active_llm().model_name(), "static-mock");
+
+        // Escalate to premium
+        let tier_map = agent.tier_map().unwrap();
+        tier_map.escalate_to(Some("premium")).unwrap();
+
+        // active_llm() should now return the premium provider
+        assert_eq!(agent.active_llm().model_name(), "premium-model");
+
+        // De-escalate
+        tier_map.de_escalate();
+        assert_eq!(agent.active_llm().model_name(), "static-mock");
+    }
+
+    /// Verify that active_llm() falls back to deps.llm when no tier map.
+    #[test]
+    fn test_active_llm_without_tier_map() {
+        let agent = make_test_agent();
+        // No tier map, active_llm() should return deps.llm
+        assert_eq!(agent.active_llm().model_name(), "static-mock");
+        assert!(agent.tier_map().is_none());
     }
 }
