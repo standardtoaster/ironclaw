@@ -125,6 +125,13 @@ pub struct Config {
     /// Channel-relay integration (Slack via external relay service).
     /// Present only when both `CHANNEL_RELAY_URL` and `CHANNEL_RELAY_API_KEY` are set.
     pub relay: Option<RelayConfig>,
+    /// Tool names to always include in LLM context (comma-separated via `CORE_TOOLS`).
+    /// All other registered tools are discoverable but not sent unless loaded.
+    /// If empty/unset, ALL tools are sent (backward compatible).
+    pub core_tools: Vec<String>,
+    /// Path to a JSON file containing MCP service configs for discovery.
+    /// Set via `SERVICES_CONFIG` env var (typically `generated/services.json`).
+    pub services_config_path: Option<String>,
 }
 
 impl Config {
@@ -203,6 +210,8 @@ impl Config {
             observability: crate::observability::ObservabilityConfig::default(),
             oauth: OAuthConfig::default(),
             relay: None,
+            core_tools: Vec::new(),
+            services_config_path: None,
         }
     }
 
@@ -396,6 +405,12 @@ impl Config {
             },
             oauth: OAuthConfig::resolve()?,
             relay: RelayConfig::from_env(),
+            core_tools: std::env::var("CORE_TOOLS")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
+                .unwrap_or_default(),
+            services_config_path: std::env::var("SERVICES_CONFIG").ok(),
         })
     }
 }
