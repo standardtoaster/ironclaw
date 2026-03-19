@@ -158,10 +158,22 @@ pub async fn mcp_post_handler(
 
 /// Axum handler for GET /mcp (SSE stream).
 ///
-/// Claude Code may attempt to open an SSE stream. We don't support
-/// server-initiated messages yet, so return 405 Method Not Allowed.
-pub async fn mcp_get_handler() -> impl IntoResponse {
-    (StatusCode::METHOD_NOT_ALLOWED, "SSE stream not supported; use POST for requests")
+/// Claude Code opens a GET SSE stream for server-initiated messages.
+/// We don't send server-initiated messages, but returning a valid SSE
+/// response signals to the client that we're a Streamable HTTP MCP server.
+pub async fn mcp_get_handler(
+    AuthenticatedUser(_user): AuthenticatedUser,
+) -> impl IntoResponse {
+    // Return a valid SSE response with just the headers.
+    // The stream stays open (empty) — no server-initiated messages.
+    let mut headers = HeaderMap::new();
+    if let Ok(ct) = "text/event-stream".parse() {
+        headers.insert("content-type", ct);
+    }
+    if let Ok(cc) = "no-cache".parse() {
+        headers.insert("cache-control", cc);
+    }
+    (StatusCode::OK, headers, ": keepalive\n\n")
 }
 
 /// Axum handler for DELETE /mcp (session teardown).
