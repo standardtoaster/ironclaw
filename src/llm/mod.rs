@@ -360,8 +360,8 @@ async fn create_tier_provider(
 
     let default_base_url = def.and_then(|d| d.default_base_url.clone()).unwrap_or_default();
 
-    // Claude sidecar doesn't use the registry/HTTP path -- build directly.
-    if tier.backend == LlmBackend::ClaudeSidecar {
+    // Claude sidecar/container doesn't use the registry/HTTP path -- build directly.
+    if tier.backend == LlmBackend::ClaudeSidecar || tier.backend == LlmBackend::ClaudeContainer {
         let sidecar_config = claude_sidecar::SidecarConfig {
             model: tier.model.clone(),
             system_prompt_append: None,
@@ -903,7 +903,7 @@ pub fn create_provider_from_user_config(
                     .to_string(),
             });
         }
-        LlmBackend::ClaudeSidecar => {
+        LlmBackend::ClaudeSidecar | LlmBackend::ClaudeContainer => {
             let sidecar_config = claude_sidecar::SidecarConfig {
                 model: user_config.model.clone(),
                 system_prompt_append: None,
@@ -917,7 +917,8 @@ pub fn create_provider_from_user_config(
             };
             tracing::info!(
                 user_model = %user_config.model,
-                "Per-user Claude sidecar provider created"
+                backend = %user_config.backend,
+                "Per-user Claude provider created"
             );
             Arc::new(claude_sidecar::ClaudeSidecarProvider::new(sidecar_config))
                 as Arc<dyn LlmProvider>

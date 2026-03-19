@@ -48,6 +48,8 @@ pub enum LlmBackend {
     Tinfoil,
     /// Claude Code CLI sidecar (managed subprocess)
     ClaudeSidecar,
+    /// Claude Code running inside a container (managed by ContainerPool)
+    ClaudeContainer,
 }
 
 impl std::str::FromStr for LlmBackend {
@@ -62,8 +64,9 @@ impl std::str::FromStr for LlmBackend {
             "openai_compatible" | "openai-compatible" | "compatible" => Ok(Self::OpenAiCompatible),
             "tinfoil" => Ok(Self::Tinfoil),
             "claude_sidecar" | "claude-sidecar" | "sidecar" => Ok(Self::ClaudeSidecar),
+            "claude_container" | "claude-container" | "container" => Ok(Self::ClaudeContainer),
             _ => Err(format!(
-                "invalid LLM backend '{}', expected one of: nearai, openai, anthropic, ollama, openai_compatible, tinfoil, claude_sidecar",
+                "invalid LLM backend '{}', expected one of: nearai, openai, anthropic, ollama, openai_compatible, tinfoil, claude_sidecar, claude_container",
                 s
             )),
         }
@@ -80,6 +83,7 @@ impl std::fmt::Display for LlmBackend {
             Self::OpenAiCompatible => write!(f, "openai_compatible"),
             Self::Tinfoil => write!(f, "tinfoil"),
             Self::ClaudeSidecar => write!(f, "claude_sidecar"),
+            Self::ClaudeContainer => write!(f, "claude_container"),
         }
     }
 }
@@ -1376,6 +1380,13 @@ mod tests {
 
         clear_escalation_tier_env();
         clear_routing_tier_env();
+    }
+
+    #[test]
+    fn test_claude_container_backend_parsing() {
+        let backend: LlmBackend = "claude_container".parse().expect("parse claude_container");
+        assert!(matches!(backend, LlmBackend::ClaudeContainer));
+        assert_eq!(format!("{}", LlmBackend::ClaudeContainer), "claude_container");
     }
 
     #[test]
