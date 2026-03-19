@@ -14,6 +14,7 @@ mod bedrock;
 pub mod circuit_breaker;
 pub mod claude_protocol;
 pub mod claude_sidecar;
+pub mod claude_container;
 pub mod container_pool;
 mod cleaning_provider;
 pub mod config;
@@ -361,8 +362,8 @@ async fn create_tier_provider(
 
     let default_base_url = def.and_then(|d| d.default_base_url.clone()).unwrap_or_default();
 
-    // Claude sidecar/container doesn't use the registry/HTTP path -- build directly.
-    if tier.backend == LlmBackend::ClaudeSidecar || tier.backend == LlmBackend::ClaudeContainer {
+    // Claude sidecar doesn't use the registry/HTTP path -- build directly.
+    if tier.backend == LlmBackend::ClaudeSidecar {
         let sidecar_config = claude_sidecar::SidecarConfig {
             model: tier.model.clone(),
             system_prompt_append: None,
@@ -381,6 +382,36 @@ async fn create_tier_provider(
         );
         return Ok(Arc::new(claude_sidecar::ClaudeSidecarProvider::new(
             sidecar_config,
+        )));
+    }
+
+    // Claude container uses bollard to manage Docker containers.
+    if tier.backend == LlmBackend::ClaudeContainer {
+        let config = claude_container::ContainerProviderConfig {
+            model: tier.model.clone(),
+            image: std::env::var("CLAUDE_CONTAINER_IMAGE")
+                .unwrap_or_else(|_| "percy-claude:latest".to_string()),
+            socket_path: std::env::var("CLAUDE_CONTAINER_SOCKET")
+                .unwrap_or_else(|_| "/run/podman/podman.sock".to_string()),
+            lens: tier.name.clone(),
+            network: std::env::var("CLAUDE_CONTAINER_NETWORK")
+                .unwrap_or_else(|_| "percy_proxy-network".to_string()),
+            request_timeout_secs: 300,
+            auth_volume: std::env::var("CLAUDE_CONTAINER_AUTH_VOLUME")
+                .unwrap_or_else(|_| "claude-auth".to_string()),
+            skip_permissions: true,
+            extra_env: vec![],
+            lens_data_volume: Some(format!("claude-data-{}", tier.name)),
+            lens_config_path: std::env::var("CLAUDE_CONTAINER_LENS_CONFIG").ok(),
+        };
+        tracing::info!(
+            tier = %tier.name,
+            model = %tier.model,
+            image = %config.image,
+            "Claude container tier provider created"
+        );
+        return Ok(Arc::new(claude_container::ClaudeContainerProvider::new(
+            config,
         )));
     }
 
@@ -904,7 +935,7 @@ pub fn create_provider_from_user_config(
                     .to_string(),
             });
         }
-        LlmBackend::ClaudeSidecar | LlmBackend::ClaudeContainer => {
+        LlmBackend::ClaudeSidecar => {
             let sidecar_config = claude_sidecar::SidecarConfig {
                 model: user_config.model.clone(),
                 system_prompt_append: None,
@@ -919,9 +950,35 @@ pub fn create_provider_from_user_config(
             tracing::info!(
                 user_model = %user_config.model,
                 backend = %user_config.backend,
-                "Per-user Claude provider created"
+                "Per-user Claude sidecar provider created"
             );
             Arc::new(claude_sidecar::ClaudeSidecarProvider::new(sidecar_config))
+                as Arc<dyn LlmProvider>
+        }
+        LlmBackend::ClaudeContainer => {
+            let config = claude_container::ContainerProviderConfig {
+                model: user_config.model.clone(),
+                image: std::env::var("CLAUDE_CONTAINER_IMAGE")
+                    .unwrap_or_else(|_| "percy-claude:latest".to_string()),
+                socket_path: std::env::var("CLAUDE_CONTAINER_SOCKET")
+                    .unwrap_or_else(|_| "/run/podman/podman.sock".to_string()),
+                lens: "user".to_string(),
+                network: std::env::var("CLAUDE_CONTAINER_NETWORK")
+                    .unwrap_or_else(|_| "percy_proxy-network".to_string()),
+                request_timeout_secs: 300,
+                auth_volume: std::env::var("CLAUDE_CONTAINER_AUTH_VOLUME")
+                    .unwrap_or_else(|_| "claude-auth".to_string()),
+                skip_permissions: true,
+                extra_env: vec![],
+                lens_data_volume: Some("claude-data-user".to_string()),
+                lens_config_path: std::env::var("CLAUDE_CONTAINER_LENS_CONFIG").ok(),
+            };
+            tracing::info!(
+                user_model = %user_config.model,
+                backend = %user_config.backend,
+                "Per-user Claude container provider created"
+            );
+            Arc::new(claude_container::ClaudeContainerProvider::new(config))
                 as Arc<dyn LlmProvider>
         }
     };
