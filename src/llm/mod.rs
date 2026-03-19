@@ -14,6 +14,7 @@ mod bedrock;
 pub mod circuit_breaker;
 pub mod claude_protocol;
 pub mod claude_sidecar;
+pub mod container_pool;
 mod cleaning_provider;
 pub mod config;
 pub mod costs;
