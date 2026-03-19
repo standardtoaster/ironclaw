@@ -299,6 +299,17 @@ pub enum SseEvent {
         thread_id: Option<String>,
     },
 
+    /// Container lifecycle event for Claude container provider.
+    #[serde(rename = "container_status")]
+    ContainerStatus {
+        thread_id: Option<String>,
+        /// One of: creating, starting, attaching, ready, stopping, stopped, error
+        state: String,
+        container_id: Option<String>,
+        lens: Option<String>,
+        message: String,
+    },
+
     /// Agent needs user input to proceed (ask_user tool).
     #[serde(rename = "user_input_needed")]
     UserInputNeeded {
@@ -853,6 +864,7 @@ impl WsServerMessage {
             SseEvent::ExtensionStatus { .. } => "extension_status",
             SseEvent::Escalated { .. } => "escalated",
             SseEvent::DeEscalated { .. } => "de_escalated",
+            SseEvent::ContainerStatus { .. } => "container_status",
             SseEvent::UserInputNeeded { .. } => "user_input_needed",
         };
         let data = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);

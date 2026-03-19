@@ -149,6 +149,7 @@ impl SseManager {
                     SseEvent::WorkspaceRouted { .. } => "workspace_routed",
                     SseEvent::Escalated { .. } => "escalated",
                     SseEvent::DeEscalated { .. } => "de_escalated",
+                    SseEvent::ContainerStatus { .. } => "container_status",
                     SseEvent::UserInputNeeded { .. } => "user_input_needed",
                 };
                 Ok(Event::default().event(event_type).data(data))
