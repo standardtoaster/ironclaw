@@ -68,6 +68,7 @@ async fn start_test_server() -> (
         restart_requested: std::sync::atomic::AtomicBool::new(false),
         collection_write_tx: None,
         default_timezone: "UTC".to_string(),
+        mcp_sessions: Arc::new(ironclaw::channels::mcp::McpSessionStore::new()),
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

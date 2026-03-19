@@ -565,6 +565,7 @@ mod tests {
             restart_requested: std::sync::atomic::AtomicBool::new(false),
             collection_write_tx: None,
             default_timezone: "UTC".to_string(),
+            mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
         }
     }
 }

@@ -111,6 +111,7 @@ impl GatewayChannel {
             restart_requested: std::sync::atomic::AtomicBool::new(false),
             collection_write_tx: None,
             default_timezone: "UTC".to_string(),
+            mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
         });
 
         Self {
@@ -153,6 +154,7 @@ impl GatewayChannel {
             restart_requested: std::sync::atomic::AtomicBool::new(false),
             collection_write_tx: None,
             default_timezone: "UTC".to_string(),
+            mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
         });
 
         Self {
@@ -195,6 +197,7 @@ impl GatewayChannel {
             restart_requested: std::sync::atomic::AtomicBool::new(false),
             collection_write_tx: self.state.collection_write_tx.clone(),
             default_timezone: self.state.default_timezone.clone(),
+            mcp_sessions: Arc::clone(&self.state.mcp_sessions),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);

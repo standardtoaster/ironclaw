@@ -293,6 +293,8 @@ pub struct GatewayState {
         Option<tokio::sync::broadcast::Sender<crate::agent::collection_events::CollectionWriteEvent>>,
     /// Default timezone (IANA name) for tool execution contexts (e.g. MCP).
     pub default_timezone: String,
+    /// Active MCP sessions for Streamable HTTP transport.
+    pub mcp_sessions: Arc<crate::channels::mcp::McpSessionStore>,
 }
 
 impl GatewayState {
@@ -496,8 +498,10 @@ pub async fn start_server(
         )
         // Gateway control plane
         .route("/api/gateway/status", get(gateway_status_handler))
-        // MCP server (JSON-RPC over HTTP)
-        .route("/mcp", post(crate::channels::mcp::mcp_handler))
+        // MCP server (Streamable HTTP transport)
+        .route("/mcp", post(crate::channels::mcp::mcp_post_handler))
+        .route("/mcp", get(crate::channels::mcp::mcp_get_handler))
+        .route("/mcp", axum::routing::delete(crate::channels::mcp::mcp_delete_handler))
         // OpenAI-compatible API
         .route(
             "/v1/chat/completions",
@@ -3061,6 +3065,7 @@ mod tests {
             restart_requested: std::sync::atomic::AtomicBool::new(false),
             collection_write_tx: None,
             default_timezone: "UTC".to_string(),
+            mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
         })
     }
 
