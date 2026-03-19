@@ -16,7 +16,7 @@ where
 }
 
 /// MCP protocol version.
-pub const PROTOCOL_VERSION: &str = "2024-11-05";
+pub const PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// An MCP tool definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,19 +213,19 @@ pub struct InitializeResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerCapabilities {
     /// Tool capabilities.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsCapability>,
 
     /// Resource capabilities.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourcesCapability>,
 
     /// Prompt capabilities.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompts: Option<PromptsCapability>,
 
     /// Logging capabilities.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logging: Option<serde_json::Value>,
 }
 
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn test_initialize_result_full() {
         let json = serde_json::json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-11-25",
             "capabilities": {
                 "tools": { "listChanged": true },
                 "resources": { "subscribe": true, "listChanged": false },
@@ -466,7 +466,7 @@ mod tests {
             "instructions": "Use this server for testing."
         });
         let result: InitializeResult = serde_json::from_value(json).expect("deserialize");
-        assert_eq!(result.protocol_version.as_deref(), Some("2024-11-05"));
+        assert_eq!(result.protocol_version.as_deref(), Some("2025-11-25"));
 
         let tools_cap = result.capabilities.tools.expect("has tools capability");
         assert!(tools_cap.list_changed);
