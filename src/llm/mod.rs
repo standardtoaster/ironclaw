@@ -12,6 +12,7 @@ mod anthropic_oauth;
 #[cfg(feature = "bedrock")]
 mod bedrock;
 pub mod circuit_breaker;
+pub mod claude_protocol;
 pub mod claude_sidecar;
 mod cleaning_provider;
 pub mod config;

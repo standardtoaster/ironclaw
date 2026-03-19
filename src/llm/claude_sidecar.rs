@@ -22,17 +22,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::llm::claude_protocol::{messages_to_prompt, read_exchange, resolve_delta};
 use crate::llm::costs;
 use crate::llm::error::LlmError;
 use crate::llm::provider::{
     ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ModelMetadata,
-    Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
+    ToolCall, ToolCompletionRequest, ToolCompletionResponse,
 };
 
 /// Configuration for the Claude sidecar process.
@@ -58,37 +58,8 @@ pub struct SidecarConfig {
     pub skip_permissions: bool,
 }
 
-/// A tool approval request from the Claude CLI process.
-///
-/// When `skip_permissions` is false, Claude may pause and request approval
-/// for tool executions. This struct represents that request, which callers
-/// can respond to via `ClaudeSidecarProvider::approve()`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SidecarApproval {
-    /// Unique request ID for this approval.
-    pub request_id: String,
-    /// Name of the tool requesting approval.
-    pub tool_name: String,
-    /// Tool parameters.
-    pub parameters: serde_json::Value,
-}
-
-/// Result of an exchange with the sidecar.
-///
-/// Either a completed response or a tool approval request that needs
-/// user confirmation before the exchange can continue.
-#[derive(Debug)]
-pub enum ExchangeResult {
-    /// The exchange completed with a response.
-    Complete {
-        content: String,
-        tool_calls: Vec<ToolCall>,
-        input_tokens: u32,
-        output_tokens: u32,
-    },
-    /// The CLI is waiting for tool approval before continuing.
-    NeedApproval(SidecarApproval),
-}
+// Re-export protocol types for backward compatibility.
+pub use crate::llm::claude_protocol::{ExchangeResult, SidecarApproval};
 
 /// Tracks the state of an active sidecar session for a specific thread.
 #[derive(Debug, Clone)]
@@ -109,46 +80,6 @@ struct ManagedProcess {
     stdout_reader: BufReader<tokio::process::ChildStdout>,
     /// Captured from the CLI's `system/init` message.
     session_id: Option<String>,
-}
-
-/// Messages received from the Claude CLI stdout (stream-json format).
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-#[allow(dead_code)]
-enum SidecarMessage {
-    #[serde(rename = "system")]
-    System {
-        #[serde(default)]
-        session_id: Option<String>,
-    },
-    #[serde(rename = "assistant")]
-    Assistant {
-        message: serde_json::Value,
-    },
-    #[serde(rename = "result")]
-    Result {
-        result: String,
-        #[serde(default)]
-        session_id: Option<String>,
-        #[serde(default)]
-        input_tokens: Option<u32>,
-        #[serde(default)]
-        output_tokens: Option<u32>,
-    },
-    /// Tool permission request from Claude (when not using --dangerously-skip-permissions).
-    /// The CLI pauses execution and waits for approval on stdin.
-    #[serde(rename = "tool_use_permission")]
-    ToolUsePermission {
-        /// Unique ID for this permission request.
-        #[serde(default)]
-        id: Option<String>,
-        /// Name of the tool requesting permission.
-        #[serde(default)]
-        tool_name: Option<String>,
-        /// Tool input parameters.
-        #[serde(default)]
-        input: Option<serde_json::Value>,
-    },
 }
 
 /// An LLM provider that manages a warm Claude Code CLI subprocess.
@@ -483,29 +414,29 @@ impl ClaudeSidecarProvider {
             return Ok((messages_to_prompt(messages), false));
         };
 
-        // Existing session: extract only the new messages.
+        // Existing session: use resolve_delta for pure computation.
         let sent = session.messages_sent;
         drop(sessions);
 
-        if sent >= messages.len() {
-            // No new messages -- this shouldn't normally happen, but handle gracefully.
+        let (prompt, is_continuation) = resolve_delta(messages, sent);
+
+        if !is_continuation && sent > 0 {
             tracing::warn!(
                 thread_id = %tid,
                 sent,
                 total = messages.len(),
                 "No new messages to send (already sent all)"
             );
-            return Ok((messages_to_prompt(messages), false));
+        } else if is_continuation {
+            tracing::debug!(
+                thread_id = %tid,
+                sent,
+                new_messages = messages.len().saturating_sub(sent),
+                "Sending delta messages to existing session"
+            );
         }
 
-        let delta = &messages[sent..];
-        tracing::debug!(
-            thread_id = %tid,
-            sent,
-            new_messages = delta.len(),
-            "Sending delta messages to existing session"
-        );
-        Ok((messages_to_prompt(delta), true))
+        Ok((prompt, is_continuation))
     }
 
     /// Send a prompt and return either a completed response or an approval request.
@@ -614,105 +545,27 @@ impl ClaudeSidecarProvider {
             reason: "Sidecar process not running".to_string(),
         })?;
 
-        let mut text_content = String::new();
-        let mut tool_calls = Vec::new();
+        let result = read_exchange(&mut proc.stdout_reader, |sid| {
+            proc.session_id = Some(sid);
+        })
+        .await;
 
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            let bytes_read = match proc.stdout_reader.read_line(&mut buf).await {
-                Ok(n) => n,
-                Err(e) => {
-                    drop(guard);
-                    let mut g = self.process.lock().await;
-                    *g = None;
-                    self.sessions.lock().await.clear();
-                    return Err(LlmError::RequestFailed {
-                        provider: "claude_sidecar".to_string(),
-                        reason: format!("Failed to read sidecar stdout: {}", e),
-                    });
-                }
-            };
-
-            if bytes_read == 0 {
+        match &result {
+            Ok(ExchangeResult::Complete { .. }) => {
+                self.restart_count
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(_) => {
+                // Process likely crashed — clear it for re-spawn.
                 drop(guard);
                 let mut g = self.process.lock().await;
                 *g = None;
                 self.sessions.lock().await.clear();
-                return Err(LlmError::RequestFailed {
-                    provider: "claude_sidecar".to_string(),
-                    reason: "Sidecar process exited unexpectedly".to_string(),
-                });
             }
-
-            let trimmed = buf.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            let msg: SidecarMessage = match serde_json::from_str(trimmed) {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::debug!("Ignoring unparseable sidecar output: {} ({})", trimmed, e);
-                    continue;
-                }
-            };
-
-            match msg {
-                SidecarMessage::System { session_id } => {
-                    if let Some(sid) = session_id {
-                        proc.session_id = Some(sid);
-                    }
-                }
-                SidecarMessage::Assistant { message } => {
-                    if let Some(content) = message.get("content") {
-                        let text = extract_text(content);
-                        if !text.is_empty() {
-                            text_content.push_str(&text);
-                        }
-                        let calls = extract_tool_calls(content);
-                        tool_calls.extend(calls);
-                    }
-                }
-                SidecarMessage::Result {
-                    result,
-                    input_tokens: it,
-                    output_tokens: ot,
-                    ..
-                } => {
-                    if text_content.is_empty() {
-                        text_content = result;
-                    }
-                    self.restart_count
-                        .store(0, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(ExchangeResult::Complete {
-                        content: text_content,
-                        tool_calls,
-                        input_tokens: it.unwrap_or(0),
-                        output_tokens: ot.unwrap_or(0),
-                    });
-                }
-                SidecarMessage::ToolUsePermission {
-                    id,
-                    tool_name,
-                    input,
-                } => {
-                    let request_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
-                    let tool = tool_name.unwrap_or_else(|| "unknown".to_string());
-                    let params = input.unwrap_or(serde_json::Value::Null);
-                    tracing::info!(
-                        tool = %tool,
-                        request_id = %request_id,
-                        "Tool permission requested by sidecar"
-                    );
-                    return Ok(ExchangeResult::NeedApproval(SidecarApproval {
-                        request_id,
-                        tool_name: tool,
-                        parameters: params,
-                    }));
-                }
-            }
+            _ => {}
         }
+
+        result
     }
 
     /// Inner exchange: write to stdin, read from stdout until result or approval.
@@ -762,67 +615,6 @@ fn thread_id_from_metadata(metadata: &HashMap<String, String>) -> Option<Uuid> {
     metadata
         .get("thread_id")
         .and_then(|s| Uuid::parse_str(s).ok())
-}
-
-/// Build the text prompt from IronClaw messages.
-///
-/// The Claude CLI in print mode takes a single prompt string. We concatenate
-/// messages with role prefixes to preserve conversation context.
-fn messages_to_prompt(messages: &[ChatMessage]) -> String {
-    let mut parts = Vec::new();
-    for msg in messages {
-        match msg.role {
-            Role::System => {
-                parts.push(format!("[System context]: {}", msg.content));
-            }
-            Role::User => parts.push(msg.content.clone()),
-            Role::Assistant => parts.push(format!("[Previous assistant]: {}", msg.content)),
-            Role::Tool => {
-                let name = msg.name.as_deref().unwrap_or("tool");
-                parts.push(format!("[Tool result from {}]: {}", name, msg.content));
-            }
-        }
-    }
-    parts.join("\n\n")
-}
-
-/// Extract text content from a Claude assistant message content value.
-fn extract_text(content: &serde_json::Value) -> String {
-    let Some(array) = content.as_array() else {
-        return content.as_str().unwrap_or("").to_string();
-    };
-    array
-        .iter()
-        .filter_map(|block| {
-            if block.get("type")?.as_str()? == "text" {
-                block.get("text")?.as_str().map(String::from)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-/// Extract tool calls from a Claude assistant message content array.
-fn extract_tool_calls(content: &serde_json::Value) -> Vec<ToolCall> {
-    let Some(array) = content.as_array() else {
-        return Vec::new();
-    };
-    array
-        .iter()
-        .filter_map(|block| {
-            if block.get("type")?.as_str()? == "tool_use" {
-                Some(ToolCall {
-                    id: block.get("id")?.as_str()?.to_string(),
-                    name: block.get("name")?.as_str()?.to_string(),
-                    arguments: block.get("input")?.clone(),
-                })
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 #[async_trait]
@@ -903,6 +695,7 @@ impl LlmProvider for ClaudeSidecarProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::claude_protocol::{ClaudeStreamMessage, extract_text, extract_tool_calls};
     use rust_decimal::Decimal;
 
     fn test_config() -> SidecarConfig {
@@ -967,9 +760,9 @@ mod tests {
     #[test]
     fn test_parse_result_message() {
         let line = r#"{"type":"result","result":"The answer is 4","session_id":"abc","cost_usd":0.003,"duration_ms":1200,"input_tokens":50,"output_tokens":10}"#;
-        let msg: SidecarMessage = serde_json::from_str(line).expect("parse result");
+        let msg: ClaudeStreamMessage = serde_json::from_str(line).expect("parse result");
         match msg {
-            SidecarMessage::Result {
+            ClaudeStreamMessage::Result {
                 result,
                 input_tokens,
                 output_tokens,
@@ -986,9 +779,9 @@ mod tests {
     #[test]
     fn test_parse_system_init_message() {
         let line = r#"{"type":"system","subtype":"init","session_id":"sess-123"}"#;
-        let msg: SidecarMessage = serde_json::from_str(line).expect("parse system");
+        let msg: ClaudeStreamMessage = serde_json::from_str(line).expect("parse system");
         match msg {
-            SidecarMessage::System { session_id } => {
+            ClaudeStreamMessage::System { session_id } => {
                 assert_eq!(session_id, Some("sess-123".to_string()));
             }
             other => panic!("Expected System, got: {:?}", other),
@@ -998,9 +791,9 @@ mod tests {
     #[test]
     fn test_parse_assistant_text_message() {
         let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello world"}]}}"#;
-        let msg: SidecarMessage = serde_json::from_str(line).expect("parse assistant");
+        let msg: ClaudeStreamMessage = serde_json::from_str(line).expect("parse assistant");
         match msg {
-            SidecarMessage::Assistant { message } => {
+            ClaudeStreamMessage::Assistant { message } => {
                 let content = message.get("content").expect("content field");
                 let text = extract_text(content);
                 assert_eq!(text, "Hello world");
@@ -1012,9 +805,9 @@ mod tests {
     #[test]
     fn test_parse_assistant_message_with_tool_use() {
         let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"memory_search","input":{"query":"test"}}]}}"#;
-        let msg: SidecarMessage = serde_json::from_str(line).expect("parse tool_use");
+        let msg: ClaudeStreamMessage = serde_json::from_str(line).expect("parse tool_use");
         match msg {
-            SidecarMessage::Assistant { message } => {
+            ClaudeStreamMessage::Assistant { message } => {
                 let content = message.get("content").expect("content field");
                 let calls = extract_tool_calls(content);
                 assert_eq!(calls.len(), 1);
@@ -1029,9 +822,9 @@ mod tests {
     #[test]
     fn test_parse_assistant_mixed_content() {
         let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Let me search. "},{"type":"tool_use","id":"tu_2","name":"search","input":{"q":"x"}}]}}"#;
-        let msg: SidecarMessage = serde_json::from_str(line).expect("parse mixed");
+        let msg: ClaudeStreamMessage = serde_json::from_str(line).expect("parse mixed");
         match msg {
-            SidecarMessage::Assistant { message } => {
+            ClaudeStreamMessage::Assistant { message } => {
                 let content = message.get("content").expect("content field");
                 let text = extract_text(content);
                 assert_eq!(text, "Let me search. ");
@@ -1067,9 +860,9 @@ mod tests {
     #[test]
     fn test_parse_tool_use_permission_message() {
         let line = r#"{"type":"tool_use_permission","id":"perm-1","tool_name":"shell","input":{"command":"ls"}}"#;
-        let msg: SidecarMessage = serde_json::from_str(line).expect("parse permission");
+        let msg: ClaudeStreamMessage = serde_json::from_str(line).expect("parse permission");
         match msg {
-            SidecarMessage::ToolUsePermission {
+            ClaudeStreamMessage::ToolUsePermission {
                 id,
                 tool_name,
                 input,
@@ -1088,9 +881,9 @@ mod tests {
     #[test]
     fn test_parse_tool_use_permission_minimal() {
         let line = r#"{"type":"tool_use_permission"}"#;
-        let msg: SidecarMessage = serde_json::from_str(line).expect("parse minimal permission");
+        let msg: ClaudeStreamMessage = serde_json::from_str(line).expect("parse minimal permission");
         match msg {
-            SidecarMessage::ToolUsePermission {
+            ClaudeStreamMessage::ToolUsePermission {
                 id,
                 tool_name,
                 input,
