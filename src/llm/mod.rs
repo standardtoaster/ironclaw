@@ -780,6 +780,17 @@ const TINFOIL_BASE_URL: &str = "https://inference.tinfoil.sh/v1";
 pub fn create_provider_from_user_config(
     user_config: &crate::config::UserLlmConfig,
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    create_provider_from_user_config_with_lens(user_config, "user")
+}
+
+/// Create a per-user LLM provider with a specific lens name.
+///
+/// The `lens` parameter is used as the container label for ClaudeContainer
+/// providers, enabling per-lens container isolation and data volumes.
+pub fn create_provider_from_user_config_with_lens(
+    user_config: &crate::config::UserLlmConfig,
+    lens: &str,
+) -> Result<Arc<dyn LlmProvider>, LlmError> {
     use crate::config::LlmBackend;
     use secrecy::ExposeSecret;
 
@@ -962,7 +973,7 @@ pub fn create_provider_from_user_config(
                     .unwrap_or_else(|_| "percy-claude:latest".to_string()),
                 socket_path: std::env::var("CLAUDE_CONTAINER_SOCKET")
                     .unwrap_or_else(|_| "/run/podman/podman.sock".to_string()),
-                lens: "user".to_string(),
+                lens: lens.to_string(),
                 network: std::env::var("CLAUDE_CONTAINER_NETWORK")
                     .unwrap_or_else(|_| "percy_proxy-network".to_string()),
                 request_timeout_secs: 300,
@@ -970,7 +981,7 @@ pub fn create_provider_from_user_config(
                     .unwrap_or_else(|_| "claude-auth".to_string()),
                 skip_permissions: true,
                 extra_env: vec![],
-                lens_data_volume: Some("claude-data-user".to_string()),
+                lens_data_volume: Some(format!("claude-data-{lens}")),
                 lens_config_path: std::env::var("CLAUDE_CONTAINER_LENS_CONFIG").ok(),
             };
             tracing::info!(
