@@ -256,8 +256,13 @@ impl ContainerPool {
         let labels = container_labels(&self.config.lens, &thread_id);
 
         // Build command.
+        // --print (-p) is required for stream-json I/O, --verbose is required
+        // for stream-json output. The process stays alive reading stdin for
+        // multi-turn conversations via --input-format stream-json.
         let mut cmd = vec![
             "claude".to_string(),
+            "--print".to_string(),
+            "--verbose".to_string(),
             "--input-format".to_string(),
             "stream-json".to_string(),
             "--output-format".to_string(),
@@ -455,9 +460,12 @@ impl ContainerPool {
         })?;
 
         // Write the user message as a JSON line to stdin.
+        // Claude CLI stream-json format: {"message":{"role":"user","content":"..."}}
         let input = serde_json::json!({
-            "type": "user",
-            "content": prompt,
+            "message": {
+                "role": "user",
+                "content": prompt,
+            }
         });
         let mut line =
             serde_json::to_string(&input).map_err(|e| LlmError::RequestFailed {
