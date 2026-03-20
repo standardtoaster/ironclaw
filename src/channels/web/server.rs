@@ -408,7 +408,7 @@ impl GatewayState {
             if let Some(cfg) = user_config {
                 match cfg.llm_config() {
                     Ok(Some(llm_cfg)) => {
-                        match crate::llm::create_provider_from_user_config(&llm_cfg) {
+                        match crate::llm::create_provider_from_user_config_with_lens(&llm_cfg, user_id) {
                             Ok(provider) => {
                                 let mut cache = self.user_llm_providers.write().await;
                                 // Double-check after acquiring write lock
@@ -3936,5 +3936,81 @@ mod tests {
     fn test_is_local_origin_rejects_garbage() {
         assert!(!is_local_origin("not-a-url"));
         assert!(!is_local_origin(""));
+    }
+
+    #[tokio::test]
+    async fn test_per_user_llm_provider_resolved_from_user_tokens() {
+        use crate::config::UserTokenConfig;
+
+        // Build user_tokens with a per-user LLM override
+        let mut tokens = std::collections::HashMap::new();
+        tokens.insert(
+            "tok-andrew".to_string(),
+            UserTokenConfig {
+                user_id: "andrew".to_string(),
+                workspace_read_scopes: vec![],
+                llm_backend: Some("openai_compatible".to_string()),
+                llm_model: Some("test-model".to_string()),
+                llm_api_key: None,
+                llm_base_url: Some("http://localhost:9999/v1".to_string()),
+            },
+        );
+
+        let state = Arc::new(GatewayState {
+            msg_tx: tokio::sync::RwLock::new(None),
+            sse: Arc::new(SseManager::new()),
+            workspace: None,
+            workspace_pool: None,
+            session_manager: None,
+            log_broadcaster: None,
+            log_level_handle: None,
+            extension_manager: None,
+            tool_registry: None,
+            store: None,
+            job_manager: None,
+            prompt_queue: None,
+            scheduler: None,
+            default_user_id: "default".to_string(),
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: None,
+            llm_provider: None,
+            user_llm_providers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            user_tokens: Some(tokens),
+            skill_registry: None,
+            skill_catalog: None,
+            chat_rate_limiter: PerUserRateLimiter::new(30, 60),
+            registry_entries: vec![],
+            cost_guard: None,
+            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
+            startup_time: std::time::Instant::now(),
+            restart_requested: std::sync::atomic::AtomicBool::new(false),
+            collection_write_tx: None,
+            default_timezone: "UTC".to_string(),
+            mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
+        });
+
+        // Should resolve a per-user provider for "andrew"
+        let provider = state.llm_provider_for_user("andrew").await;
+        assert!(
+            provider.is_some(),
+            "Expected per-user provider for andrew, got None"
+        );
+        let p = provider.unwrap();
+        assert!(
+            p.model_name().contains("test-model"),
+            "Expected model name to contain 'test-model', got '{}'",
+            p.model_name()
+        );
+
+        // Should return None for unknown user (no global fallback set)
+        let unknown = state.llm_provider_for_user("nobody").await;
+        assert!(
+            unknown.is_none(),
+            "Expected None for unknown user, got Some"
+        );
+
+        // Should be cached on second call
+        let cached = state.llm_provider_for_user("andrew").await;
+        assert!(cached.is_some());
     }
 }
