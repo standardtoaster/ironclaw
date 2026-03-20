@@ -202,6 +202,13 @@ impl ContainerPool {
                 provider: "claude_container".to_string(),
                 reason: format!("Failed to connect to Docker: {}", e),
             })?
+        } else if socket_path.starts_with("tcp://") || socket_path.starts_with("http://") {
+            Docker::connect_with_http(socket_path, 120, bollard::API_DEFAULT_VERSION).map_err(
+                |e| LlmError::RequestFailed {
+                    provider: "claude_container".to_string(),
+                    reason: format!("Failed to connect to Docker via TCP at {}: {}", socket_path, e),
+                },
+            )?
         } else {
             Docker::connect_with_socket(socket_path, 120, bollard::API_DEFAULT_VERSION).map_err(
                 |e| LlmError::RequestFailed {
