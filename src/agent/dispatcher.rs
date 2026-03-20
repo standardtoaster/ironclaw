@@ -263,7 +263,23 @@ impl Agent {
             None
         };
 
-        let active_provider = self.active_llm();
+        // Resolve per-user LLM provider if configured (e.g. claude_container for Andrew).
+        // Falls back to the global active provider (which may be tier-mapped for escalation).
+        let active_provider = if let Some(ref gw) = self.gateway_state {
+            match gw.llm_provider_for_user(&message.user_id).await {
+                Some(user_provider) => {
+                    tracing::info!(
+                        user_id = %message.user_id,
+                        model = %user_provider.model_name(),
+                        "Using per-user LLM provider"
+                    );
+                    user_provider
+                }
+                None => self.active_llm(),
+            }
+        } else {
+            self.active_llm()
+        };
         let mut reasoning = Reasoning::new(active_provider.clone())
             .with_channel(message.channel.clone())
             .with_model_name(active_provider.active_model_name())
