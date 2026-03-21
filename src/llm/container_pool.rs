@@ -741,7 +741,7 @@ impl ContainerPool {
 
     /// Build volume bind mounts for a new container.
     fn build_volume_binds(&self) -> Vec<String> {
-        let mut binds = vec![format!("{}:/mnt/claude-auth:ro", self.config.auth_volume)];
+        let mut binds = vec![format!("{}:/mnt/claude-auth", self.config.auth_volume)];
         if let Some(ref vol) = self.config.lens_data_volume {
             binds.push(format!("{}:/mnt/lens-data:rw", vol));
         }
@@ -933,7 +933,7 @@ mod tests {
             auth_token: None,
         };
 
-        let mut binds = vec![format!("{}:/mnt/claude-auth:ro", config.auth_volume)];
+        let mut binds = vec![format!("{}:/mnt/claude-auth", config.auth_volume)];
         if let Some(ref vol) = config.lens_data_volume {
             binds.push(format!("{}:/mnt/lens-data:rw", vol));
         }
@@ -942,7 +942,7 @@ mod tests {
         }
 
         assert_eq!(binds.len(), 1);
-        assert_eq!(binds[0], "claude-auth:/mnt/claude-auth:ro");
+        assert_eq!(binds[0], "claude-auth:/mnt/claude-auth");
     }
 
     #[test]
@@ -963,7 +963,7 @@ mod tests {
             auth_token: None,
         };
 
-        let mut binds = vec![format!("{}:/mnt/claude-auth:ro", config.auth_volume)];
+        let mut binds = vec![format!("{}:/mnt/claude-auth", config.auth_volume)];
         if let Some(ref vol) = config.lens_data_volume {
             binds.push(format!("{}:/mnt/lens-data:rw", vol));
         }
