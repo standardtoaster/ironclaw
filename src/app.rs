@@ -422,7 +422,43 @@ impl AppBuilder {
                 ws = ws.with_memory_layers(gw.memory_layers.clone());
             }
             let ws = Arc::new(ws);
-            tools.register_memory_tools(Arc::clone(&ws));
+
+            // Detect multi-tenant mode and create the appropriate resolver
+            let is_multi_tenant = self
+                .config
+                .channels
+                .gateway
+                .as_ref()
+                .and_then(|gw| gw.user_tokens.as_ref())
+                .map(|t| !t.is_empty())
+                .unwrap_or(false);
+
+            if is_multi_tenant {
+                let mut resolver = crate::tools::builtin::PerUserWorkspaceResolver::new(
+                    Arc::clone(db),
+                    embeddings.clone(),
+                );
+                // Register per-user configs from GATEWAY_USER_TOKENS
+                if let Some(ref gw) = self.config.channels.gateway {
+                    if let Some(ref tokens) = gw.user_tokens {
+                        for tc in tokens.values() {
+                            resolver.add_user_config(
+                                tc.user_id.clone(),
+                                tc.workspace_read_scopes.clone(),
+                                crate::workspace::layer::MemoryLayer::default_for_user(
+                                    &tc.user_id,
+                                ),
+                            );
+                        }
+                    }
+                }
+                let resolver: Arc<dyn crate::tools::builtin::WorkspaceResolver> =
+                    Arc::new(resolver);
+                tools.register_memory_tools_with_resolver(resolver);
+                tracing::info!("Memory tools configured with per-user workspace resolver (multi-tenant)");
+            } else {
+                tools.register_memory_tools(Arc::clone(&ws));
+            };
 
             // Register structured collection tools.
             // In multi-tenant mode, scan schemas for ALL users so per-collection

@@ -316,17 +316,30 @@ impl ToolRegistry {
         tracing::info!("Registered 5 development tools");
     }
 
-    /// Register memory tools with a workspace.
+    /// Register memory tools with a workspace resolver.
     ///
-    /// Memory tools require a workspace for persistence. Call this after
+    /// Memory tools require a workspace resolver for persistence. Call this after
     /// `register_builtin_tools()` if you have a workspace available.
-    pub fn register_memory_tools(&self, workspace: Arc<Workspace>) {
-        self.register_sync(Arc::new(MemorySearchTool::new(Arc::clone(&workspace))));
-        self.register_sync(Arc::new(MemoryWriteTool::new(Arc::clone(&workspace))));
-        self.register_sync(Arc::new(MemoryReadTool::new(Arc::clone(&workspace))));
-        self.register_sync(Arc::new(MemoryTreeTool::new(workspace)));
+    pub fn register_memory_tools_with_resolver(
+        &self,
+        resolver: Arc<dyn crate::tools::builtin::WorkspaceResolver>,
+    ) {
+        self.register_sync(Arc::new(MemorySearchTool::new(Arc::clone(&resolver))));
+        self.register_sync(Arc::new(MemoryWriteTool::new(Arc::clone(&resolver))));
+        self.register_sync(Arc::new(MemoryReadTool::new(Arc::clone(&resolver))));
+        self.register_sync(Arc::new(MemoryTreeTool::new(resolver)));
 
         tracing::info!("Registered 4 memory tools");
+    }
+
+    /// Register memory tools with a fixed workspace (backward compatibility).
+    ///
+    /// Wraps the workspace in a `FixedWorkspaceResolver` and delegates to
+    /// `register_memory_tools_with_resolver`.
+    pub fn register_memory_tools(&self, workspace: Arc<Workspace>) {
+        let resolver: Arc<dyn crate::tools::builtin::WorkspaceResolver> =
+            Arc::new(crate::tools::builtin::FixedWorkspaceResolver::new(workspace));
+        self.register_memory_tools_with_resolver(resolver);
     }
 
     /// Register job management tools.

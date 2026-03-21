@@ -16,7 +16,7 @@ mod file;
 mod http;
 mod job;
 mod json;
-mod memory;
+pub mod memory;
 mod message;
 pub mod path_utils;
 mod restart;
@@ -50,7 +50,10 @@ pub use job::{
     PromptQueue, SchedulerSlot,
 };
 pub use json::JsonTool;
-pub use memory::{MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool};
+pub use memory::{
+    FixedWorkspaceResolver, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool,
+    PerUserWorkspaceResolver, WorkspaceResolver,
+};
 pub use message::MessageTool;
 pub use restart::RestartTool;
 pub use routine::{
