@@ -3403,9 +3403,10 @@ impl ExtensionManager {
 
         // No auth section — setup_is_complete was already checked above,
         // so if we reach here the setup requirements are satisfied.
-        if cap_file.setup.is_none() {
-            return ToolAuthState::NoAuth;
-        }
+        let setup = match &cap_file.setup {
+            Some(s) => s,
+            None => return ToolAuthState::NoAuth,
+        };
 
         let all_provided = futures::future::join_all(
             setup
