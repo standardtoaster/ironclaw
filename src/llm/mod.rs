@@ -886,10 +886,17 @@ pub fn create_provider_from_user_config_with_lens(
                 reason: "llm_base_url is required for openai_compatible backend".to_string(),
             })?;
 
+            // Use a dummy API key when none is provided — OpenAI-compatible servers
+            // (MLX, vLLM, LiteLLM) typically don't require auth, and this prevents
+            // the NearAiChatProvider from triggering interactive NEAR AI session auth.
+            let api_key = user_config
+                .api_key
+                .clone()
+                .or_else(|| Some(secrecy::SecretString::from("no-key")));
             let nearai_config = config::NearAiConfig {
                 model: user_config.model.clone(),
                 base_url: base_url.to_string(),
-                api_key: user_config.api_key.clone(),
+                api_key,
                 cheap_model: None,
                 fallback_model: None,
                 max_retries: 3,
