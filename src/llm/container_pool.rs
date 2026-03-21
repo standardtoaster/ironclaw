@@ -16,8 +16,11 @@ use bollard::container::{
 };
 use bollard::models::HostConfig;
 use bollard::Docker;
+#[allow(unused_imports)]
+use dashmap::DashMap;
 use tokio::io::{AsyncBufRead, AsyncWrite, ReadBuf};
-use tokio::sync::Mutex;
+#[allow(unused_imports)]
+use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 
 use crate::llm::claude_protocol::{self, ClaudeStreamMessage, ExchangeResult};
@@ -46,6 +49,31 @@ pub struct ContainerPoolConfig {
     pub request_timeout_secs: u64,
     /// Extra environment variables to pass to the container.
     pub extra_env: Vec<String>,
+}
+
+/// Reply received from the channel MCP server via HTTP callback.
+#[derive(Debug, Clone)]
+pub struct ChannelReply {
+    pub content: String,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub session_id: Option<String>,
+}
+
+/// Tracks a pending tool approval request from a container.
+#[derive(Debug)]
+pub struct PendingApproval {
+    pub container_ip: String,
+    pub container_port: u16,
+    pub thread_id: Uuid,
+}
+
+/// Tracks a pending percy_ask_user question from a container.
+#[derive(Debug)]
+pub struct PendingQuestion {
+    pub container_ip: String,
+    pub container_port: u16,
+    pub thread_id: Uuid,
 }
 
 /// Tracks the state of an active container session for a specific thread.
