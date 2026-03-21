@@ -328,7 +328,19 @@ impl GatewayState {
             if let Some(cfg) = user_config {
                 match cfg.llm_config() {
                     Ok(Some(llm_cfg)) => {
-                        match crate::llm::create_provider_from_user_config_with_lens(&llm_cfg, user_id) {
+                        // If a shared container pool exists and the user wants
+                        // ClaudeContainer, build the provider with the shared pool
+                        // so callbacks route to the correct DashMaps.
+                        let provider_result = if llm_cfg.backend == crate::config::LlmBackend::ClaudeContainer {
+                            if let Some(ref pool) = self.container_pool {
+                                crate::llm::create_container_provider_with_pool(&llm_cfg, user_id, Arc::clone(pool))
+                            } else {
+                                crate::llm::create_provider_from_user_config_with_lens(&llm_cfg, user_id)
+                            }
+                        } else {
+                            crate::llm::create_provider_from_user_config_with_lens(&llm_cfg, user_id)
+                        };
+                        match provider_result {
                             Ok(provider) => {
                                 let mut cache = self.user_llm_providers.write().await;
                                 // Double-check after acquiring write lock
