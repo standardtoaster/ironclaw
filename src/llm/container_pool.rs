@@ -284,7 +284,7 @@ impl ContainerPool {
         let container_ip =
             self.discover_container_ip(&container_id)
                 .await
-                .map_err(|e| {
+                .inspect_err(|_| {
                     let docker = self.docker.clone();
                     let cid = container_id.clone();
                     tokio::spawn(async move {
@@ -298,7 +298,6 @@ impl ContainerPool {
                             )
                             .await;
                     });
-                    e
                 })?;
 
         // Wait for the channel MCP server to become healthy.
