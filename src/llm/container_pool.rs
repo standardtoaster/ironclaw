@@ -95,7 +95,7 @@ pub struct ContainerSession {
 }
 
 /// Default port for the channel MCP server inside containers.
-const DEFAULT_CHANNEL_PORT: u16 = 3100;
+const DEFAULT_CHANNEL_PORT: u16 = 8787;
 
 /// Pool of warm Docker containers running Claude Code with channel MCP servers.
 ///
@@ -866,7 +866,7 @@ mod tests {
         let session = ContainerSession {
             container_id: "abc123".to_string(),
             container_ip: "172.18.0.5".to_string(),
-            channel_port: 3100,
+            channel_port: 8787,
             cli_session_id: Some("sess-1".to_string()),
             messages_sent: 3,
             created_at: Instant::now(),
@@ -874,7 +874,7 @@ mod tests {
         let cloned = session.clone();
         assert_eq!(cloned.container_id, "abc123");
         assert_eq!(cloned.container_ip, "172.18.0.5");
-        assert_eq!(cloned.channel_port, 3100);
+        assert_eq!(cloned.channel_port, 8787);
         assert_eq!(cloned.messages_sent, 3);
     }
 
@@ -910,7 +910,7 @@ mod tests {
         assert!(env.contains(&"EXTRA=1".to_string()));
         assert!(env.contains(&"PERCY_LENS=andrew".to_string()));
         assert!(env.contains(&"CLAUDE_MODEL=sonnet-4".to_string()));
-        assert!(env.contains(&"PERCY_CHANNEL_PORT=3100".to_string()));
+        assert!(env.contains(&"PERCY_CHANNEL_PORT=8787".to_string()));
     }
 
     // --- build_volume_binds tests ---
@@ -1056,7 +1056,7 @@ mod tests {
             "req-1".to_string(),
             PendingApproval {
                 container_ip: "172.18.0.5".to_string(),
-                container_port: 3100,
+                container_port: 8787,
                 thread_id,
             },
         );
@@ -1064,7 +1064,7 @@ mod tests {
         assert!(map.contains_key("req-1"));
         let (_, approval) = map.remove("req-1").unwrap();
         assert_eq!(approval.container_ip, "172.18.0.5");
-        assert_eq!(approval.container_port, 3100);
+        assert_eq!(approval.container_port, 8787);
         assert_eq!(approval.thread_id, thread_id);
         assert!(!map.contains_key("req-1"));
     }
@@ -1080,7 +1080,7 @@ mod tests {
             "q-1".to_string(),
             PendingQuestion {
                 container_ip: "10.0.0.2".to_string(),
-                container_port: 3100,
+                container_port: 8787,
                 thread_id,
             },
         );
