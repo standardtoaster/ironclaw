@@ -13,10 +13,13 @@ use crate::workspace::EmbeddingProvider;
 pub struct EmbeddingsConfig {
     /// Whether embeddings are enabled.
     pub enabled: bool,
-    /// Provider to use: "openai", "nearai", or "ollama"
+    /// Provider to use: "openai", "openai_compatible", "nearai", or "ollama"
     pub provider: String,
-    /// OpenAI API key (for OpenAI provider).
+    /// OpenAI API key (for OpenAI and openai_compatible providers).
     pub openai_api_key: Option<SecretString>,
+    /// Base URL for OpenAI-compatible embedding servers.
+    /// Used when provider is "openai_compatible". Defaults to https://api.openai.com.
+    pub base_url: Option<String>,
     /// Model to use for embeddings.
     pub model: String,
     /// Ollama base URL (for Ollama provider). Defaults to http://localhost:11434.
@@ -33,6 +36,7 @@ impl Default for EmbeddingsConfig {
             enabled: false,
             provider: "openai".to_string(),
             openai_api_key: None,
+            base_url: None,
             model,
             ollama_base_url: "http://localhost:11434".to_string(),
             dimension,
@@ -65,6 +69,8 @@ impl EmbeddingsConfig {
         let model =
             optional_env("EMBEDDING_MODEL")?.unwrap_or_else(|| settings.embeddings.model.clone());
 
+        let base_url = optional_env("EMBEDDING_BASE_URL")?;
+
         let ollama_base_url = optional_env("OLLAMA_BASE_URL")?
             .or_else(|| settings.ollama_base_url.clone())
             .unwrap_or_else(|| "http://localhost:11434".to_string());
@@ -78,6 +84,7 @@ impl EmbeddingsConfig {
             enabled,
             provider,
             openai_api_key,
+            base_url,
             model,
             ollama_base_url,
             dimension,
@@ -128,18 +135,47 @@ impl EmbeddingsConfig {
                         .with_model(&self.model, self.dimension),
                 ))
             }
-            _ => {
-                if let Some(api_key) = self.openai_api_key() {
-                    tracing::info!(
-                        "Embeddings enabled via OpenAI (model: {}, dim: {})",
-                        self.model,
-                        self.dimension,
-                    );
-                    Some(Arc::new(crate::workspace::OpenAiEmbeddings::with_model(
+            "openai_compatible" => {
+                let api_key = self.openai_api_key().unwrap_or("no-key");
+                let base_url = self.base_url.as_deref().unwrap_or("http://localhost:8080");
+                tracing::info!(
+                    "Embeddings enabled via OpenAI-compatible (model: {}, url: {}, dim: {})",
+                    self.model,
+                    base_url,
+                    self.dimension,
+                );
+                Some(Arc::new(
+                    crate::workspace::OpenAiEmbeddings::with_model(
                         api_key,
                         &self.model,
                         self.dimension,
-                    )))
+                    )
+                    .with_base_url(base_url),
+                ))
+            }
+            _ => {
+                if let Some(api_key) = self.openai_api_key() {
+                    let mut provider = crate::workspace::OpenAiEmbeddings::with_model(
+                        api_key,
+                        &self.model,
+                        self.dimension,
+                    );
+                    if let Some(base_url) = &self.base_url {
+                        tracing::info!(
+                            "Embeddings enabled via OpenAI (model: {}, url: {}, dim: {})",
+                            self.model,
+                            base_url,
+                            self.dimension,
+                        );
+                        provider = provider.with_base_url(base_url);
+                    } else {
+                        tracing::info!(
+                            "Embeddings enabled via OpenAI (model: {}, dim: {})",
+                            self.model,
+                            self.dimension,
+                        );
+                    }
+                    Some(Arc::new(provider))
                 } else {
                     tracing::warn!("Embeddings configured but OPENAI_API_KEY not set");
                     None

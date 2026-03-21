@@ -61,9 +61,12 @@ pub trait EmbeddingProvider: Send + Sync {
 }
 
 /// OpenAI embedding provider using text-embedding-ada-002 or text-embedding-3-small.
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
+
 pub struct OpenAiEmbeddings {
     client: reqwest::Client,
     api_key: String,
+    base_url: String,
     model: String,
     dimension: usize,
 }
@@ -76,6 +79,7 @@ impl OpenAiEmbeddings {
         Self {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
+            base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
             model: "text-embedding-3-small".to_string(),
             dimension: 1536,
         }
@@ -86,6 +90,7 @@ impl OpenAiEmbeddings {
         Self {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
+            base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
             model: "text-embedding-ada-002".to_string(),
             dimension: 1536,
         }
@@ -96,6 +101,7 @@ impl OpenAiEmbeddings {
         Self {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
+            base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
             model: "text-embedding-3-large".to_string(),
             dimension: 3072,
         }
@@ -110,9 +116,19 @@ impl OpenAiEmbeddings {
         Self {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
+            base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
             model: model.into(),
             dimension,
         }
+    }
+
+    /// Override the base URL for OpenAI-compatible embedding servers.
+    ///
+    /// Allows using local servers (MLX, vLLM, LiteLLM) that implement the
+    /// OpenAI `/v1/embeddings` endpoint.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into().trim_end_matches('/').to_string();
+        self
     }
 }
 
@@ -173,9 +189,10 @@ impl EmbeddingProvider for OpenAiEmbeddings {
             input: texts,
         };
 
+        let url = format!("{}/v1/embeddings", self.base_url);
         let response = self
             .client
-            .post("https://api.openai.com/v1/embeddings")
+            .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&request)
             .send()
