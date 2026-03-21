@@ -22,6 +22,7 @@ use crate::secrets::SecretsStore;
 use crate::skills::SkillRegistry;
 use crate::skills::catalog::SkillCatalog;
 use crate::tools::ToolRegistry;
+use crate::tools::builtin::memory::{FixedWorkspaceResolver, PerUserWorkspaceResolver, WorkspaceResolver};
 use crate::tools::mcp::{McpProcessManager, McpSessionManager};
 use crate::tools::wasm::SharedCredentialRegistry;
 use crate::tools::wasm::WasmToolRuntime;
@@ -311,17 +312,45 @@ impl AppBuilder {
             .map(|gw| gw.user_id.as_str())
             .unwrap_or("default");
         let workspace = if let Some(ref db) = self.db {
+            let memory_layers = self
+                .config
+                .channels
+                .gateway
+                .as_ref()
+                .map(|gw| gw.memory_layers.clone())
+                .unwrap_or_default();
+
             let mut ws = Workspace::new_with_db(workspace_user_id, db.clone())
                 .with_search_config(&self.config.search);
             if let Some(ref emb) = embeddings {
                 ws = ws.with_embeddings(emb.clone());
             }
-            // Wire memory layers from gateway config if present
-            if let Some(ref gw) = self.config.channels.gateway {
-                ws = ws.with_memory_layers(gw.memory_layers.clone());
-            }
+            ws = ws.with_memory_layers(memory_layers.clone());
             let ws = Arc::new(ws);
-            tools.register_memory_tools(Arc::clone(&ws));
+
+            // In multi-tenant mode (GATEWAY_USER_TOKENS configured), create a
+            // PerUserWorkspaceResolver that scopes memory per authenticated user.
+            // Otherwise use a fixed resolver with the startup workspace.
+            let is_multi_tenant = self
+                .config
+                .channels
+                .gateway
+                .as_ref()
+                .and_then(|gw| gw.user_tokens.as_ref())
+                .is_some();
+
+            let resolver: Arc<dyn WorkspaceResolver> = if is_multi_tenant {
+                Arc::new(PerUserWorkspaceResolver::new(
+                    db.clone(),
+                    embeddings.clone(),
+                    self.config.search.clone(),
+                    memory_layers,
+                ))
+            } else {
+                Arc::new(FixedWorkspaceResolver::new(Arc::clone(&ws)))
+            };
+            tools.register_memory_tools(resolver);
+
             Some(ws)
         } else {
             None

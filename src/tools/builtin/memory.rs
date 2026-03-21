@@ -12,14 +12,96 @@
 //! Use `memory_write` to persist important facts that should be remembered
 //! across sessions.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::config::WorkspaceSearchConfig;
 use crate::context::JobContext;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
-use crate::workspace::{Workspace, paths};
+use crate::workspace::layer::MemoryLayer;
+use crate::workspace::{EmbeddingProvider, Workspace, paths};
+
+/// Resolves a workspace for a given user ID.
+///
+/// In single-user mode, always returns the same workspace.
+/// In multi-tenant mode, creates per-user workspaces on demand.
+#[async_trait]
+pub trait WorkspaceResolver: Send + Sync {
+    async fn resolve(&self, user_id: &str) -> Arc<Workspace>;
+}
+
+/// Returns a fixed workspace regardless of user ID (single-user mode).
+pub struct FixedWorkspaceResolver {
+    workspace: Arc<Workspace>,
+}
+
+impl FixedWorkspaceResolver {
+    pub fn new(workspace: Arc<Workspace>) -> Self {
+        Self { workspace }
+    }
+}
+
+#[async_trait]
+impl WorkspaceResolver for FixedWorkspaceResolver {
+    async fn resolve(&self, _user_id: &str) -> Arc<Workspace> {
+        Arc::clone(&self.workspace)
+    }
+}
+
+/// Creates per-user workspaces, caching them for reuse (multi-tenant mode).
+pub struct PerUserWorkspaceResolver {
+    db: Arc<dyn crate::db::Database>,
+    embeddings: Option<Arc<dyn EmbeddingProvider>>,
+    search_config: WorkspaceSearchConfig,
+    memory_layers: Vec<MemoryLayer>,
+    cache: tokio::sync::RwLock<HashMap<String, Arc<Workspace>>>,
+}
+
+impl PerUserWorkspaceResolver {
+    pub fn new(
+        db: Arc<dyn crate::db::Database>,
+        embeddings: Option<Arc<dyn EmbeddingProvider>>,
+        search_config: WorkspaceSearchConfig,
+        memory_layers: Vec<MemoryLayer>,
+    ) -> Self {
+        Self {
+            db,
+            embeddings,
+            search_config,
+            memory_layers,
+            cache: tokio::sync::RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl WorkspaceResolver for PerUserWorkspaceResolver {
+    async fn resolve(&self, user_id: &str) -> Arc<Workspace> {
+        // Fast path: check read lock
+        {
+            let cache = self.cache.read().await;
+            if let Some(ws) = cache.get(user_id) {
+                return Arc::clone(ws);
+            }
+        }
+        // Slow path: create and cache
+        let mut ws = Workspace::new_with_db(user_id, Arc::clone(&self.db))
+            .with_search_config(&self.search_config);
+        if let Some(ref emb) = self.embeddings {
+            ws = ws.with_embeddings(Arc::clone(emb));
+        }
+        ws = ws.with_memory_layers(self.memory_layers.clone());
+        let ws = Arc::new(ws);
+        let mut cache = self.cache.write().await;
+        cache
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::clone(&ws));
+        ws
+    }
+}
 
 /// Identity files that the LLM must not overwrite via tool calls.
 /// These are loaded into the system prompt and could be used for prompt
@@ -55,13 +137,20 @@ fn looks_like_filesystem_path(path: &str) -> bool {
 /// The agent should call this tool before answering questions about
 /// prior work, decisions, preferences, or any historical context.
 pub struct MemorySearchTool {
-    workspace: Arc<Workspace>,
+    resolver: Arc<dyn WorkspaceResolver>,
 }
 
 impl MemorySearchTool {
-    /// Create a new memory search tool.
-    pub fn new(workspace: Arc<Workspace>) -> Self {
-        Self { workspace }
+    /// Create a new memory search tool with a workspace resolver.
+    pub fn new(resolver: Arc<dyn WorkspaceResolver>) -> Self {
+        Self { resolver }
+    }
+
+    /// Convenience constructor for single-user mode.
+    pub fn from_workspace(workspace: Arc<Workspace>) -> Self {
+        Self {
+            resolver: Arc::new(FixedWorkspaceResolver::new(workspace)),
+        }
     }
 }
 
@@ -100,7 +189,7 @@ impl Tool for MemorySearchTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -112,8 +201,8 @@ impl Tool for MemorySearchTool {
             .unwrap_or(5)
             .min(20) as usize;
 
-        let results = self
-            .workspace
+        let workspace = self.resolver.resolve(&ctx.user_id).await;
+        let results = workspace
             .search(query, limit)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Search failed: {}", e)))?;
@@ -144,13 +233,20 @@ impl Tool for MemorySearchTool {
 /// Use this to persist important information that should be remembered
 /// across sessions: decisions, preferences, facts, lessons learned.
 pub struct MemoryWriteTool {
-    workspace: Arc<Workspace>,
+    resolver: Arc<dyn WorkspaceResolver>,
 }
 
 impl MemoryWriteTool {
-    /// Create a new memory write tool.
-    pub fn new(workspace: Arc<Workspace>) -> Self {
-        Self { workspace }
+    /// Create a new memory write tool with a workspace resolver.
+    pub fn new(resolver: Arc<dyn WorkspaceResolver>) -> Self {
+        Self { resolver }
+    }
+
+    /// Convenience constructor for single-user mode.
+    pub fn from_workspace(workspace: Arc<Workspace>) -> Self {
+        Self {
+            resolver: Arc::new(FixedWorkspaceResolver::new(workspace)),
+        }
     }
 }
 
@@ -208,6 +304,7 @@ impl Tool for MemoryWriteTool {
         ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
+        let workspace = self.resolver.resolve(&ctx.user_id).await;
 
         let content = require_str(&params, "content")?;
 
@@ -229,7 +326,7 @@ impl Tool for MemoryWriteTool {
         if target == "bootstrap" {
             // Write empty content to effectively disable the bootstrap injection.
             // system_prompt_for_context() skips empty files.
-            self.workspace
+            workspace
                 .write(paths::BOOTSTRAP, "")
                 .await
                 .map_err(|e| ToolError::ExecutionFailed(format!("Write failed: {}", e)))?;
@@ -302,14 +399,14 @@ impl Tool for MemoryWriteTool {
         // When a layer is specified, route through layer-aware methods for ALL targets.
         let layer_result = if let Some(layer_name) = layer {
             let result = if append {
-                self.workspace
+                workspace
                     .append_to_layer(layer_name, &resolved_path, content, force)
                     .await
                     .map_err(|e| {
                         ToolError::ExecutionFailed(format!("Write failed: {}", e))
                     })?
             } else {
-                self.workspace
+                workspace
                     .write_to_layer(layer_name, &resolved_path, content, force)
                     .await
                     .map_err(|e| {
@@ -322,12 +419,12 @@ impl Tool for MemoryWriteTool {
             match target {
                 "memory" => {
                     if append {
-                        self.workspace
+                        workspace
                             .append_memory(content)
                             .await
                             .map_err(|e| ToolError::ExecutionFailed(format!("Write failed: {}", e)))?;
                     } else {
-                        self.workspace
+                        workspace
                             .write(paths::MEMORY, content)
                             .await
                             .map_err(|e| ToolError::ExecutionFailed(format!("Write failed: {}", e)))?;
@@ -336,19 +433,19 @@ impl Tool for MemoryWriteTool {
                 "daily_log" => {
                     let tz = crate::timezone::parse_timezone(&ctx.user_timezone)
                         .unwrap_or(chrono_tz::Tz::UTC);
-                    self.workspace
+                    workspace
                         .append_daily_log_tz(content, tz)
                         .await
                         .map_err(|e| ToolError::ExecutionFailed(format!("Write failed: {}", e)))?;
                 }
                 _ => {
                     if append {
-                        self.workspace
+                        workspace
                             .append(&resolved_path, content)
                             .await
                             .map_err(|e| ToolError::ExecutionFailed(format!("Write failed: {}", e)))?;
                     } else {
-                        self.workspace
+                        workspace
                             .write(&resolved_path, content)
                             .await
                             .map_err(|e| ToolError::ExecutionFailed(format!("Write failed: {}", e)))?;
@@ -385,13 +482,20 @@ impl Tool for MemoryWriteTool {
 ///
 /// Use this to read the full content of any file in the workspace.
 pub struct MemoryReadTool {
-    workspace: Arc<Workspace>,
+    resolver: Arc<dyn WorkspaceResolver>,
 }
 
 impl MemoryReadTool {
-    /// Create a new memory read tool.
-    pub fn new(workspace: Arc<Workspace>) -> Self {
-        Self { workspace }
+    /// Create a new memory read tool with a workspace resolver.
+    pub fn new(resolver: Arc<dyn WorkspaceResolver>) -> Self {
+        Self { resolver }
+    }
+
+    /// Convenience constructor for single-user mode.
+    pub fn from_workspace(workspace: Arc<Workspace>) -> Self {
+        Self {
+            resolver: Arc::new(FixedWorkspaceResolver::new(workspace)),
+        }
     }
 }
 
@@ -425,7 +529,7 @@ impl Tool for MemoryReadTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -439,8 +543,8 @@ impl Tool for MemoryReadTool {
             )));
         }
 
-        let doc = self
-            .workspace
+        let workspace = self.resolver.resolve(&ctx.user_id).await;
+        let doc = workspace
             .read(path)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Read failed: {}", e)))?;
@@ -464,20 +568,27 @@ impl Tool for MemoryReadTool {
 ///
 /// Returns a hierarchical view of files and directories with configurable depth.
 pub struct MemoryTreeTool {
-    workspace: Arc<Workspace>,
+    resolver: Arc<dyn WorkspaceResolver>,
 }
 
 impl MemoryTreeTool {
-    /// Create a new memory tree tool.
-    pub fn new(workspace: Arc<Workspace>) -> Self {
-        Self { workspace }
+    /// Create a new memory tree tool with a workspace resolver.
+    pub fn new(resolver: Arc<dyn WorkspaceResolver>) -> Self {
+        Self { resolver }
+    }
+
+    /// Convenience constructor for single-user mode.
+    pub fn from_workspace(workspace: Arc<Workspace>) -> Self {
+        Self {
+            resolver: Arc::new(FixedWorkspaceResolver::new(workspace)),
+        }
     }
 
     /// Recursively build tree structure.
     ///
     /// Returns a compact format where directories end with `/` and may have children.
     async fn build_tree(
-        &self,
+        workspace: &Workspace,
         path: &str,
         current_depth: usize,
         max_depth: usize,
@@ -486,8 +597,7 @@ impl MemoryTreeTool {
             return Ok(Vec::new());
         }
 
-        let entries = self
-            .workspace
+        let entries = workspace
             .list(path)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Tree failed: {}", e)))?;
@@ -502,8 +612,13 @@ impl MemoryTreeTool {
             };
 
             if entry.is_directory && current_depth < max_depth {
-                let children =
-                    Box::pin(self.build_tree(&entry.path, current_depth + 1, max_depth)).await?;
+                let children = Box::pin(Self::build_tree(
+                    workspace,
+                    &entry.path,
+                    current_depth + 1,
+                    max_depth,
+                ))
+                .await?;
                 if children.is_empty() {
                     result.push(serde_json::Value::String(display_path));
                 } else {
@@ -553,7 +668,7 @@ impl Tool for MemoryTreeTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -565,7 +680,8 @@ impl Tool for MemoryTreeTool {
             .unwrap_or(1)
             .clamp(1, 10) as usize;
 
-        let tree = self.build_tree(path, 1, depth).await?;
+        let workspace = self.resolver.resolve(&ctx.user_id).await;
+        let tree = Self::build_tree(&workspace, path, 1, depth).await?;
 
         // Compact output: just the tree array
         Ok(ToolOutput::success(
@@ -617,7 +733,7 @@ mod tests {
         #[test]
         fn test_memory_search_schema() {
             let workspace = make_test_workspace();
-            let tool = MemorySearchTool::new(workspace);
+            let tool = MemorySearchTool::from_workspace(workspace);
 
             assert_eq!(tool.name(), "memory_search");
             assert!(!tool.requires_sanitization());
@@ -635,7 +751,7 @@ mod tests {
         #[test]
         fn test_memory_write_schema() {
             let workspace = make_test_workspace();
-            let tool = MemoryWriteTool::new(workspace);
+            let tool = MemoryWriteTool::from_workspace(workspace);
 
             assert_eq!(tool.name(), "memory_write");
 
@@ -648,7 +764,7 @@ mod tests {
         #[test]
         fn test_memory_read_schema() {
             let workspace = make_test_workspace();
-            let tool = MemoryReadTool::new(workspace);
+            let tool = MemoryReadTool::from_workspace(workspace);
 
             assert_eq!(tool.name(), "memory_read");
 
@@ -665,7 +781,7 @@ mod tests {
         #[test]
         fn test_memory_tree_schema() {
             let workspace = make_test_workspace();
-            let tool = MemoryTreeTool::new(workspace);
+            let tool = MemoryTreeTool::from_workspace(workspace);
 
             assert_eq!(tool.name(), "memory_tree");
 

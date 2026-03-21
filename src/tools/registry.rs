@@ -14,13 +14,16 @@ use crate::secrets::SecretsStore;
 use crate::skills::catalog::SkillCatalog;
 use crate::skills::registry::SkillRegistry;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
+use crate::tools::builtin::memory::{
+    FixedWorkspaceResolver, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool,
+    WorkspaceResolver,
+};
 use crate::tools::builtin::{
     ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, ExtensionInfoTool, HttpTool,
-    JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool,
-    MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool,
-    ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool,
-    ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
-    ToolUpgradeTool, WriteFileTool,
+    JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool, PromptQueue,
+    ReadFileTool, ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool,
+    TimeTool, ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool,
+    ToolSearchTool, ToolUpgradeTool, WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolDomain};
@@ -337,17 +340,23 @@ impl ToolRegistry {
         tracing::debug!("Registered 5 development tools");
     }
 
-    /// Register memory tools with a workspace.
+    /// Register memory tools with a workspace resolver.
     ///
-    /// Memory tools require a workspace for persistence. Call this after
-    /// `register_builtin_tools()` if you have a workspace available.
-    pub fn register_memory_tools(&self, workspace: Arc<Workspace>) {
-        self.register_sync(Arc::new(MemorySearchTool::new(Arc::clone(&workspace))));
-        self.register_sync(Arc::new(MemoryWriteTool::new(Arc::clone(&workspace))));
-        self.register_sync(Arc::new(MemoryReadTool::new(Arc::clone(&workspace))));
-        self.register_sync(Arc::new(MemoryTreeTool::new(workspace)));
+    /// Memory tools require a workspace resolver for persistence. In single-user
+    /// mode, use `register_memory_tools_with_workspace` for convenience.
+    /// In multi-tenant mode, pass a `PerUserWorkspaceResolver`.
+    pub fn register_memory_tools(&self, resolver: Arc<dyn WorkspaceResolver>) {
+        self.register_sync(Arc::new(MemorySearchTool::new(Arc::clone(&resolver))));
+        self.register_sync(Arc::new(MemoryWriteTool::new(Arc::clone(&resolver))));
+        self.register_sync(Arc::new(MemoryReadTool::new(Arc::clone(&resolver))));
+        self.register_sync(Arc::new(MemoryTreeTool::new(resolver)));
 
         tracing::debug!("Registered 4 memory tools");
+    }
+
+    /// Register memory tools with a fixed workspace (single-user mode).
+    pub fn register_memory_tools_with_workspace(&self, workspace: Arc<Workspace>) {
+        self.register_memory_tools(Arc::new(FixedWorkspaceResolver::new(workspace)));
     }
 
     /// Register job management tools.
