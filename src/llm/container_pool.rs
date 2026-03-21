@@ -975,4 +975,120 @@ mod tests {
         assert!(binds[1].contains("data-vol"));
         assert!(binds[2].contains("/etc/percy/andrew"));
     }
+
+    // --- ChannelReply tests ---
+
+    #[test]
+    fn test_channel_reply_fields() {
+        let reply = ChannelReply {
+            content: "Hello, world!".to_string(),
+            input_tokens: 10,
+            output_tokens: 25,
+            session_id: Some("sess-abc".to_string()),
+        };
+        assert_eq!(reply.content, "Hello, world!");
+        assert_eq!(reply.input_tokens, 10);
+        assert_eq!(reply.output_tokens, 25);
+        assert_eq!(reply.session_id, Some("sess-abc".to_string()));
+    }
+
+    #[test]
+    fn test_channel_reply_no_session_id() {
+        let reply = ChannelReply {
+            content: "Done".to_string(),
+            input_tokens: 5,
+            output_tokens: 3,
+            session_id: None,
+        };
+        assert!(reply.session_id.is_none());
+    }
+
+    #[test]
+    fn test_channel_reply_clone() {
+        let reply = ChannelReply {
+            content: "test".to_string(),
+            input_tokens: 1,
+            output_tokens: 2,
+            session_id: Some("s1".to_string()),
+        };
+        let cloned = reply.clone();
+        assert_eq!(cloned.content, "test");
+        assert_eq!(cloned.session_id, Some("s1".to_string()));
+    }
+
+    // --- Pending map (DashMap) tests ---
+
+    #[tokio::test]
+    async fn test_pending_replies_insert_remove() {
+        use dashmap::DashMap;
+        use tokio::sync::oneshot;
+
+        let map: DashMap<Uuid, oneshot::Sender<ChannelReply>> = DashMap::new();
+        let thread_id = Uuid::new_v4();
+
+        let (tx, rx) = oneshot::channel::<ChannelReply>();
+        map.insert(thread_id, tx);
+        assert!(map.contains_key(&thread_id));
+
+        // Remove and send a reply through the channel.
+        let (_, sender) = map.remove(&thread_id).unwrap();
+        let reply = ChannelReply {
+            content: "ok".to_string(),
+            input_tokens: 1,
+            output_tokens: 2,
+            session_id: None,
+        };
+        sender.send(reply).unwrap();
+
+        let received = rx.await.unwrap();
+        assert_eq!(received.content, "ok");
+        assert!(!map.contains_key(&thread_id));
+    }
+
+    #[test]
+    fn test_pending_approvals_insert_remove() {
+        use dashmap::DashMap;
+
+        let map: DashMap<String, PendingApproval> = DashMap::new();
+        let thread_id = Uuid::new_v4();
+
+        map.insert(
+            "req-1".to_string(),
+            PendingApproval {
+                container_ip: "172.18.0.5".to_string(),
+                container_port: 3100,
+                thread_id,
+            },
+        );
+
+        assert!(map.contains_key("req-1"));
+        let (_, approval) = map.remove("req-1").unwrap();
+        assert_eq!(approval.container_ip, "172.18.0.5");
+        assert_eq!(approval.container_port, 3100);
+        assert_eq!(approval.thread_id, thread_id);
+        assert!(!map.contains_key("req-1"));
+    }
+
+    #[test]
+    fn test_pending_questions_insert_remove() {
+        use dashmap::DashMap;
+
+        let map: DashMap<String, PendingQuestion> = DashMap::new();
+        let thread_id = Uuid::new_v4();
+
+        map.insert(
+            "q-1".to_string(),
+            PendingQuestion {
+                container_ip: "10.0.0.2".to_string(),
+                container_port: 3100,
+                thread_id,
+            },
+        );
+
+        assert!(map.contains_key("q-1"));
+        let (_, question) = map.remove("q-1").unwrap();
+        assert_eq!(question.container_ip, "10.0.0.2");
+        assert_eq!(question.thread_id, thread_id);
+        assert!(!map.contains_key("q-1"));
+    }
 }
