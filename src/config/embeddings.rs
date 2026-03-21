@@ -16,9 +16,9 @@ pub const DEFAULT_EMBEDDING_CACHE_SIZE: usize = 10_000;
 pub struct EmbeddingsConfig {
     /// Whether embeddings are enabled.
     pub enabled: bool,
-    /// Provider to use: "openai", "nearai", or "ollama"
+    /// Provider to use: "openai", "openai_compatible", "nearai", or "ollama"
     pub provider: String,
-    /// OpenAI API key (for OpenAI provider).
+    /// OpenAI API key (for OpenAI and openai_compatible providers).
     pub openai_api_key: Option<SecretString>,
     /// Model to use for embeddings.
     pub model: String,
@@ -159,6 +159,24 @@ impl EmbeddingsConfig {
                 Some(Arc::new(
                     crate::workspace::OllamaEmbeddings::new(&self.ollama_base_url)
                         .with_model(&self.model, self.dimension),
+                ))
+            }
+            "openai_compatible" => {
+                let api_key = self.openai_api_key().unwrap_or("no-key");
+                let base_url = self.openai_base_url.as_deref().unwrap_or("http://localhost:8080");
+                tracing::debug!(
+                    "Embeddings enabled via OpenAI-compatible (model: {}, url: {}, dim: {})",
+                    self.model,
+                    base_url,
+                    self.dimension,
+                );
+                Some(Arc::new(
+                    crate::workspace::OpenAiEmbeddings::with_model(
+                        api_key,
+                        &self.model,
+                        self.dimension,
+                    )
+                    .with_base_url(base_url),
                 ))
             }
             _ => {
