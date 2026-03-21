@@ -403,6 +403,11 @@ async fn create_tier_provider(
             extra_env: vec![],
             lens_data_volume: Some(format!("claude-data-{}", tier.name)),
             lens_config_path: std::env::var("CLAUDE_CONTAINER_LENS_CONFIG").ok(),
+            callback_host: std::env::var("CLAUDE_CONTAINER_CALLBACK_HOST").ok(),
+            callback_port: std::env::var("CLAUDE_CONTAINER_CALLBACK_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            auth_token: std::env::var("GATEWAY_AUTH_TOKEN").ok(),
         };
         tracing::info!(
             tier = %tier.name,
@@ -983,6 +988,11 @@ pub fn create_provider_from_user_config_with_lens(
                 extra_env: vec![],
                 lens_data_volume: Some(format!("claude-data-{lens}")),
                 lens_config_path: std::env::var("CLAUDE_CONTAINER_LENS_CONFIG").ok(),
+                callback_host: std::env::var("CLAUDE_CONTAINER_CALLBACK_HOST").ok(),
+                callback_port: std::env::var("CLAUDE_CONTAINER_CALLBACK_PORT")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
+                auth_token: std::env::var("GATEWAY_AUTH_TOKEN").ok(),
             };
             tracing::info!(
                 user_model = %user_config.model,
