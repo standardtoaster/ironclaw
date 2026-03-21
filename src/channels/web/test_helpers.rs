@@ -94,6 +94,7 @@ impl TestGatewayBuilder {
             collection_write_tx: None,
             default_timezone: "UTC".to_string(),
             mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
+            container_pool: None,
         })
     }
 
@@ -108,7 +109,7 @@ impl TestGatewayBuilder {
             .parse()
             .expect("hard-coded address must parse");
         let auth = MultiAuthState::single(auth_token.to_string(), "test-user".to_string());
-        let bound = start_server(addr, state.clone(), auth).await?;
+        let bound = start_server(addr, state.clone(), auth, &[]).await?;
         Ok((bound, state))
     }
 }

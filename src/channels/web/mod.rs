@@ -63,6 +63,11 @@ pub struct GatewayChannel {
     state: Arc<GatewayState>,
     /// Multi-user auth state (replaces bare auth_token).
     auth: MultiAuthState,
+    /// Extra routes to merge into the gateway router (e.g., Claude container callbacks).
+    ///
+    /// These must already have their own state applied (i.e., be `Router<()>`) so they
+    /// merge cleanly into the outer router regardless of its state type.
+    extra_routes: Vec<axum::Router>,
 }
 
 impl GatewayChannel {
@@ -112,12 +117,14 @@ impl GatewayChannel {
             collection_write_tx: None,
             default_timezone: "UTC".to_string(),
             mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
+            container_pool: None,
         });
 
         Self {
             config,
             state,
             auth,
+            extra_routes: Vec::new(),
         }
     }
 
@@ -155,12 +162,14 @@ impl GatewayChannel {
             collection_write_tx: None,
             default_timezone: "UTC".to_string(),
             mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
+            container_pool: None,
         });
 
         Self {
             config,
             state,
             auth,
+            extra_routes: Vec::new(),
         }
     }
 
@@ -198,6 +207,7 @@ impl GatewayChannel {
             collection_write_tx: self.state.collection_write_tx.clone(),
             default_timezone: self.state.default_timezone.clone(),
             mcp_sessions: Arc::clone(&self.state.mcp_sessions),
+            container_pool: self.state.container_pool.clone(),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
@@ -326,6 +336,27 @@ impl GatewayChannel {
         self
     }
 
+    /// Inject a shared container pool for Claude container providers.
+    ///
+    /// When set, the gateway registers callback routes (`/api/claude/*`) and
+    /// per-user `ClaudeContainer` providers reuse this pool.
+    pub fn with_container_pool(
+        mut self,
+        pool: Arc<crate::llm::container_pool::ContainerPool>,
+    ) -> Self {
+        self.rebuild_state(|s| s.container_pool = Some(pool));
+        self
+    }
+
+    /// Add extra routes to merge into the gateway router.
+    ///
+    /// The routes must already have their own state applied (be `Router<()>`)
+    /// so they merge cleanly. Used for Claude container callback endpoints.
+    pub fn with_extra_routes(mut self, routes: axum::Router) -> Self {
+        self.extra_routes.push(routes);
+        self
+    }
+
     /// Get the first auth token (for printing to console on startup).
     pub fn auth_token(&self) -> &str {
         self.auth.first_token().unwrap_or("")
@@ -357,7 +388,7 @@ impl Channel for GatewayChannel {
                 ),
             })?;
 
-        server::start_server(addr, self.state.clone(), self.auth.clone()).await?;
+        server::start_server(addr, self.state.clone(), self.auth.clone(), &self.extra_routes).await?;
 
         Ok(Box::pin(ReceiverStream::new(rx)))
     }

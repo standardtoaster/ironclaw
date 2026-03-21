@@ -583,6 +583,71 @@ async fn async_main() -> anyhow::Result<()> {
         gw = gw.with_cost_guard(Arc::clone(&components.cost_guard));
         gw = gw.with_collection_write_tx(collection_write_tx.clone());
         gw = gw.with_default_timezone(config.agent.default_timezone.clone());
+
+        // Wire up Claude container callback routes if any lens uses the
+        // ClaudeContainer backend (routing tiers, escalation tiers, or per-user).
+        {
+            use ironclaw::config::LlmBackend;
+
+            let has_container_tier = config
+                .llm
+                .routing_tiers
+                .iter()
+                .chain(config.llm.escalation_tiers.iter())
+                .any(|t| t.backend == LlmBackend::ClaudeContainer);
+
+            let has_container_user = gw_config
+                .user_tokens
+                .as_ref()
+                .is_some_and(|tokens| {
+                    tokens.values().any(|cfg| {
+                        cfg.llm_backend
+                            .as_deref()
+                            .is_some_and(|b| b == "claude_container")
+                    })
+                });
+
+            if has_container_tier || has_container_user {
+                let socket_path = std::env::var("CLAUDE_CONTAINER_SOCKET")
+                    .unwrap_or_else(|_| "/run/podman/podman.sock".to_string());
+                let pool_config = ironclaw::llm::container_pool::ContainerPoolConfig {
+                    image: std::env::var("CLAUDE_CONTAINER_IMAGE")
+                        .unwrap_or_else(|_| "percy-claude:latest".to_string()),
+                    lens: "shared".to_string(),
+                    model: String::new(),
+                    network: std::env::var("CLAUDE_CONTAINER_NETWORK")
+                        .unwrap_or_else(|_| "percy_proxy-network".to_string()),
+                    auth_volume: std::env::var("CLAUDE_CONTAINER_AUTH_VOLUME")
+                        .unwrap_or_else(|_| "claude-auth".to_string()),
+                    lens_data_volume: None,
+                    lens_config_path: None,
+                    skip_permissions: true,
+                    request_timeout_secs: 300,
+                    extra_env: vec![],
+                    callback_host: std::env::var("CLAUDE_CONTAINER_CALLBACK_HOST").ok(),
+                    callback_port: std::env::var("CLAUDE_CONTAINER_CALLBACK_PORT")
+                        .ok()
+                        .and_then(|s| s.parse().ok()),
+                    auth_token: std::env::var("GATEWAY_AUTH_TOKEN").ok(),
+                };
+                match ironclaw::llm::container_pool::ContainerPool::new(&socket_path, pool_config)
+                    .await
+                {
+                    Ok(pool) => {
+                        let pool = Arc::new(pool);
+                        gw = gw.with_container_pool(Arc::clone(&pool));
+                        tracing::info!("Shared container pool created for Claude container providers");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to create shared container pool — Claude container providers will use lazy init"
+                        );
+                    }
+                }
+            }
+        }
+
         if config.sandbox.enabled {
             gw = gw.with_prompt_queue(Arc::clone(&prompt_queue));
 

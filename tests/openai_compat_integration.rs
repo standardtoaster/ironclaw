@@ -221,10 +221,11 @@ async fn start_test_server_with_provider(
         collection_write_tx: None,
         default_timezone: "UTC".to_string(),
         mcp_sessions: Arc::new(ironclaw::channels::mcp::McpSessionStore::new()),
+        container_pool: None,
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let bound_addr = start_server(addr, state.clone(), MultiAuthState::single(AUTH_TOKEN.to_string(), "test-user".to_string()))
+    let bound_addr = start_server(addr, state.clone(), MultiAuthState::single(AUTH_TOKEN.to_string(), "test-user".to_string()), &[])
         .await
         .expect("Failed to start test server");
 
@@ -718,10 +719,11 @@ async fn test_no_llm_provider_returns_503() {
         collection_write_tx: None,
         default_timezone: "UTC".to_string(),
         mcp_sessions: Arc::new(ironclaw::channels::mcp::McpSessionStore::new()),
+        container_pool: None,
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let bound_addr = start_server(addr, state, MultiAuthState::single(AUTH_TOKEN.to_string(), "test-user".to_string()))
+    let bound_addr = start_server(addr, state, MultiAuthState::single(AUTH_TOKEN.to_string(), "test-user".to_string()), &[])
         .await
         .unwrap();
 

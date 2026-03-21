@@ -93,6 +93,30 @@ impl ClaudeContainerProvider {
         }
     }
 
+    /// Create a new container provider with a pre-initialized pool.
+    ///
+    /// Use this when the pool needs to be shared (e.g., with callback routes
+    /// registered on the web gateway).
+    pub fn new_with_pool(config: ContainerProviderConfig, pool: Arc<ContainerPool>) -> Self {
+        let model_label = format!("claude-container/{}", config.model);
+        let cell = OnceCell::new();
+        // OnceCell::set cannot fail here since the cell is freshly created.
+        let _ = cell.set(pool);
+        Self {
+            config,
+            pool: cell,
+            model_label,
+        }
+    }
+
+    /// Get the pool if it has been initialized.
+    ///
+    /// Returns `None` if no request has been made yet (lazy init not triggered).
+    /// Use this to obtain the pool for building callback routes.
+    pub fn initialized_pool(&self) -> Option<&Arc<ContainerPool>> {
+        self.pool.get()
+    }
+
     /// Get or initialize the container pool.
     async fn pool(&self) -> Result<&Arc<ContainerPool>, LlmError> {
         self.pool

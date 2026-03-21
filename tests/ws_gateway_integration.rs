@@ -69,10 +69,11 @@ async fn start_test_server() -> (
         collection_write_tx: None,
         default_timezone: "UTC".to_string(),
         mcp_sessions: Arc::new(ironclaw::channels::mcp::McpSessionStore::new()),
+        container_pool: None,
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let bound_addr = start_server(addr, state.clone(), MultiAuthState::single(AUTH_TOKEN.to_string(), "test-user".to_string()))
+    let bound_addr = start_server(addr, state.clone(), MultiAuthState::single(AUTH_TOKEN.to_string(), "test-user".to_string()), &[])
         .await
         .expect("Failed to start test server");
 

@@ -566,6 +566,7 @@ mod tests {
             collection_write_tx: None,
             default_timezone: "UTC".to_string(),
             mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
+            container_pool: None,
         }
     }
 }

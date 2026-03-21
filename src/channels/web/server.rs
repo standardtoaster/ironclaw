@@ -295,6 +295,12 @@ pub struct GatewayState {
     pub default_timezone: String,
     /// Active MCP sessions for Streamable HTTP transport.
     pub mcp_sessions: Arc<crate::channels::mcp::McpSessionStore>,
+    /// Shared container pool for Claude container providers.
+    ///
+    /// When present, callback routes (`/api/claude/*`) are registered on the
+    /// gateway and per-user `ClaudeContainer` providers reuse this pool instead
+    /// of creating their own.
+    pub container_pool: Option<Arc<crate::llm::container_pool::ContainerPool>>,
 }
 
 impl GatewayState {
@@ -367,6 +373,7 @@ pub async fn start_server(
     addr: SocketAddr,
     state: Arc<GatewayState>,
     auth: MultiAuthState,
+    extra_routes: &[axum::Router],
 ) -> Result<SocketAddr, crate::error::ChannelError> {
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
         crate::error::ChannelError::StartupFailed {
@@ -554,7 +561,7 @@ pub async fn start_server(
         ]))
         .allow_credentials(true);
 
-    let app = Router::new()
+    let mut app = Router::new()
         .merge(public)
         .merge(statics)
         .merge(projects)
@@ -570,6 +577,25 @@ pub async fn start_server(
             header::HeaderValue::from_static("DENY"),
         ))
         .with_state(state.clone());
+
+    // Register Claude container callback routes when a container pool is configured.
+    // These routes carry their own `ChannelCallbackState` (via `.with_state()`),
+    // so they are `Router<()>` and merge cleanly after the outer `.with_state()`.
+    if let Some(ref pool) = state.container_pool {
+        let callback_router = crate::llm::claude_container::ClaudeContainerProvider::callback_routes(
+            Arc::clone(pool),
+            Arc::clone(&state.sse),
+        );
+        app = app.merge(callback_router);
+        tracing::info!("Claude container callback routes registered");
+    }
+
+    // Merge any extra routes passed by the caller.
+    for routes in extra_routes {
+        app = app.merge(routes.clone());
+    }
+
+    let app = app;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     *state.shutdown_tx.write().await = Some(shutdown_tx);
@@ -3066,6 +3092,7 @@ mod tests {
             collection_write_tx: None,
             default_timezone: "UTC".to_string(),
             mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
+            container_pool: None,
         })
     }
 
@@ -3463,6 +3490,7 @@ mod tests {
             collection_write_tx: None,
             default_timezone: "UTC".to_string(),
             mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
+            container_pool: None,
         });
 
         // Should resolve a per-user provider for "andrew"
