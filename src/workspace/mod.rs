@@ -1076,9 +1076,28 @@ impl Workspace {
             .await
     }
 
+    /// Paths excluded from search results.
+    ///
+    /// Identity and system files are already injected into the system prompt —
+    /// returning them from search pollutes results with content the model already
+    /// has, pushing actual user data below the relevance cutoff.
+    const SEARCH_EXCLUDED_PATHS: &[&str] = &[
+        paths::AGENTS,
+        paths::SOUL,
+        paths::USER,
+        paths::IDENTITY,
+        paths::TOOLS,
+        paths::HEARTBEAT,
+        paths::BOOTSTRAP,
+        paths::MEMORY,  // already in system prompt
+        paths::README,  // workspace boilerplate
+    ];
+
     /// Search with custom configuration.
     ///
     /// When multi-scope reads are configured, searches across all read scopes.
+    /// Results from identity/system files are automatically excluded — they are
+    /// already in the system prompt and would otherwise pollute search rankings.
     pub async fn search_with_config(
         &self,
         query: &str,
@@ -1098,7 +1117,7 @@ impl Workspace {
             None
         };
 
-        if self.is_multi_scope() {
+        let results = if self.is_multi_scope() {
             self.storage
                 .hybrid_search_multi(
                     &self.read_user_ids,
@@ -1107,7 +1126,7 @@ impl Workspace {
                     embedding.as_deref(),
                     &config,
                 )
-                .await
+                .await?
         } else {
             self.storage
                 .hybrid_search(
@@ -1117,8 +1136,20 @@ impl Workspace {
                     embedding.as_deref(),
                     &config,
                 )
-                .await
-        }
+                .await?
+        };
+
+        // Filter out identity/system files — they're already in the system prompt.
+        let filtered: Vec<SearchResult> = results
+            .into_iter()
+            .filter(|r| {
+                !Self::SEARCH_EXCLUDED_PATHS
+                    .iter()
+                    .any(|p| r.document_path == *p)
+            })
+            .collect();
+
+        Ok(filtered)
     }
 
     // ==================== Indexing ====================
