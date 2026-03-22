@@ -57,6 +57,7 @@ fn make_skill(
             activation: ActivationCriteria::default(),
             credentials,
             metadata: None,
+            scope: None,
         },
         prompt_content: prompt.to_string(),
         trust: SkillTrust::Trusted,

@@ -27,12 +27,14 @@
 
 pub mod attenuation;
 pub mod bundled;
+pub mod script_runner;
 
 // Items from `ironclaw_skills` are no longer glob-re-exported.
 // Callers should import from `ironclaw_skills` directly.
 
 // Re-export attenuation at the same path as before.
 pub use attenuation::{AttenuationResult, attenuate_tools};
+pub use script_runner::run_activation_script;
 
 use crate::secrets::{CredentialLocation, CredentialMapping};
 use ironclaw_skills::{LoadedSkill, SkillCredentialLocation, SkillCredentialSpec};
@@ -198,6 +200,7 @@ mod tests {
                     setup_instructions: None,
                 }],
                 metadata: None,
+                scope: None,
             },
             prompt_content: "test".to_string(),
             trust: SkillTrust::Trusted,
@@ -236,6 +239,7 @@ mod tests {
                     setup_instructions: None,
                 }],
                 metadata: None,
+                scope: None,
             },
             prompt_content: "test".to_string(),
             trust: SkillTrust::Trusted,

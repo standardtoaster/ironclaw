@@ -25,6 +25,55 @@ const MIN_KEYWORD_TAG_LENGTH: usize = 3;
 /// Maximum file size for SKILL.md (64 KiB).
 pub const MAX_PROMPT_FILE_SIZE: u64 = 64 * 1024;
 
+/// Optional user scope for a skill. When set, the skill only activates for
+/// matching user IDs. Supports both a single string and a list via untagged
+/// serde deserialization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum SkillScope {
+    /// Skill is scoped to a single user.
+    Single(String),
+    /// Skill is scoped to multiple users.
+    Multiple(Vec<String>),
+}
+
+impl SkillScope {
+    /// Check if the given user_id is within this scope.
+    pub fn matches(&self, user_id: &str) -> bool {
+        match self {
+            SkillScope::Single(s) => s == user_id,
+            SkillScope::Multiple(v) => v.iter().any(|s| s == user_id),
+        }
+    }
+}
+
+/// Script to run at skill activation time, capturing stdout as dynamic context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivationScript {
+    /// Interpreter language: "python", "bash", or "node".
+    pub language: String,
+    /// Inline script content (mutually exclusive with `source_file`).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Script file path relative to the skill directory (mutually exclusive with `source`).
+    #[serde(default)]
+    pub source_file: Option<String>,
+    /// Script execution timeout in milliseconds.
+    #[serde(default = "default_script_timeout")]
+    pub timeout_ms: u64,
+    /// Maximum bytes to capture from stdout.
+    #[serde(default = "default_max_output")]
+    pub max_output_bytes: usize,
+}
+
+fn default_script_timeout() -> u64 {
+    5000
+}
+
+fn default_max_output() -> usize {
+    4096
+}
+
 /// Trust state for a skill, determining its authority ceiling.
 ///
 /// SAFETY: Variant ordering matters. `Ord` is derived from discriminant values
@@ -89,6 +138,9 @@ pub struct ActivationCriteria {
     /// prevent activation for users without access to the collection.
     #[serde(default)]
     pub tools_prefix: Option<String>,
+    /// Optional activation script to run at skill activation time.
+    #[serde(default)]
+    pub script: Option<ActivationScript>,
 }
 
 impl ActivationCriteria {
@@ -133,6 +185,10 @@ pub struct SkillManifest {
     /// Optional OpenClaw metadata.
     #[serde(default)]
     pub metadata: Option<SkillMetadata>,
+    /// Optional user_id scope. If set, the skill only activates for matching users.
+    /// Can be a single user_id or a list. If empty/None, activates for all users.
+    #[serde(default)]
+    pub scope: Option<SkillScope>,
 }
 
 fn default_version() -> String {
@@ -470,6 +526,7 @@ metadata:
                 activation: ActivationCriteria::default(),
                 credentials: vec![],
                 metadata: None,
+                scope: None,
             },
             prompt_content: "test prompt".to_string(),
             trust: SkillTrust::Trusted,

@@ -50,9 +50,9 @@ pub mod registry;
 
 // Re-export core types at crate root for convenience.
 pub use types::{
-    ActivationCriteria, GatingRequirements, LoadedSkill, MAX_PROMPT_FILE_SIZE, OpenClawMeta,
-    ProviderRefreshStrategy, SkillCredentialLocation, SkillCredentialSpec, SkillManifest,
-    SkillMetadata, SkillOAuthConfig, SkillSource, SkillTrust,
+    ActivationCriteria, ActivationScript, GatingRequirements, LoadedSkill, MAX_PROMPT_FILE_SIZE,
+    OpenClawMeta, ProviderRefreshStrategy, SkillCredentialLocation, SkillCredentialSpec,
+    SkillManifest, SkillMetadata, SkillOAuthConfig, SkillScope, SkillSource, SkillTrust,
 };
 
 pub use gating::{GatingResult, check_requirements, check_requirements_sync};

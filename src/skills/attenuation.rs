@@ -142,6 +142,7 @@ mod tests {
                 activation: ActivationCriteria::default(),
                 credentials: vec![],
                 metadata: None,
+                scope: None,
             },
             prompt_content: "test".to_string(),
             trust,

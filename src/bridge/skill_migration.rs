@@ -143,6 +143,7 @@ mod tests {
                 },
                 credentials: vec![],
                 metadata: None,
+                scope: None,
             },
             prompt_content: content.to_string(),
             trust: SkillTrust::Trusted,
