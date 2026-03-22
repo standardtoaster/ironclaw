@@ -762,4 +762,15 @@ impl WorkspaceStore for PgBackend {
             .list_directory_multi(user_ids, agent_id, directory)
             .await
     }
+
+    async fn search_conversation_messages(
+        &self,
+        user_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, WorkspaceError> {
+        self.repo
+            .search_conversation_messages(user_id, query, limit)
+            .await
+    }
 }

@@ -840,6 +840,63 @@ impl WorkspaceStore for LibSqlBackend {
 
         Ok(fuse_results(fts_results, vector_results, config))
     }
+
+    async fn search_conversation_messages(
+        &self,
+        user_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, WorkspaceError> {
+        let conn = self
+            .connect()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: e.to_string(),
+            })?;
+
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT cm.id, cm.conversation_id, cm.content
+                FROM conversation_messages_fts fts
+                JOIN conversation_messages cm ON cm.rowid = fts.rowid
+                JOIN conversations c ON c.id = cm.conversation_id
+                WHERE c.user_id = ?1
+                  AND conversation_messages_fts MATCH ?2
+                ORDER BY rank
+                LIMIT ?3
+                "#,
+                params![user_id, query, limit as i64],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Conversation FTS query failed: {}", e),
+            })?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Conversation FTS row fetch failed: {}", e),
+            })?
+        {
+            let message_id: Uuid = get_text(&row, 0).parse().unwrap_or_default();
+            let conversation_id: Uuid = get_text(&row, 1).parse().unwrap_or_default();
+            results.push(SearchResult {
+                document_id: message_id,
+                document_path: format!("conversation/{}", conversation_id),
+                chunk_id: message_id,
+                content: get_text(&row, 2),
+                score: 0.0,
+                fts_rank: Some(results.len() as u32 + 1),
+                vector_rank: None,
+                conversation_id: Some(conversation_id),
+                source: "conversation".to_string(),
+            });
+        }
+        Ok(results)
+    }
 }
 
 #[cfg(test)]

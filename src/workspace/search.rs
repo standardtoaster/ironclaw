@@ -145,6 +145,10 @@ pub struct SearchResult {
     pub fts_rank: Option<u32>,
     /// Rank in vector results (1-based, None if not in vector results).
     pub vector_rank: Option<u32>,
+    /// Conversation ID (set for conversation message hits, None for memory hits).
+    pub conversation_id: Option<Uuid>,
+    /// Source of this result: "memory" or "conversation".
+    pub source: String,
 }
 
 impl SearchResult {
@@ -273,6 +277,8 @@ pub fn reciprocal_rank_fusion(
             score: info.score,
             fts_rank: info.fts_rank,
             vector_rank: info.vector_rank,
+            conversation_id: None,
+            source: "memory".to_string(),
         })
         .collect();
 
@@ -376,6 +382,8 @@ pub fn weighted_score_fusion(
             score: info.score,
             fts_rank: info.fts_rank,
             vector_rank: info.vector_rank,
+            conversation_id: None,
+            source: "memory".to_string(),
         })
         .collect();
 
