@@ -324,6 +324,25 @@ impl WorkspaceStorage {
         }
     }
 
+    async fn search_conversation_messages(
+        &self,
+        user_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => {
+                repo.search_conversation_messages(user_id, query, limit)
+                    .await
+            }
+            Self::Db(db) => {
+                db.search_conversation_messages(user_id, query, limit)
+                    .await
+            }
+        }
+    }
+
     // ==================== Multi-scope read methods ====================
 
     async fn hybrid_search_multi(
@@ -1481,7 +1500,7 @@ impl Workspace {
             None
         };
 
-        if self.is_multi_scope() {
+        let mut memory_results = if self.is_multi_scope() {
             let results = self
                 .storage
                 .hybrid_search_multi(
@@ -1506,10 +1525,10 @@ impl Workspace {
                     }
                 }
             }
-            Ok(results
+            results
                 .into_iter()
                 .filter(|r| !excluded_doc_ids.contains(&r.document_id))
-                .collect())
+                .collect()
         } else {
             self.storage
                 .hybrid_search(
@@ -1519,8 +1538,56 @@ impl Workspace {
                     embedding.as_deref(),
                     &config,
                 )
-                .await
+                .await?
+        };
+
+        // Also search conversation messages via FTS and merge via simple
+        // score interleaving. Conversation results participate in the final
+        // sort alongside memory results.
+        let conv_results = self
+            .storage
+            .search_conversation_messages(&self.user_id, query, config.pre_fusion_limit)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::debug!("Conversation search failed (non-fatal): {}", e);
+                Vec::new()
+            });
+
+        if !conv_results.is_empty() {
+            // Assign RRF-style scores to conversation results so they can
+            // interleave fairly with memory results.
+            let k = config.rrf_k as f32;
+            let conv_scored: Vec<SearchResult> = conv_results
+                .into_iter()
+                .map(|mut r| {
+                    if let Some(rank) = r.fts_rank {
+                        r.score = 1.0 / (k + rank as f32);
+                    }
+                    r
+                })
+                .collect();
+
+            memory_results.extend(conv_scored);
+
+            // Re-normalize all scores to 0-1 range
+            if let Some(max_score) = memory_results.iter().map(|r| r.score).reduce(f32::max)
+                && max_score > 0.0
+            {
+                for r in &mut memory_results {
+                    r.score /= max_score;
+                }
+            }
+
+            // Re-sort and truncate
+            memory_results.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            memory_results.truncate(config.limit);
         }
+
+        Ok(memory_results)
     }
 
     // ==================== Indexing ====================
