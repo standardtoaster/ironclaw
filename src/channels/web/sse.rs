@@ -203,6 +203,7 @@ impl SseManager {
                     SseEvent::Suggestions { .. } => "suggestions",
                     SseEvent::TurnCost { .. } => "turn_cost",
                     SseEvent::ExtensionStatus { .. } => "extension_status",
+                    SseEvent::UserInputNeeded { .. } => "user_input_needed",
                 };
                 Ok(Event::default().event(event_type).data(data))
             });

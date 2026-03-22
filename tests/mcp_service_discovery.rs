@@ -168,7 +168,7 @@ async fn test_mcp_client_fetches_tools_with_prefix() {
         oauth: None,
         enabled: true,
         description: Some(service.description.clone()),
-    });
+    }).expect("create MCP client");
 
     let tools = client.create_tools().await.expect("should create tools");
 
@@ -272,7 +272,7 @@ async fn test_full_discovery_flow() {
         oauth: None,
         enabled: true,
         description: None,
-    });
+    }).expect("create MCP client");
 
     let tools = client.create_tools().await.expect("create tools");
     assert_eq!(tools.len(), 3);
@@ -280,7 +280,7 @@ async fn test_full_discovery_flow() {
     // Filter tools through allow/deny for Andrew.
     let andrew_tools: Vec<_> = tools
         .iter()
-        .filter(|t| {
+        .filter(|t: &&std::sync::Arc<dyn ironclaw::tools::Tool>| {
             // Strip the server prefix to get the original tool name.
             let original_name = t
                 .name()

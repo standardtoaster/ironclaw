@@ -556,6 +556,9 @@ fn gateway_state_has_multi_tenant_fields() {
         startup_time: std::time::Instant::now(),
         webhook_rate_limiter: RateLimiter::new(10, 60),
         active_config: Default::default(),
+        default_timezone: "UTC".to_string(),
+        mcp_sessions: std::sync::Arc::new(ironclaw::channels::mcp::McpSessionStore::new()),
+        container_pool: None,
     };
 
     assert_eq!(state.default_user_id, "fallback");
@@ -904,6 +907,9 @@ async fn start_multi_user_server_with_db() -> (
         startup_time: std::time::Instant::now(),
         webhook_rate_limiter: RateLimiter::new(10, 60),
         active_config: Default::default(),
+        default_timezone: "UTC".to_string(),
+        mcp_sessions: std::sync::Arc::new(ironclaw::channels::mcp::McpSessionStore::new()),
+        container_pool: None,
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

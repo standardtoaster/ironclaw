@@ -113,6 +113,7 @@ impl GatewayChannel {
             active_config: server::ActiveConfigSnapshot::default(),
             default_timezone: "UTC".to_string(),
             mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
+            container_pool: None,
         });
 
         Self {
@@ -157,6 +158,7 @@ impl GatewayChannel {
             active_config: server::ActiveConfigSnapshot::default(),
             default_timezone: "UTC".to_string(),
             mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
+            container_pool: None,
         });
 
         Self {
@@ -201,6 +203,7 @@ impl GatewayChannel {
             active_config: self.state.active_config.clone(),
             default_timezone: self.state.default_timezone.clone(),
             mcp_sessions: Arc::clone(&self.state.mcp_sessions),
+            container_pool: self.state.container_pool.clone(),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);

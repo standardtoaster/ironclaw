@@ -238,6 +238,11 @@ impl GatewayWorkflowHarness {
             routine_engine: Arc::clone(&routine_slot),
             startup_time: Instant::now(),
             active_config: ironclaw::channels::web::server::ActiveConfigSnapshot::default(),
+            default_timezone: "UTC".to_string(),
+            mcp_sessions: std::sync::Arc::new(ironclaw::channels::mcp::McpSessionStore::new()),
+            container_pool: None,
+            user_llm_providers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            user_tokens: None,
         });
 
         let mut agent = Agent::new(

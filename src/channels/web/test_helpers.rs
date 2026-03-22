@@ -95,6 +95,7 @@ impl TestGatewayBuilder {
             active_config: crate::channels::web::server::ActiveConfigSnapshot::default(),
             default_timezone: "UTC".to_string(),
             mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
+            container_pool: None,
         })
     }
 

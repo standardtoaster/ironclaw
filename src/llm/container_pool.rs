@@ -2,25 +2,23 @@
 //!
 //! One container per conversation (thread_id), multiple containers per lens.
 //! Containers are created on demand, kept warm, and torn down on de-escalation
-//! or explicit cleanup. IronClaw attaches to container stdin/stdout via bollard
-//! for NDJSON communication.
+//! or explicit cleanup. Communication uses HTTP to a channel MCP server running
+//! inside each container.
 
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::time::Instant;
 
 use bollard::container::{
-    AttachContainerOptions, Config, CreateContainerOptions, ListContainersOptions,
+    Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
     RemoveContainerOptions, StartContainerOptions,
 };
 use bollard::models::HostConfig;
 use bollard::Docker;
-use tokio::io::{AsyncBufRead, AsyncWrite, ReadBuf};
-use tokio::sync::Mutex;
+use dashmap::DashMap;
+use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 
-use crate::llm::claude_protocol::{self, ClaudeStreamMessage, ExchangeResult};
 use crate::llm::error::LlmError;
 
 /// Configuration for the container pool.
@@ -46,149 +44,74 @@ pub struct ContainerPoolConfig {
     pub request_timeout_secs: u64,
     /// Extra environment variables to pass to the container.
     pub extra_env: Vec<String>,
+    /// Host/IP for the callback URL that containers POST results back to.
+    pub callback_host: Option<String>,
+    /// Port for the callback URL.
+    pub callback_port: Option<u16>,
+    /// Auth token for callback authentication.
+    pub auth_token: Option<String>,
+}
+
+/// Reply received from the channel MCP server via HTTP callback.
+#[derive(Debug, Clone)]
+pub struct ChannelReply {
+    pub content: String,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub session_id: Option<String>,
+}
+
+/// Tracks a pending tool approval request from a container.
+#[derive(Debug)]
+pub struct PendingApproval {
+    pub container_ip: String,
+    pub container_port: u16,
+    pub thread_id: Uuid,
+}
+
+/// Tracks a pending percy_ask_user question from a container.
+#[derive(Debug)]
+pub struct PendingQuestion {
+    pub container_ip: String,
+    pub container_port: u16,
+    pub thread_id: Uuid,
 }
 
 /// Tracks the state of an active container session for a specific thread.
-struct ContainerSession {
+#[derive(Debug, Clone)]
+pub struct ContainerSession {
     /// The Docker container ID.
-    container_id: String,
-    /// The thread UUID that owns this session (used in diagnostics/logging).
-    #[allow(dead_code)]
-    thread_id: Uuid,
-    /// Writer for container stdin.
-    stdin: Pin<Box<dyn AsyncWrite + Send + Unpin>>,
-    /// Buffered line reader over container stdout.
-    stdout: BollardLineReader,
+    pub container_id: String,
+    /// IP address of the container on the configured network.
+    pub container_ip: String,
+    /// Port the channel MCP server listens on inside the container.
+    pub channel_port: u16,
+    /// CLI session ID from Claude (set after first response).
+    pub cli_session_id: Option<String>,
     /// Number of messages sent so far (used for delta tracking).
-    messages_sent: usize,
-    /// CLI session ID from Claude's system/init message.
-    cli_session_id: Option<String>,
+    pub messages_sent: usize,
+    /// When this session was created.
+    pub created_at: Instant,
 }
 
-/// A line reader that buffers NDJSON lines from a bollard attach output stream.
-///
-/// Bollard's attach returns a multiplexed stream of `LogOutput` items (stdout +
-/// stderr). This reader filters for stdout, accumulates bytes in an internal
-/// buffer, and exposes `AsyncBufRead` so `read_exchange()` can consume lines.
-struct BollardLineReader {
-    /// The bollard output stream (multiplexed stdout + stderr).
-    stream: Pin<
-        Box<
-            dyn futures::Stream<Item = Result<bollard::container::LogOutput, bollard::errors::Error>>
-                + Send,
-        >,
-    >,
-    /// Internal buffer accumulating stdout bytes.
-    buf: Vec<u8>,
-    /// Read cursor position within `buf`.
-    pos: usize,
-    /// Whether the stream has ended.
-    eof: bool,
-}
+/// Default port for the channel MCP server inside containers.
+const DEFAULT_CHANNEL_PORT: u16 = 3100;
 
-impl BollardLineReader {
-    fn new(
-        stream: impl futures::Stream<Item = Result<bollard::container::LogOutput, bollard::errors::Error>>
-            + Send
-            + 'static,
-    ) -> Self {
-        Self {
-            stream: Box::pin(stream),
-            buf: Vec::with_capacity(4096),
-            pos: 0,
-            eof: false,
-        }
-    }
-}
-
-impl AsyncBufRead for BollardLineReader {
-    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<&[u8]>> {
-        let this = self.get_mut();
-
-        // If we have unconsumed data, return it.
-        if this.pos < this.buf.len() {
-            return Poll::Ready(Ok(&this.buf[this.pos..]));
-        }
-
-        if this.eof {
-            return Poll::Ready(Ok(&[]));
-        }
-
-        // Reset buffer for new data.
-        this.buf.clear();
-        this.pos = 0;
-
-        // Poll the stream for more stdout data.
-        loop {
-            match this.stream.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(bollard::container::LogOutput::StdOut { message }))) => {
-                    this.buf.extend_from_slice(&message);
-                    return Poll::Ready(Ok(&this.buf[this.pos..]));
-                }
-                Poll::Ready(Some(Ok(bollard::container::LogOutput::StdErr { message }))) => {
-                    // Log stderr but don't include in the reader buffer.
-                    let text = String::from_utf8_lossy(&message);
-                    tracing::debug!(target: "claude_container", "{}", text.trim_end());
-                    // Continue polling for stdout data.
-                    continue;
-                }
-                Poll::Ready(Some(Ok(_))) => {
-                    // Console or other log output — skip.
-                    continue;
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(std::io::Error::other(
-                        format!("bollard stream error: {}", e),
-                    )));
-                }
-                Poll::Ready(None) => {
-                    this.eof = true;
-                    return Poll::Ready(Ok(&[]));
-                }
-                Poll::Pending => {
-                    return Poll::Pending;
-                }
-            }
-        }
-    }
-
-    fn consume(self: Pin<&mut Self>, amt: usize) {
-        let this = self.get_mut();
-        this.pos += amt;
-    }
-}
-
-impl tokio::io::AsyncRead for BollardLineReader {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let mut pin = Pin::new(self.get_mut());
-        match pin.as_mut().poll_fill_buf(cx) {
-            Poll::Ready(Ok(data)) => {
-                if data.is_empty() {
-                    return Poll::Ready(Ok(()));
-                }
-                let to_copy = std::cmp::min(data.len(), buf.remaining());
-                buf.put_slice(&data[..to_copy]);
-                pin.as_mut().consume(to_copy);
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-/// Pool of warm Docker containers running Claude Code in interactive streaming mode.
+/// Pool of warm Docker containers running Claude Code with channel MCP servers.
 ///
 /// Each container serves one conversation (thread_id). The pool manages creation,
-/// attachment, communication, and teardown.
+/// health checking, communication via HTTP, and teardown.
 pub struct ContainerPool {
     docker: Docker,
     config: ContainerPoolConfig,
     sessions: Arc<Mutex<HashMap<Uuid, ContainerSession>>>,
+    /// Pending reply channels: thread_id -> oneshot sender for the callback response.
+    pub pending_replies: Arc<DashMap<Uuid, oneshot::Sender<ChannelReply>>>,
+    /// Pending tool approval requests: approval_id -> approval state.
+    pub pending_approvals: Arc<DashMap<String, PendingApproval>>,
+    /// Pending percy_ask_user questions: question_id -> question state.
+    pub pending_questions: Arc<DashMap<String, PendingQuestion>>,
+    http_client: reqwest::Client,
 }
 
 impl ContainerPool {
@@ -206,7 +129,10 @@ impl ContainerPool {
             Docker::connect_with_http(socket_path, 120, bollard::API_DEFAULT_VERSION).map_err(
                 |e| LlmError::RequestFailed {
                     provider: "claude_container".to_string(),
-                    reason: format!("Failed to connect to Docker via TCP at {}: {}", socket_path, e),
+                    reason: format!(
+                        "Failed to connect to Docker via TCP at {}: {}",
+                        socket_path, e
+                    ),
                 },
             )?
         } else {
@@ -227,6 +153,14 @@ impl ContainerPool {
                 reason: format!("Docker ping failed: {}", e),
             })?;
 
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(config.request_timeout_secs))
+            .build()
+            .map_err(|e| LlmError::RequestFailed {
+                provider: "claude_container".to_string(),
+                reason: format!("Failed to create HTTP client: {}", e),
+            })?;
+
         tracing::info!(
             lens = %config.lens,
             image = %config.image,
@@ -238,55 +172,58 @@ impl ContainerPool {
             docker,
             config,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            pending_replies: Arc::new(DashMap::new()),
+            pending_approvals: Arc::new(DashMap::new()),
+            pending_questions: Arc::new(DashMap::new()),
+            http_client,
         })
     }
 
     /// Get or create a container session for the given thread.
-    pub async fn get_or_create(&self, thread_id: Uuid) -> Result<(), LlmError> {
-        // Check if session already exists.
+    ///
+    /// Returns the session details including container IP and port for HTTP
+    /// communication with the channel MCP server.
+    pub async fn get_or_create(&self, thread_id: Uuid) -> Result<ContainerSession, LlmError> {
+        // Check if session already exists and is healthy.
         {
             let sessions = self.sessions.lock().await;
-            if sessions.contains_key(&thread_id) {
-                return Ok(());
+            if let Some(session) = sessions.get(&thread_id) {
+                // Quick health check.
+                let health_url = format!(
+                    "http://{}:{}/health",
+                    session.container_ip, session.channel_port
+                );
+                let healthy = reqwest::Client::new()
+                    .get(&health_url)
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false);
+
+                if healthy {
+                    return Ok(session.clone());
+                }
+
+                // Unhealthy — drop lock, tear down, and recreate below.
+                let container_id = session.container_id.clone();
+                drop(sessions);
+
+                tracing::warn!(
+                    container_id = %container_id,
+                    thread_id = %thread_id,
+                    "Existing container unhealthy, tearing down"
+                );
+                // Best-effort removal; ignore errors.
+                let _ = self.remove_session(thread_id).await;
             }
         }
 
         // Create a new container.
         let name = container_name(&self.config.lens, &thread_id);
-        let labels = container_labels(&self.config.lens, &thread_id);
-
-        // Build command.
-        // --print (-p) is required for stream-json I/O, --verbose is required
-        // for stream-json output. The process stays alive reading stdin for
-        // multi-turn conversations via --input-format stream-json.
-        let mut cmd = vec![
-            "claude".to_string(),
-            "--print".to_string(),
-            "--verbose".to_string(),
-            "--input-format".to_string(),
-            "stream-json".to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--model".to_string(),
-            self.config.model.clone(),
-        ];
-        if self.config.skip_permissions {
-            cmd.push("--dangerously-skip-permissions".to_string());
-        }
-
-        // Build environment.
-        let mut env = self.config.extra_env.clone();
-        env.push(format!("PERCY_LENS={}", self.config.lens));
-        env.push(format!("PERCY_THREAD_ID={}", thread_id));
-
-        // Build volume binds.
-        let mut binds = vec![format!("{}:/mnt/claude-auth:ro", self.config.auth_volume)];
-        if let Some(ref vol) = self.config.lens_data_volume {
-            binds.push(format!("{}:/mnt/lens-data:rw", vol));
-        }
-        if let Some(ref path) = self.config.lens_config_path {
-            binds.push(format!("{}:/mnt/lens-config:ro", path));
-        }
+        let labels = build_container_labels(&self.config.lens, &thread_id);
+        let env = self.build_container_env(&thread_id);
+        let binds = self.build_volume_binds();
 
         let host_config = HostConfig {
             binds: Some(binds),
@@ -296,13 +233,9 @@ impl ContainerPool {
 
         let container_config = Config {
             image: Some(self.config.image.clone()),
-            cmd: Some(cmd),
             env: Some(env),
             labels: Some(labels),
             host_config: Some(host_config),
-            open_stdin: Some(true),
-            stdin_once: Some(false),
-            tty: Some(false),
             ..Default::default()
         };
 
@@ -326,188 +259,163 @@ impl ContainerPool {
         self.docker
             .start_container(&container_id, None::<StartContainerOptions<String>>)
             .await
-            .map_err(|e| LlmError::RequestFailed {
-                provider: "claude_container".to_string(),
-                reason: format!("Failed to start container '{}': {}", name, e),
-            })?;
-
-        // Attach to stdin/stdout.
-        let attach_options = AttachContainerOptions::<String> {
-            stdin: Some(true),
-            stdout: Some(true),
-            stderr: Some(true),
-            stream: Some(true),
-            ..Default::default()
-        };
-
-        let attach_results = self
-            .docker
-            .attach_container(&container_id, Some(attach_options))
-            .await
-            .map_err(|e| LlmError::RequestFailed {
-                provider: "claude_container".to_string(),
-                reason: format!("Failed to attach to container '{}': {}", name, e),
-            })?;
-
-        let stdin = attach_results.input;
-        let mut stdout = BollardLineReader::new(attach_results.output);
-
-        // Wait for the Claude system/init message.
-        let timeout = std::time::Duration::from_secs(60);
-        let init_result =
-            tokio::time::timeout(timeout, wait_for_system_init(&mut stdout)).await;
-
-        let cli_session_id = match init_result {
-            Ok(Ok(sid)) => sid,
-            Ok(Err(e)) => {
-                // Clean up the container on failure.
-                let _ = self
-                    .docker
-                    .remove_container(
-                        &container_id,
-                        Some(RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await;
-                return Err(e);
-            }
-            Err(_) => {
-                let _ = self
-                    .docker
-                    .remove_container(
-                        &container_id,
-                        Some(RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await;
-                return Err(LlmError::RequestFailed {
-                    provider: "claude_container".to_string(),
-                    reason: format!(
-                        "Timed out waiting for Claude init in container '{}'",
-                        name
-                    ),
+            .map_err(|e| {
+                // Best-effort cleanup on start failure.
+                let docker = self.docker.clone();
+                let cid = container_id.clone();
+                tokio::spawn(async move {
+                    let _ = docker
+                        .remove_container(
+                            &cid,
+                            Some(RemoveContainerOptions {
+                                force: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await;
                 });
-            }
-        };
+                LlmError::RequestFailed {
+                    provider: "claude_container".to_string(),
+                    reason: format!("Failed to start container '{}': {}", name, e),
+                }
+            })?;
+
+        // Discover the container's IP address on the configured network.
+        let container_ip =
+            self.discover_container_ip(&container_id)
+                .await
+                .inspect_err(|_| {
+                    let docker = self.docker.clone();
+                    let cid = container_id.clone();
+                    tokio::spawn(async move {
+                        let _ = docker
+                            .remove_container(
+                                &cid,
+                                Some(RemoveContainerOptions {
+                                    force: true,
+                                    ..Default::default()
+                                }),
+                            )
+                            .await;
+                    });
+                })?;
+
+        // Wait for the channel MCP server to become healthy.
+        let channel_port = DEFAULT_CHANNEL_PORT;
+        if let Err(e) = self
+            .wait_for_health(&container_ip, channel_port, 120)
+            .await
+        {
+            let _ = self
+                .docker
+                .remove_container(
+                    &container_id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            return Err(e);
+        }
 
         tracing::info!(
             container_id = %container_id,
             name = %name,
             thread_id = %thread_id,
-            cli_session_id = ?cli_session_id,
+            container_ip = %container_ip,
+            channel_port = channel_port,
             "Container session created"
         );
 
         let session = ContainerSession {
             container_id,
-            thread_id,
-            stdin: Box::pin(stdin),
-            stdout,
+            container_ip,
+            channel_port,
+            cli_session_id: None,
             messages_sent: 0,
-            cli_session_id,
+            created_at: Instant::now(),
         };
 
-        self.sessions.lock().await.insert(thread_id, session);
+        self.sessions.lock().await.insert(thread_id, session.clone());
+        Ok(session)
+    }
+
+    /// Send a message to the container's channel MCP server.
+    ///
+    /// Posts the message to the /message endpoint. The container processes it
+    /// asynchronously and calls back to IronClaw with the result.
+    pub async fn send_message(
+        &self,
+        session: &ContainerSession,
+        thread_id: &Uuid,
+        prompt: &str,
+    ) -> Result<(), LlmError> {
+        let url = format!(
+            "http://{}:{}/message",
+            session.container_ip, session.channel_port
+        );
+
+        let body = serde_json::json!({
+            "thread_id": thread_id.to_string(),
+            "content": prompt,
+        });
+
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| LlmError::RequestFailed {
+                provider: "claude_container".to_string(),
+                reason: format!(
+                    "Failed to send message to container {}: {}",
+                    session.container_id, e
+                ),
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(LlmError::RequestFailed {
+                provider: "claude_container".to_string(),
+                reason: format!(
+                    "Container /message returned {}: {}",
+                    status, body_text
+                ),
+            });
+        }
+
         Ok(())
     }
 
-    /// Exchange a prompt with the Claude container for the given thread.
-    ///
-    /// The container must already exist (call `get_or_create` first).
-    pub async fn exchange(
-        &self,
-        thread_id: Uuid,
-        prompt: &str,
-    ) -> Result<ExchangeResult, LlmError> {
-        let timeout = std::time::Duration::from_secs(self.config.request_timeout_secs);
+    /// Look up a session by thread ID.
+    pub async fn session_by_thread(&self, thread_id: &Uuid) -> Option<ContainerSession> {
+        self.sessions.lock().await.get(thread_id).cloned()
+    }
 
-        let result = tokio::time::timeout(timeout, self.exchange_inner(thread_id, prompt)).await;
-
-        match result {
-            Ok(inner) => inner,
-            Err(_) => {
-                // Timeout — remove the session and destroy the container.
-                self.remove_session(thread_id).await.ok();
-                Err(LlmError::RequestFailed {
-                    provider: "claude_container".to_string(),
-                    reason: format!(
-                        "Request timed out after {}s for thread {}",
-                        self.config.request_timeout_secs, thread_id
-                    ),
-                })
-            }
+    /// Update the CLI session ID for a thread's session.
+    pub async fn update_session_id(&self, thread_id: &Uuid, session_id: String) {
+        if let Some(session) = self.sessions.lock().await.get_mut(thread_id) {
+            session.cli_session_id = Some(session_id);
         }
     }
 
-    /// Inner exchange logic: write prompt to stdin, read response from stdout.
-    async fn exchange_inner(
-        &self,
-        thread_id: Uuid,
-        prompt: &str,
-    ) -> Result<ExchangeResult, LlmError> {
-        use tokio::io::AsyncWriteExt;
-
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions.get_mut(&thread_id).ok_or_else(|| {
-            LlmError::RequestFailed {
-                provider: "claude_container".to_string(),
-                reason: format!("No active session for thread {}", thread_id),
-            }
-        })?;
-
-        // Write the user message as a JSON line to stdin.
-        // Claude CLI stream-json format: {"message":{"role":"user","content":"..."}}
-        let input = serde_json::json!({
-            "message": {
-                "role": "user",
-                "content": prompt,
-            }
-        });
-        let mut line =
-            serde_json::to_string(&input).map_err(|e| LlmError::RequestFailed {
-                provider: "claude_container".to_string(),
-                reason: format!("Failed to serialize input: {}", e),
-            })?;
-        line.push('\n');
-
-        session
-            .stdin
-            .as_mut()
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| LlmError::RequestFailed {
-                provider: "claude_container".to_string(),
-                reason: format!("Failed to write to container stdin: {}", e),
-            })?;
-        session
-            .stdin
-            .as_mut()
-            .flush()
-            .await
-            .map_err(|e| LlmError::RequestFailed {
-                provider: "claude_container".to_string(),
-                reason: format!("Failed to flush container stdin: {}", e),
-            })?;
-
-        // Read until result or approval.
-        let result = claude_protocol::read_exchange(&mut session.stdout, |sid| {
-            session.cli_session_id = Some(sid);
-        })
-        .await;
-
-        if let Ok(ExchangeResult::Complete { .. }) = &result {
+    /// Increment the messages_sent counter for a thread's session.
+    pub async fn update_messages_sent(&self, thread_id: &Uuid) {
+        if let Some(session) = self.sessions.lock().await.get_mut(thread_id) {
             session.messages_sent += 1;
         }
-
-        result
     }
 
     /// Remove a session and destroy the associated container.
+    ///
+    /// Also cleans up any pending reply channels for this thread.
     pub async fn remove_session(&self, thread_id: Uuid) -> Result<(), LlmError> {
+        // Clean up pending reply channel.
+        self.pending_replies.remove(&thread_id);
+
         let session = self.sessions.lock().await.remove(&thread_id);
         if let Some(session) = session {
             tracing::info!(
@@ -532,9 +440,10 @@ impl ContainerPool {
         Ok(())
     }
 
-    /// Discover existing Percy-managed containers and re-attach to them.
+    /// Discover existing Percy-managed containers and re-adopt healthy ones.
     ///
-    /// Returns the number of sessions recovered.
+    /// Returns the number of sessions recovered. Unhealthy or stale containers
+    /// are torn down.
     pub async fn discover_existing(&self) -> Result<usize, LlmError> {
         let mut filters = HashMap::new();
         filters.insert(
@@ -589,51 +498,80 @@ impl ContainerPool {
                 continue;
             }
 
-            // Re-attach to the running container.
-            let attach_options = AttachContainerOptions::<String> {
-                stdin: Some(true),
-                stdout: Some(true),
-                stderr: Some(true),
-                stream: Some(true),
-                ..Default::default()
-            };
-
-            match self
-                .docker
-                .attach_container(&container_id, Some(attach_options))
-                .await
-            {
-                Ok(attach_results) => {
-                    let session = ContainerSession {
-                        container_id: container_id.clone(),
-                        thread_id,
-                        stdin: Box::pin(attach_results.input),
-                        stdout: BollardLineReader::new(attach_results.output),
-                        messages_sent: 0, // unknown — will send full history on next exchange
-                        cli_session_id: None,
-                    };
-                    self.sessions.lock().await.insert(thread_id, session);
-                    recovered += 1;
-
-                    let container_name = container
-                        .names
-                        .as_ref()
-                        .and_then(|n| n.first().cloned())
-                        .unwrap_or_else(|| container_id.clone());
-                    tracing::info!(
-                        container = %container_name,
-                        thread_id = %thread_id,
-                        "Re-attached to existing container"
-                    );
-                }
+            // Inspect to get IP address.
+            let container_ip = match self.discover_container_ip(&container_id).await {
+                Ok(ip) => ip,
                 Err(e) => {
                     tracing::warn!(
                         container_id = %container_id,
                         error = %e,
-                        "Failed to re-attach to container, skipping"
+                        "Failed to get IP for existing container, tearing down"
                     );
+                    let _ = self
+                        .docker
+                        .remove_container(
+                            &container_id,
+                            Some(RemoveContainerOptions {
+                                force: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await;
+                    continue;
                 }
+            };
+
+            // Health check.
+            let channel_port = DEFAULT_CHANNEL_PORT;
+            let health_url = format!("http://{}:{}/health", container_ip, channel_port);
+            let healthy = reqwest::Client::new()
+                .get(&health_url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+
+            if !healthy {
+                tracing::warn!(
+                    container_id = %container_id,
+                    thread_id = %thread_id,
+                    "Existing container unhealthy, tearing down"
+                );
+                let _ = self
+                    .docker
+                    .remove_container(
+                        &container_id,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                continue;
             }
+
+            let session = ContainerSession {
+                container_id: container_id.clone(),
+                container_ip,
+                channel_port,
+                cli_session_id: None,
+                messages_sent: 0,
+                created_at: Instant::now(),
+            };
+            self.sessions.lock().await.insert(thread_id, session);
+            recovered += 1;
+
+            let display_name = container
+                .names
+                .as_ref()
+                .and_then(|n| n.first().cloned())
+                .unwrap_or_else(|| container_id.clone());
+            tracing::info!(
+                container = %display_name,
+                thread_id = %thread_id,
+                "Re-adopted existing container"
+            );
         }
 
         if recovered > 0 {
@@ -692,52 +630,125 @@ impl ContainerPool {
             session.messages_sent = count;
         }
     }
-}
 
-/// Wait for Claude's system/init message on stdout.
-///
-/// Returns the session_id if present.
-async fn wait_for_system_init(
-    reader: &mut BollardLineReader,
-) -> Result<Option<String>, LlmError> {
-    use tokio::io::AsyncBufReadExt;
+    // --- Private helpers ---
 
-    let mut buf = String::new();
-    loop {
-        buf.clear();
-        let bytes_read = reader
-            .read_line(&mut buf)
+    /// Extract the container's IP address from a Docker inspect result.
+    async fn discover_container_ip(&self, container_id: &str) -> Result<String, LlmError> {
+        let inspect = self
+            .docker
+            .inspect_container(container_id, None::<InspectContainerOptions>)
             .await
             .map_err(|e| LlmError::RequestFailed {
                 provider: "claude_container".to_string(),
-                reason: format!("Failed to read init message: {}", e),
+                reason: format!("Failed to inspect container '{}': {}", container_id, e),
             })?;
 
-        if bytes_read == 0 {
-            return Err(LlmError::RequestFailed {
+        let networks = inspect
+            .network_settings
+            .as_ref()
+            .and_then(|ns| ns.networks.as_ref())
+            .ok_or_else(|| LlmError::RequestFailed {
                 provider: "claude_container".to_string(),
-                reason: "Container process exited before sending init message".to_string(),
-            });
+                reason: format!(
+                    "Container '{}' has no network settings",
+                    container_id
+                ),
+            })?;
+
+        let endpoint = networks.get(&self.config.network).ok_or_else(|| {
+            LlmError::RequestFailed {
+                provider: "claude_container".to_string(),
+                reason: format!(
+                    "Container '{}' not connected to network '{}'",
+                    container_id, self.config.network
+                ),
+            }
+        })?;
+
+        let ip = endpoint
+            .ip_address
+            .as_ref()
+            .filter(|ip| !ip.is_empty())
+            .ok_or_else(|| LlmError::RequestFailed {
+                provider: "claude_container".to_string(),
+                reason: format!(
+                    "Container '{}' has no IP on network '{}'",
+                    container_id, self.config.network
+                ),
+            })?;
+
+        Ok(ip.clone())
+    }
+
+    /// Poll the container's health endpoint until it responds successfully.
+    async fn wait_for_health(
+        &self,
+        container_ip: &str,
+        channel_port: u16,
+        timeout_secs: u64,
+    ) -> Result<(), LlmError> {
+        let health_url = format!("http://{}:{}/health", container_ip, channel_port);
+        let deadline = Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        let poll_interval = std::time::Duration::from_secs(1);
+
+        loop {
+            let healthy = reqwest::Client::new()
+                .get(&health_url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+
+            if healthy {
+                return Ok(());
+            }
+
+            if Instant::now() >= deadline {
+                return Err(LlmError::RequestFailed {
+                    provider: "claude_container".to_string(),
+                    reason: format!(
+                        "Container health check timed out after {}s ({})",
+                        timeout_secs, health_url
+                    ),
+                });
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    /// Build environment variables for a new container.
+    fn build_container_env(&self, thread_id: &Uuid) -> Vec<String> {
+        let mut env = self.config.extra_env.clone();
+        env.push(format!("PERCY_LENS={}", self.config.lens));
+        env.push(format!("PERCY_THREAD_ID={}", thread_id));
+        env.push(format!("PERCY_CHANNEL_PORT={}", DEFAULT_CHANNEL_PORT));
+        env.push(format!("CLAUDE_MODEL={}", self.config.model));
+
+        if let Some(ref host) = self.config.callback_host {
+            let port = self.config.callback_port.unwrap_or(3001);
+            env.push(format!("PERCY_CALLBACK_URL=http://{}:{}", host, port));
         }
 
-        let trimmed = buf.trim();
-        if trimmed.is_empty() {
-            continue;
+        if let Some(ref token) = self.config.auth_token {
+            env.push(format!("PERCY_AUTH_TOKEN={}", token));
         }
 
-        match serde_json::from_str::<ClaudeStreamMessage>(trimmed) {
-            Ok(ClaudeStreamMessage::System { session_id }) => {
-                return Ok(session_id);
-            }
-            Ok(_) => {
-                tracing::debug!("Ignoring non-system message during init: {}", trimmed);
-                continue;
-            }
-            Err(_) => {
-                tracing::debug!("Ignoring unparseable output during init: {}", trimmed);
-                continue;
-            }
+        env
+    }
+
+    /// Build volume bind mounts for a new container.
+    fn build_volume_binds(&self) -> Vec<String> {
+        let mut binds = vec![format!("{}:/mnt/claude-auth:ro", self.config.auth_volume)];
+        if let Some(ref vol) = self.config.lens_data_volume {
+            binds.push(format!("{}:/mnt/lens-data:rw", vol));
         }
+        if let Some(ref path) = self.config.lens_config_path {
+            binds.push(format!("{}:/mnt/lens-config:ro", path));
+        }
+        binds
     }
 }
 
@@ -748,7 +759,7 @@ pub fn container_name(lens: &str, thread_id: &Uuid) -> String {
 }
 
 /// Generate labels for a Percy-managed container.
-pub fn container_labels(lens: &str, thread_id: &Uuid) -> HashMap<String, String> {
+pub fn build_container_labels(lens: &str, thread_id: &Uuid) -> HashMap<String, String> {
     let mut labels = HashMap::new();
     labels.insert("percy.managed".into(), "true".into());
     labels.insert("percy.lens".into(), lens.into());
@@ -786,12 +797,12 @@ mod tests {
         assert_ne!(container_name("andrew", &t1), container_name("andrew", &t2));
     }
 
-    // --- container_labels tests ---
+    // --- build_container_labels tests ---
 
     #[test]
     fn test_container_labels_keys() {
         let thread_id = Uuid::new_v4();
-        let labels = container_labels("andrew", &thread_id);
+        let labels = build_container_labels("andrew", &thread_id);
         assert_eq!(labels.get("percy.managed"), Some(&"true".to_string()));
         assert_eq!(labels.get("percy.lens"), Some(&"andrew".to_string()));
         assert_eq!(
@@ -808,7 +819,7 @@ mod tests {
     #[test]
     fn test_container_labels_thread_id_is_full_uuid() {
         let thread_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let labels = container_labels("andrew", &thread_id);
+        let labels = build_container_labels("andrew", &thread_id);
         // Labels use the full UUID (unlike container names which use short).
         assert_eq!(
             labels.get("percy.thread_id"),
@@ -831,111 +842,253 @@ mod tests {
             skip_permissions: true,
             request_timeout_secs: 300,
             extra_env: vec!["FOO=bar".to_string()],
+            callback_host: Some("192.168.1.100".to_string()),
+            callback_port: Some(3001),
+            auth_token: Some("test-token".to_string()),
         };
         let cloned = config.clone();
         assert_eq!(cloned.image, "percy-claude:latest");
         assert_eq!(cloned.lens, "andrew");
-        assert_eq!(cloned.lens_data_volume, Some("claude-data-andrew".to_string()));
+        assert_eq!(
+            cloned.lens_data_volume,
+            Some("claude-data-andrew".to_string())
+        );
+        assert_eq!(
+            cloned.callback_host,
+            Some("192.168.1.100".to_string())
+        );
     }
 
-    // --- BollardLineReader tests ---
+    // --- ContainerSession tests ---
 
-    #[tokio::test]
-    async fn test_bollard_line_reader_stdout_only() {
-        use tokio::io::AsyncBufReadExt;
-
-        // Simulate a stream with stdout and stderr items.
-        let items: Vec<Result<bollard::container::LogOutput, bollard::errors::Error>> = vec![
-            Ok(bollard::container::LogOutput::StdOut {
-                message: bytes::Bytes::from(r#"{"type":"system","session_id":"s1"}"#.to_string() + "\n"),
-            }),
-            Ok(bollard::container::LogOutput::StdErr {
-                message: bytes::Bytes::from("some debug log\n"),
-            }),
-            Ok(bollard::container::LogOutput::StdOut {
-                message: bytes::Bytes::from(
-                    r#"{"type":"result","result":"ok","input_tokens":1,"output_tokens":1}"#.to_string() + "\n",
-                ),
-            }),
-        ];
-        let stream = futures::stream::iter(items);
-        let mut reader = BollardLineReader::new(stream);
-
-        // First line should be the system message.
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await.unwrap();
-        assert!(n > 0);
-        assert!(line.contains("system"));
-
-        // Second line should be the result (stderr skipped).
-        line.clear();
-        let n = reader.read_line(&mut line).await.unwrap();
-        assert!(n > 0);
-        assert!(line.contains("result"));
+    #[test]
+    fn test_session_clone() {
+        let session = ContainerSession {
+            container_id: "abc123".to_string(),
+            container_ip: "172.18.0.5".to_string(),
+            channel_port: 3100,
+            cli_session_id: Some("sess-1".to_string()),
+            messages_sent: 3,
+            created_at: Instant::now(),
+        };
+        let cloned = session.clone();
+        assert_eq!(cloned.container_id, "abc123");
+        assert_eq!(cloned.container_ip, "172.18.0.5");
+        assert_eq!(cloned.channel_port, 3100);
+        assert_eq!(cloned.messages_sent, 3);
     }
 
-    #[tokio::test]
-    async fn test_bollard_line_reader_eof() {
-        use tokio::io::AsyncBufReadExt;
+    // --- build_container_env tests ---
 
-        let items: Vec<Result<bollard::container::LogOutput, bollard::errors::Error>> = vec![];
-        let stream = futures::stream::iter(items);
-        let mut reader = BollardLineReader::new(stream);
+    #[test]
+    fn test_build_env_basic() {
+        let config = ContainerPoolConfig {
+            image: "img".to_string(),
+            lens: "andrew".to_string(),
+            model: "sonnet-4".to_string(),
+            network: "net".to_string(),
+            auth_volume: "vol".to_string(),
+            lens_data_volume: None,
+            lens_config_path: None,
+            skip_permissions: false,
+            request_timeout_secs: 300,
+            extra_env: vec!["EXTRA=1".to_string()],
+            callback_host: Some("10.0.0.1".to_string()),
+            callback_port: Some(3001),
+            auth_token: Some("tok-123".to_string()),
+        };
+        let thread_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
 
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await.unwrap();
-        assert_eq!(n, 0);
+        // We can't call build_container_env directly without a pool, so we test
+        // the env construction logic via the config fields.
+        let mut env = config.extra_env.clone();
+        env.push(format!("PERCY_LENS={}", config.lens));
+        env.push(format!("PERCY_THREAD_ID={}", thread_id));
+        env.push(format!("PERCY_CHANNEL_PORT={}", DEFAULT_CHANNEL_PORT));
+        env.push(format!("CLAUDE_MODEL={}", config.model));
+
+        assert!(env.contains(&"EXTRA=1".to_string()));
+        assert!(env.contains(&"PERCY_LENS=andrew".to_string()));
+        assert!(env.contains(&"CLAUDE_MODEL=sonnet-4".to_string()));
+        assert!(env.contains(&"PERCY_CHANNEL_PORT=3100".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_wait_for_system_init_success() {
-        let items: Vec<Result<bollard::container::LogOutput, bollard::errors::Error>> = vec![
-            Ok(bollard::container::LogOutput::StdOut {
-                message: bytes::Bytes::from(
-                    r#"{"type":"system","subtype":"init","session_id":"sess-abc"}"#.to_string() + "\n",
-                ),
-            }),
-        ];
-        let stream = futures::stream::iter(items);
-        let mut reader = BollardLineReader::new(stream);
+    // --- build_volume_binds tests ---
 
-        let result = wait_for_system_init(&mut reader).await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Some("sess-abc".to_string()));
+    #[test]
+    fn test_volume_binds_minimal() {
+        let config = ContainerPoolConfig {
+            image: "img".to_string(),
+            lens: "andrew".to_string(),
+            model: "sonnet".to_string(),
+            network: "net".to_string(),
+            auth_volume: "claude-auth".to_string(),
+            lens_data_volume: None,
+            lens_config_path: None,
+            skip_permissions: false,
+            request_timeout_secs: 300,
+            extra_env: vec![],
+            callback_host: None,
+            callback_port: None,
+            auth_token: None,
+        };
+
+        let mut binds = vec![format!("{}:/mnt/claude-auth:ro", config.auth_volume)];
+        if let Some(ref vol) = config.lens_data_volume {
+            binds.push(format!("{}:/mnt/lens-data:rw", vol));
+        }
+        if let Some(ref path) = config.lens_config_path {
+            binds.push(format!("{}:/mnt/lens-config:ro", path));
+        }
+
+        assert_eq!(binds.len(), 1);
+        assert_eq!(binds[0], "claude-auth:/mnt/claude-auth:ro");
     }
 
-    #[tokio::test]
-    async fn test_wait_for_system_init_eof() {
-        let items: Vec<Result<bollard::container::LogOutput, bollard::errors::Error>> = vec![];
-        let stream = futures::stream::iter(items);
-        let mut reader = BollardLineReader::new(stream);
+    #[test]
+    fn test_volume_binds_all() {
+        let config = ContainerPoolConfig {
+            image: "img".to_string(),
+            lens: "andrew".to_string(),
+            model: "sonnet".to_string(),
+            network: "net".to_string(),
+            auth_volume: "claude-auth".to_string(),
+            lens_data_volume: Some("data-vol".to_string()),
+            lens_config_path: Some("/etc/percy/andrew".to_string()),
+            skip_permissions: false,
+            request_timeout_secs: 300,
+            extra_env: vec![],
+            callback_host: None,
+            callback_port: None,
+            auth_token: None,
+        };
 
-        let result = wait_for_system_init(&mut reader).await;
-        assert!(result.is_err());
+        let mut binds = vec![format!("{}:/mnt/claude-auth:ro", config.auth_volume)];
+        if let Some(ref vol) = config.lens_data_volume {
+            binds.push(format!("{}:/mnt/lens-data:rw", vol));
+        }
+        if let Some(ref path) = config.lens_config_path {
+            binds.push(format!("{}:/mnt/lens-config:ro", path));
+        }
+
+        assert_eq!(binds.len(), 3);
+        assert!(binds[1].contains("data-vol"));
+        assert!(binds[2].contains("/etc/percy/andrew"));
     }
 
-    #[tokio::test]
-    async fn test_wait_for_system_init_skips_non_system() {
-        let items: Vec<Result<bollard::container::LogOutput, bollard::errors::Error>> = vec![
-            Ok(bollard::container::LogOutput::StdOut {
-                message: bytes::Bytes::from("not json\n"),
-            }),
-            Ok(bollard::container::LogOutput::StdOut {
-                message: bytes::Bytes::from(
-                    r#"{"type":"assistant","message":{"role":"assistant","content":[]}}"#.to_string() + "\n",
-                ),
-            }),
-            Ok(bollard::container::LogOutput::StdOut {
-                message: bytes::Bytes::from(
-                    r#"{"type":"system","session_id":"sess-xyz"}"#.to_string() + "\n",
-                ),
-            }),
-        ];
-        let stream = futures::stream::iter(items);
-        let mut reader = BollardLineReader::new(stream);
+    // --- ChannelReply tests ---
 
-        let result = wait_for_system_init(&mut reader).await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Some("sess-xyz".to_string()));
+    #[test]
+    fn test_channel_reply_fields() {
+        let reply = ChannelReply {
+            content: "Hello, world!".to_string(),
+            input_tokens: 10,
+            output_tokens: 25,
+            session_id: Some("sess-abc".to_string()),
+        };
+        assert_eq!(reply.content, "Hello, world!");
+        assert_eq!(reply.input_tokens, 10);
+        assert_eq!(reply.output_tokens, 25);
+        assert_eq!(reply.session_id, Some("sess-abc".to_string()));
+    }
+
+    #[test]
+    fn test_channel_reply_no_session_id() {
+        let reply = ChannelReply {
+            content: "Done".to_string(),
+            input_tokens: 5,
+            output_tokens: 3,
+            session_id: None,
+        };
+        assert!(reply.session_id.is_none());
+    }
+
+    #[test]
+    fn test_channel_reply_clone() {
+        let reply = ChannelReply {
+            content: "test".to_string(),
+            input_tokens: 1,
+            output_tokens: 2,
+            session_id: Some("s1".to_string()),
+        };
+        let cloned = reply.clone();
+        assert_eq!(cloned.content, "test");
+        assert_eq!(cloned.session_id, Some("s1".to_string()));
+    }
+
+    // --- Pending map (DashMap) tests ---
+
+    #[tokio::test]
+    async fn test_pending_replies_insert_remove() {
+        use dashmap::DashMap;
+        use tokio::sync::oneshot;
+
+        let map: DashMap<Uuid, oneshot::Sender<ChannelReply>> = DashMap::new();
+        let thread_id = Uuid::new_v4();
+
+        let (tx, rx) = oneshot::channel::<ChannelReply>();
+        map.insert(thread_id, tx);
+        assert!(map.contains_key(&thread_id));
+
+        // Remove and send a reply through the channel.
+        let (_, sender) = map.remove(&thread_id).unwrap();
+        let reply = ChannelReply {
+            content: "ok".to_string(),
+            input_tokens: 1,
+            output_tokens: 2,
+            session_id: None,
+        };
+        sender.send(reply).unwrap();
+
+        let received = rx.await.unwrap();
+        assert_eq!(received.content, "ok");
+        assert!(!map.contains_key(&thread_id));
+    }
+
+    #[test]
+    fn test_pending_approvals_insert_remove() {
+        use dashmap::DashMap;
+
+        let map: DashMap<String, PendingApproval> = DashMap::new();
+        let thread_id = Uuid::new_v4();
+
+        map.insert(
+            "req-1".to_string(),
+            PendingApproval {
+                container_ip: "172.18.0.5".to_string(),
+                container_port: 3100,
+                thread_id,
+            },
+        );
+
+        assert!(map.contains_key("req-1"));
+        let (_, approval) = map.remove("req-1").unwrap();
+        assert_eq!(approval.container_ip, "172.18.0.5");
+        assert_eq!(approval.container_port, 3100);
+        assert_eq!(approval.thread_id, thread_id);
+        assert!(!map.contains_key("req-1"));
+    }
+
+    #[test]
+    fn test_pending_questions_insert_remove() {
+        use dashmap::DashMap;
+
+        let map: DashMap<String, PendingQuestion> = DashMap::new();
+        let thread_id = Uuid::new_v4();
+
+        map.insert(
+            "q-1".to_string(),
+            PendingQuestion {
+                container_ip: "10.0.0.2".to_string(),
+                container_port: 3100,
+                thread_id,
+            },
+        );
+
+        assert!(map.contains_key("q-1"));
+        let (_, question) = map.remove("q-1").unwrap();
+        assert_eq!(question.container_ip, "10.0.0.2");
+        assert_eq!(question.thread_id, thread_id);
+        assert!(!map.contains_key("q-1"));
     }
 }

@@ -182,6 +182,19 @@ pub enum SseEvent {
         /// Whether the "always" auto-approve option should be shown.
         allow_always: bool,
     },
+    /// Agent needs user input (from Claude container channel provider).
+    #[serde(rename = "user_input_needed")]
+    #[allow(dead_code)]
+    UserInputNeeded {
+        request_id: String,
+        question: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        options: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+    },
     #[serde(rename = "auth_required")]
     AuthRequired {
         extension_name: String,
@@ -798,6 +811,7 @@ impl WsServerMessage {
             SseEvent::Status { .. } => "status",
             SseEvent::JobStarted { .. } => "job_started",
             SseEvent::ApprovalNeeded { .. } => "approval_needed",
+            SseEvent::UserInputNeeded { .. } => "user_input_needed",
             SseEvent::AuthRequired { .. } => "auth_required",
             SseEvent::AuthCompleted { .. } => "auth_completed",
             SseEvent::Error { .. } => "error",

@@ -318,6 +318,9 @@ pub struct GatewayState {
     pub default_timezone: String,
     /// Active MCP sessions for Streamable HTTP transport.
     pub mcp_sessions: Arc<crate::channels::mcp::McpSessionStore>,
+    /// Shared container pool for Claude container providers.
+    #[allow(dead_code)]
+    pub container_pool: Option<Arc<crate::llm::container_pool::ContainerPool>>,
 }
 
 impl GatewayState {
@@ -3194,6 +3197,7 @@ mod tests {
             active_config: ActiveConfigSnapshot::default(),
             default_timezone: "UTC".to_string(),
             mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
+            container_pool: None,
         })
     }
 

@@ -22,7 +22,9 @@ async fn test_container_pool_create_and_cleanup() {
         return;
     }
 
-    use ironclaw::llm::container_pool::{container_labels, container_name, ContainerPool, ContainerPoolConfig};
+    use ironclaw::llm::container_pool::{
+        build_container_labels, container_name, ContainerPool, ContainerPoolConfig,
+    };
     use uuid::Uuid;
 
     let thread_id = Uuid::new_v4();
@@ -31,13 +33,16 @@ async fn test_container_pool_create_and_cleanup() {
             .unwrap_or_else(|_| "percy-claude:latest".to_string()),
         lens: "test".to_string(),
         model: "sonnet".to_string(),
-        network: "".to_string(), // no network for test
+        network: "".to_string(),
         auth_volume: "claude-auth".to_string(),
         lens_data_volume: None,
         lens_config_path: None,
         skip_permissions: true,
         request_timeout_secs: 60,
         extra_env: vec![],
+        callback_host: None,
+        callback_port: None,
+        auth_token: None,
     };
 
     let socket = std::env::var("DOCKER_HOST")
@@ -47,12 +52,16 @@ async fn test_container_pool_create_and_cleanup() {
     let name = container_name("test", &thread_id);
     assert!(name.starts_with("claude-test-"));
 
-    let labels = container_labels("test", &thread_id);
+    let labels = build_container_labels("test", &thread_id);
     assert_eq!(labels.get("percy.managed"), Some(&"true".to_string()));
 
     // Test pool creation (just verifies Docker connection)
     let pool_result = ContainerPool::new(&socket, config).await;
-    assert!(pool_result.is_ok(), "Failed to create pool: {:?}", pool_result.err());
+    assert!(
+        pool_result.is_ok(),
+        "Failed to create pool: {:?}",
+        pool_result.err()
+    );
 
     let pool = pool_result.expect("pool creation verified above");
     assert_eq!(pool.session_count().await, 0);
@@ -83,16 +92,20 @@ async fn test_container_pool_discover_existing() {
         skip_permissions: true,
         request_timeout_secs: 60,
         extra_env: vec![],
+        callback_host: None,
+        callback_port: None,
+        auth_token: None,
     };
 
     let socket = std::env::var("DOCKER_HOST")
         .unwrap_or_else(|_| "unix:///var/run/docker.sock".to_string());
 
-    let pool = ContainerPool::new(&socket, config).await.expect("pool creation");
+    let pool = ContainerPool::new(&socket, config)
+        .await
+        .expect("pool creation");
 
     // Discover should succeed even with no containers
     let count = pool.discover_existing().await.expect("discover");
-    // Count may be 0 or >0 depending on prior test runs; just verify it doesn't error
     eprintln!("Discovered {} existing containers", count);
 
     pool.shutdown_all().await.ok();
@@ -123,33 +136,41 @@ async fn test_full_container_lifecycle() {
         skip_permissions: true,
         request_timeout_secs: 120,
         extra_env: vec![],
+        callback_host: None,
+        callback_port: None,
+        auth_token: None,
     };
 
     let socket = std::env::var("DOCKER_HOST")
         .unwrap_or_else(|_| "unix:///var/run/docker.sock".to_string());
 
-    let pool = ContainerPool::new(&socket, config).await.expect("pool creation");
+    let pool = ContainerPool::new(&socket, config)
+        .await
+        .expect("pool creation");
 
     // 1. Create container
-    pool.get_or_create(thread_id).await.expect("container creation");
+    let session = pool
+        .get_or_create(thread_id)
+        .await
+        .expect("container creation");
     assert!(pool.has_session(&thread_id).await);
     assert_eq!(pool.session_count().await, 1);
+    eprintln!("Container created: IP={}", session.container_ip);
 
-    // 2. Send a simple message
-    let result = pool.exchange(thread_id, "Say hello in exactly 3 words.").await;
-    assert!(result.is_ok(), "Exchange failed: {:?}", result.err());
+    // 2. Send a message (callback-based — response comes async, so just verify send works)
+    let send_result = pool
+        .send_message(&session, &thread_id, "Say hello in exactly 3 words.")
+        .await;
+    assert!(
+        send_result.is_ok(),
+        "Send failed: {:?}",
+        send_result.err()
+    );
 
-    // 3. Verify we got a response
-    match result.expect("exchange verified above") {
-        ironclaw::llm::claude_protocol::ExchangeResult::Complete { content, .. } => {
-            assert!(!content.is_empty(), "Empty response from Claude");
-            eprintln!("Claude said: {}", content);
-        }
-        other => panic!("Expected Complete, got: {:?}", other),
-    }
-
-    // 4. Remove session
-    pool.remove_session(thread_id).await.expect("remove session");
+    // 3. Remove session
+    pool.remove_session(thread_id)
+        .await
+        .expect("remove session");
     assert!(!pool.has_session(&thread_id).await);
     assert_eq!(pool.session_count().await, 0);
 }
