@@ -30,6 +30,7 @@ pub mod session;
 mod session_manager;
 pub mod submission;
 pub mod task;
+pub mod passive_buffer;
 mod thread_ops;
 pub mod undo;
 
