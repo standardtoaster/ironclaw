@@ -725,6 +725,42 @@ CREATE INDEX IF NOT EXISTS idx_routines_event_triggers
 PRAGMA foreign_keys=ON;
 "#,
     ),
+    (
+        14,
+        "conversation_messages_fts",
+        // Add FTS5 index on conversation_messages for searchable chat history.
+        // Follows the same pattern as memory_chunks_fts.
+        r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS conversation_messages_fts USING fts5(
+    content,
+    content='conversation_messages',
+    content_rowid='rowid'
+);
+
+-- Backfill existing messages into the FTS index
+INSERT INTO conversation_messages_fts(rowid, content)
+    SELECT rowid, content FROM conversation_messages;
+
+-- Triggers to keep FTS5 in sync with conversation_messages
+CREATE TRIGGER IF NOT EXISTS conversation_messages_fts_insert
+    AFTER INSERT ON conversation_messages BEGIN
+    INSERT INTO conversation_messages_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS conversation_messages_fts_delete
+    AFTER DELETE ON conversation_messages BEGIN
+    INSERT INTO conversation_messages_fts(conversation_messages_fts, rowid, content)
+        VALUES ('delete', old.rowid, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS conversation_messages_fts_update
+    AFTER UPDATE ON conversation_messages BEGIN
+    INSERT INTO conversation_messages_fts(conversation_messages_fts, rowid, content)
+        VALUES ('delete', old.rowid, old.content);
+    INSERT INTO conversation_messages_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+"#,
+    ),
 ];
 
 /// Run incremental migrations that haven't been applied yet.

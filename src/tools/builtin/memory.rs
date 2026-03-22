@@ -190,9 +190,10 @@ impl Tool for MemorySearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search past memories, decisions, and context. MUST be called before answering \
+        "Search past memories, decisions, conversations, and context. Returns results \
+         from saved memory AND past chat history. MUST be called before answering \
          questions about prior work, decisions, dates, people, preferences, or todos. \
-         Returns relevant snippets with relevance scores."
+         When results include a conversation_id, use conversation_load to read the full thread."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -239,13 +240,20 @@ impl Tool for MemorySearchTool {
         let result_count = results.len();
         let output = serde_json::json!({
             "query": query,
-            "results": results.into_iter().map(|r| serde_json::json!({
-                "content": r.content,
-                "score": r.score,
-                "path": r.document_path,
-                "document_id": r.document_id.to_string(),
-                "is_hybrid_match": r.is_hybrid(),
-            })).collect::<Vec<_>>(),
+            "results": results.into_iter().map(|r| {
+                let mut entry = serde_json::json!({
+                    "content": r.content,
+                    "score": r.score,
+                    "path": r.document_path,
+                    "document_id": r.document_id.to_string(),
+                    "source": r.source,
+                    "is_hybrid_match": r.is_hybrid(),
+                });
+                if let Some(conv_id) = r.conversation_id {
+                    entry["conversation_id"] = serde_json::Value::String(conv_id.to_string());
+                }
+                entry
+            }).collect::<Vec<_>>(),
             "result_count": result_count,
         });
 

@@ -368,6 +368,7 @@ impl AppBuilder {
             } else {
                 tools.register_memory_tools(Arc::clone(&ws));
             }
+            tools.register_conversation_tools(Arc::clone(db));
 
             Some(ws)
         } else {
