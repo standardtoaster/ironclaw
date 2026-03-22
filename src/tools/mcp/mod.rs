@@ -41,7 +41,12 @@ pub(crate) mod transport;
 #[cfg(unix)]
 pub(crate) mod unix_transport;
 
+pub mod service_cache;
+pub mod service_proxy;
+pub mod service_registry;
+
 pub use auth::{is_authenticated, refresh_access_token};
+pub use service_registry::{ServiceConfig, ServiceRegistry};
 pub use client::McpClient;
 pub use config::{McpServerConfig, McpServersFile, OAuthConfig};
 pub use factory::{McpFactoryError, create_client_from_config};

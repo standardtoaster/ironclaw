@@ -106,6 +106,9 @@ pub struct Config {
     /// Channel-relay integration (Slack via external relay service).
     /// Present only when both `CHANNEL_RELAY_URL` and `CHANNEL_RELAY_API_KEY` are set.
     pub relay: Option<RelayConfig>,
+    /// Path to MCP service registry JSON config (SERVICES_CONFIG env var).
+    #[allow(dead_code)]
+    pub services_config_path: Option<String>,
 }
 
 impl Config {
@@ -182,6 +185,7 @@ impl Config {
             workspace: WorkspaceConfig::default(),
             observability: crate::observability::ObservabilityConfig::default(),
             relay: None,
+            services_config_path: None,
         }
     }
 
@@ -346,6 +350,7 @@ impl Config {
                 backend: std::env::var("OBSERVABILITY_BACKEND").unwrap_or_else(|_| "none".into()),
             },
             relay: RelayConfig::from_env(),
+            services_config_path: std::env::var("SERVICES_CONFIG").ok(),
         })
     }
 }
