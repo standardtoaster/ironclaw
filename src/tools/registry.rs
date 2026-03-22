@@ -210,6 +210,30 @@ impl ToolRegistry {
         self.tools.read().await.values().cloned().collect()
     }
 
+    /// Search for tools matching a query string (case-insensitive substring match
+    /// against tool names and descriptions).
+    pub async fn search_tools(&self, query: &str) -> Vec<(String, String)> {
+        let query_lower = query.to_lowercase();
+        let tools = self.tools.read().await;
+        let mut results: Vec<(String, String)> = tools
+            .values()
+            .filter(|t| {
+                t.name().to_lowercase().contains(&query_lower)
+                    || t.description().to_lowercase().contains(&query_lower)
+            })
+            .map(|t| (t.name().to_string(), t.description().to_string()))
+            .collect();
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        results
+    }
+
+    /// Mark a tool as discovered (no-op currently; future: track discovery state).
+    pub async fn mark_discovered(&self, _name: &str) {
+        // Placeholder for future discovery tracking.
+        // In a full implementation, this would add the tool to a "discovered" set
+        // so it appears in subsequent tool_definitions() calls.
+    }
+
     /// Get the set of built-in tool names currently registered.
     pub async fn builtin_tool_names(&self) -> std::collections::HashSet<String> {
         self.builtin_names.read().await.clone()
