@@ -66,6 +66,63 @@ pub struct UserTokenConfig {
     pub user_id: String,
     #[serde(default)]
     pub workspace_read_scopes: Vec<String>,
+    /// LLM backend override for this user (e.g. "anthropic", "ollama", "openai").
+    #[serde(default)]
+    pub llm_backend: Option<String>,
+    /// LLM model override for this user (e.g. "claude-haiku-4-5-20251001").
+    #[serde(default)]
+    pub llm_model: Option<String>,
+    /// LLM API key for this user's provider.
+    #[serde(default, deserialize_with = "deserialize_optional_secret")]
+    pub llm_api_key: Option<SecretString>,
+    /// LLM base URL override for this user's provider.
+    #[serde(default)]
+    pub llm_base_url: Option<String>,
+}
+
+/// Resolved per-user LLM configuration.
+///
+/// Only constructed when all required fields (`llm_backend` + `llm_model`) are
+/// present on a `UserTokenConfig`. The API key and base URL are optional
+/// depending on the backend (e.g. Ollama needs no key).
+#[derive(Debug, Clone)]
+pub struct UserLlmConfig {
+    pub backend: String,
+    pub model: String,
+    pub api_key: Option<SecretString>,
+    pub base_url: Option<String>,
+}
+
+impl UserTokenConfig {
+    /// Try to extract a resolved `UserLlmConfig` from this token config.
+    ///
+    /// Returns `Some` when at least `llm_backend` and `llm_model` are set.
+    pub fn llm_config(&self) -> Result<Option<UserLlmConfig>, String> {
+        match (&self.llm_backend, &self.llm_model) {
+            (Some(backend_str), Some(model)) => {
+                Ok(Some(UserLlmConfig {
+                    backend: backend_str.clone(),
+                    model: model.clone(),
+                    api_key: self.llm_api_key.clone(),
+                    base_url: self.llm_base_url.clone(),
+                }))
+            }
+            (Some(_), None) | (None, Some(_)) => Err(format!(
+                "user '{}': llm_backend and llm_model must both be set (or both omitted)",
+                self.user_id
+            )),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+/// Deserialize an optional `SecretString` from a JSON string.
+fn deserialize_optional_secret<'de, D>(deserializer: D) -> Result<Option<SecretString>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(opt.map(SecretString::from))
 }
 
 /// Signal channel configuration (signal-cli daemon HTTP/JSON-RPC).
@@ -248,6 +305,7 @@ impl ChannelsConfig {
                     });
                 }
             }
+
             Some(GatewayConfig {
                 host: optional_env("GATEWAY_HOST")?
                     .or_else(|| cs.gateway_host.clone())
