@@ -135,6 +135,7 @@ mod tests {
                 description: String::new(),
                 activation: ActivationCriteria::default(),
                 metadata: None,
+                scope: None,
             },
             prompt_content: "test".to_string(),
             trust,
