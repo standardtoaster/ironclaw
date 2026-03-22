@@ -933,4 +933,62 @@ impl Repository {
             })?;
         Ok(result)
     }
+
+    // ==================== Conversation Search ====================
+
+    /// Full-text search across conversation messages (PostgreSQL).
+    ///
+    /// Returns `SearchResult` items with `source = "conversation"` and
+    /// `conversation_id` set. The `document_id` and `chunk_id` are set to the
+    /// message UUID (conversations don't have document/chunk structure).
+    pub async fn search_conversation_messages(
+        &self,
+        user_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, WorkspaceError> {
+        let conn = self.conn().await?;
+
+        let rows = conn
+            .query(
+                r#"
+                SELECT
+                    cm.id as message_id,
+                    cm.conversation_id,
+                    cm.content,
+                    ts_rank_cd(cm.content_tsv, plainto_tsquery('english', $2)) as rank
+                FROM conversation_messages cm
+                JOIN conversations c ON c.id = cm.conversation_id
+                WHERE c.user_id = $1
+                  AND cm.content_tsv @@ plainto_tsquery('english', $2)
+                ORDER BY rank DESC
+                LIMIT $3
+                "#,
+                &[&user_id, &query, &(limit as i64)],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Conversation FTS query failed: {}", e),
+            })?;
+
+        Ok(rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let message_id: Uuid = row.get("message_id");
+                let conversation_id: Uuid = row.get("conversation_id");
+                SearchResult {
+                    document_id: message_id,
+                    document_path: format!("conversation/{}", conversation_id),
+                    chunk_id: message_id,
+                    content: row.get("content"),
+                    score: 0.0, // Will be set by RRF fusion
+                    fts_rank: Some((i + 1) as u32),
+                    vector_rank: None,
+                    conversation_id: Some(conversation_id),
+                    source: "conversation".to_string(),
+                }
+            })
+            .collect())
+    }
 }

@@ -834,6 +834,17 @@ impl WorkspaceStore for PgBackend {
             .await
     }
 
+    async fn search_conversation_messages(
+        &self,
+        user_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, WorkspaceError> {
+        self.repo
+            .search_conversation_messages(user_id, query, limit)
+            .await
+    }
+
     // ==================== Metadata ====================
 
     async fn update_document_metadata(

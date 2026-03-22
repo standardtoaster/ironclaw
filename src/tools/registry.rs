@@ -15,12 +15,12 @@ use crate::tools::builder::{
     BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder, SoftwareBuilder,
 };
 use crate::tools::builtin::{
-    ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, ExtensionInfoTool, HttpTool,
-    JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool,
-    MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PlanUpdateTool, PromptQueue,
-    ReadFileTool, ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool,
-    TimeTool, ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool,
-    ToolSearchTool, ToolUpgradeTool, WriteFileTool,
+    ApplyPatchTool, CancelJobTool, ConversationLoadTool, CreateJobTool, EchoTool,
+    ExtensionInfoTool, HttpTool, JobEventsTool, JobPromptTool, JobStatusTool, JsonTool,
+    ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool,
+    PlanUpdateTool, PromptQueue, ReadFileTool, ShellTool, SkillInstallTool, SkillListTool,
+    SkillRemoveTool, SkillSearchTool, TimeTool, ToolActivateTool, ToolAuthTool, ToolInstallTool,
+    ToolListTool, ToolRemoveTool, ToolSearchTool, ToolUpgradeTool, WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolDiscoverySummary, ToolDomain};
@@ -49,6 +49,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "memory_write",
     "memory_read",
     "memory_tree",
+    "conversation_load",
     "create_job",
     "list_jobs",
     "job_status",
@@ -412,6 +413,14 @@ impl ToolRegistry {
         self.register_sync(Arc::new(ApplyPatchTool::new()));
 
         tracing::debug!("Registered 5 development tools");
+    }
+
+    /// Register conversation tools for loading past chat threads.
+    ///
+    /// Call this after `register_builtin_tools()` when a database is available.
+    pub fn register_conversation_tools(&self, db: Arc<dyn Database>) {
+        self.register_sync(Arc::new(ConversationLoadTool::new(db)));
+        tracing::debug!("Registered 1 conversation tool");
     }
 
     /// Register memory tools with a workspace resolver.

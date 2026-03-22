@@ -744,6 +744,18 @@ pub trait WorkspaceStore: Send + Sync {
         config: &SearchConfig,
     ) -> Result<Vec<SearchResult>, WorkspaceError>;
 
+    /// Full-text search across conversation messages.
+    ///
+    /// Returns ranked results from past conversation messages matching the
+    /// query. Used by `hybrid_search` to merge conversation hits with memory
+    /// chunk hits via RRF.
+    async fn search_conversation_messages(
+        &self,
+        user_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, WorkspaceError>;
+
     // ==================== Metadata ====================
     //
     // **Trust boundary:** methods in this section accept bare document/version

@@ -372,6 +372,7 @@ impl AppBuilder {
                 "Memory tools configured with per-user workspace resolver"
             );
 
+            tools.register_conversation_tools(Arc::clone(db));
             Some(ws)
         } else {
             None
