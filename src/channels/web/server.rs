@@ -407,8 +407,12 @@ pub struct GatewayState {
     pub shutdown_tx: tokio::sync::RwLock<Option<oneshot::Sender<()>>>,
     /// WebSocket connection tracker.
     pub ws_tracker: Option<Arc<crate::channels::web::ws::WsConnectionTracker>>,
-    /// LLM provider for OpenAI-compatible API proxy.
+    /// LLM provider for OpenAI-compatible API proxy (global default).
     pub llm_provider: Option<Arc<dyn crate::llm::LlmProvider>>,
+    /// Per-user LLM provider cache. Lazily populated from `user_tokens` config.
+    pub user_llm_providers: tokio::sync::RwLock<std::collections::HashMap<String, Arc<dyn crate::llm::LlmProvider>>>,
+    /// Per-user token configs for resolving LLM overrides.
+    pub user_tokens: Option<std::collections::HashMap<String, crate::config::UserTokenConfig>>,
     /// Skill registry for skill management API.
     pub skill_registry: Option<Arc<std::sync::RwLock<ironclaw_skills::SkillRegistry>>>,
     /// Skill catalog for searching the ClawHub registry.
@@ -467,6 +471,69 @@ pub struct GatewayState {
     >,
     /// Skills directory for writing per-collection SKILL.md files.
     pub skills_dir: Option<std::path::PathBuf>,
+}
+
+impl GatewayState {
+    /// Get the LLM provider for a specific user.
+    ///
+    /// Checks the per-user cache first, then tries to build a provider from
+    /// the user's token config. Falls back to the global `llm_provider` if no
+    /// per-user config exists or if the user has no LLM overrides.
+    pub async fn llm_provider_for_user(
+        &self,
+        user_id: &str,
+    ) -> Option<Arc<dyn crate::llm::LlmProvider>> {
+        // Fast path: check cache under read lock
+        {
+            let cache = self.user_llm_providers.read().await;
+            if let Some(provider) = cache.get(user_id) {
+                return Some(Arc::clone(provider));
+            }
+        }
+
+        // Look up user token config and check for LLM overrides
+        if let Some(ref tokens) = self.user_tokens {
+            // Find the token config for this user_id
+            let user_config = tokens.values().find(|cfg| cfg.user_id == user_id);
+            if let Some(cfg) = user_config {
+                match cfg.llm_config() {
+                    Ok(Some(llm_cfg)) => {
+                        match crate::llm::create_provider_from_user_config(&llm_cfg) {
+                            Ok(provider) => {
+                                let mut cache = self.user_llm_providers.write().await;
+                                // Double-check after acquiring write lock
+                                if let Some(existing) = cache.get(user_id) {
+                                    return Some(Arc::clone(existing));
+                                }
+                                cache.insert(user_id.to_string(), Arc::clone(&provider));
+                                return Some(provider);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    user_id = %user_id,
+                                    error = %e,
+                                    "Failed to create per-user LLM provider, falling back to global"
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // No per-user LLM config, fall through to global
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            error = %e,
+                            "Invalid per-user LLM config, falling back to global"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Fall back to global provider
+        self.llm_provider.as_ref().map(Arc::clone)
+    }
 }
 
 /// Start the gateway HTTP server.
