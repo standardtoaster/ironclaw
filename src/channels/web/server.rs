@@ -1804,6 +1804,7 @@ async fn chat_threads_handler(
                     title: s.title.clone(),
                     thread_type: s.thread_type.clone(),
                     channel: Some(s.channel.clone()),
+                    workspace_topic: None,
                 };
 
                 if s.id == assistant_id {
@@ -1824,6 +1825,7 @@ async fn chat_threads_handler(
                     title: None,
                     thread_type: Some("assistant".to_string()),
                     channel: Some("gateway".to_string()),
+                    workspace_topic: None,
                 });
             }
 
@@ -1853,6 +1855,7 @@ async fn chat_threads_handler(
             title: None,
             thread_type: None,
             channel: Some("gateway".to_string()),
+            workspace_topic: None,
         })
         .collect();
 
@@ -1886,6 +1889,7 @@ async fn chat_new_thread_handler(
             title: None,
             thread_type: Some("thread".to_string()),
             channel: Some("gateway".to_string()),
+            workspace_topic: None,
         };
         (id, info)
     };

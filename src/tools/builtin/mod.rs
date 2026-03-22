@@ -2,7 +2,13 @@
 
 pub mod collections;
 mod conversation;
+mod create_workspace;
+mod delegate_workspace;
 mod echo;
+mod list_workspaces;
+mod search_workspace_history;
+mod set_workspace_topic;
+mod workspace_summary;
 pub mod extension_tools;
 mod file;
 mod http;
@@ -20,7 +26,13 @@ mod time;
 mod tool_info;
 
 pub use conversation::ConversationLoadTool;
+pub use create_workspace::CreateWorkspaceTool;
+pub use delegate_workspace::DelegateToWorkspaceTool;
 pub use echo::EchoTool;
+pub use list_workspaces::ListWorkspacesTool;
+pub use search_workspace_history::SearchWorkspaceHistoryTool;
+pub use set_workspace_topic::SetWorkspaceTopicTool;
+pub use workspace_summary::WorkspaceSummaryTool;
 pub use extension_tools::{
     ExtensionInfoTool, ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool,
     ToolRemoveTool, ToolSearchTool, ToolUpgradeTool,
