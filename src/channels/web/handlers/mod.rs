@@ -26,3 +26,5 @@ pub mod settings;
 #[allow(dead_code)]
 pub mod static_files;
 pub mod webhooks;
+#[allow(dead_code)]
+pub mod workspaces;

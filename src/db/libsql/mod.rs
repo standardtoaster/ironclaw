@@ -6,6 +6,7 @@
 //! - Turso cloud with embedded replica (sync to cloud)
 //! - In-memory (for testing)
 
+mod agent_workspaces;
 mod conversations;
 mod identities;
 mod jobs;

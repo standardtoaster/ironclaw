@@ -31,8 +31,13 @@ mod session_manager;
 pub mod submission;
 pub mod task;
 pub mod passive_buffer;
+mod organizer_runner;
 mod thread_ops;
+pub mod thread_resolver;
 pub mod undo;
+pub mod workspace_queue;
+pub mod workspace_router;
+pub mod workspace_thread_resolver;
 
 pub(crate) use agent_loop::truncate_for_preview;
 pub use agent_loop::{Agent, AgentDeps};
@@ -42,7 +47,9 @@ pub(crate) use dispatcher::strip_suggestions;
 pub use heartbeat::{
     HeartbeatConfig, HeartbeatResult, HeartbeatRunner, spawn_heartbeat, spawn_multi_user_heartbeat,
 };
+pub use organizer_runner::{OrganizerConfig, OrganizerSignal, spawn_organizer};
 pub use router::{MessageIntent, Router};
+pub use thread_resolver::{OrganizeResult, ResolverError, ThreadResolution, ThreadResolver};
 pub use routine::{Routine, RoutineAction, RoutineRun, Trigger};
 pub use routine_engine::{RoutineEngine, SandboxReadiness};
 pub use scheduler::{Scheduler, SchedulerDeps};

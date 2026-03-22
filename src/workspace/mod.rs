@@ -59,7 +59,8 @@ pub use document::{
 };
 pub use embedding_cache::{CachedEmbeddingProvider, EmbeddingCacheConfig};
 pub use embeddings::{
-    EmbeddingProvider, MockEmbeddings, NearAiEmbeddings, OllamaEmbeddings, OpenAiEmbeddings,
+    EmbeddingError, EmbeddingProvider, MockEmbeddings, NearAiEmbeddings, OllamaEmbeddings,
+    OpenAiEmbeddings,
 };
 #[cfg(feature = "postgres")]
 pub use repository::Repository;

@@ -48,6 +48,8 @@ pub struct ThreadInfo {
     pub thread_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_topic: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

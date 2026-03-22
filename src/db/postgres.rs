@@ -15,10 +15,12 @@ use crate::agent::BrokenTool;
 use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
+use pgvector::Vector;
+
 use crate::db::{
-    ApiTokenRecord, ConversationStore, Database, IdentityStore, JobStore, RoutineStore,
-    SandboxStore, SettingsStore, ToolFailureStore, UserIdentityRecord, UserRecord, UserStore,
-    WorkspaceStore,
+    AgentWorkspace, AgentWorkspaceStore, ApiTokenRecord, ConversationStore, Database, IdentityStore,
+    JobStore, RoutineStore, SandboxStore, SettingsStore, ToolFailureStore, UserIdentityRecord,
+    UserRecord, UserStore, WorkspaceMessageResult, WorkspaceStore,
     structured,
     structured::{Aggregation, CollectionSchema, Filter, Record, StructuredStore},
 };
@@ -1842,6 +1844,340 @@ fn extract_agg_value(
                 }
                 None => Ok(serde_json::Value::Null),
             }
+        }
+    }
+}
+
+// ==================== AgentWorkspaceStore ====================
+
+/// Map a tokio_postgres row to an `AgentWorkspace`.
+fn pg_row_to_agent_workspace(row: &tokio_postgres::Row) -> AgentWorkspace {
+    AgentWorkspace {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        topic: row.get("topic"),
+        conversation_id: row.get("conversation_id"),
+        status: row.get("status"),
+        last_accessed: row.get("last_accessed"),
+        turn_count: row.get("turn_count"),
+        created_at: row.get("created_at"),
+        summary: row.get("summary"),
+    }
+}
+
+#[async_trait]
+impl AgentWorkspaceStore for PgBackend {
+    async fn create_agent_workspace(
+        &self,
+        user_id: &str,
+        conversation_id: Uuid,
+    ) -> Result<AgentWorkspace, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_one(
+                r#"
+                INSERT INTO agent_workspaces (user_id, conversation_id)
+                VALUES ($1, $2)
+                RETURNING id, user_id, topic, conversation_id, status,
+                          last_accessed, turn_count, created_at, summary
+                "#,
+                &[&user_id, &conversation_id],
+            )
+            .await?;
+        Ok(pg_row_to_agent_workspace(&row))
+    }
+
+    async fn update_agent_workspace_topic(
+        &self,
+        id: Uuid,
+        topic: &str,
+        embedding: &[f32],
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        let embedding_vec = Vector::from(embedding.to_vec());
+        conn.execute(
+            "UPDATE agent_workspaces SET topic = $2, topic_embedding = $3 WHERE id = $1",
+            &[&id, &topic, &embedding_vec],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn find_matching_workspace(
+        &self,
+        user_id: &str,
+        embedding: &[f32],
+        threshold: f64,
+    ) -> Result<Option<AgentWorkspace>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let embedding_vec = Vector::from(embedding.to_vec());
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, user_id, topic, conversation_id, status,
+                       last_accessed, turn_count, created_at, summary,
+                       1 - (topic_embedding <=> $2) AS similarity
+                FROM agent_workspaces
+                WHERE user_id = $1
+                  AND status != 'archived'
+                  AND topic_embedding IS NOT NULL
+                ORDER BY topic_embedding <=> $2
+                LIMIT 1
+                "#,
+                &[&user_id, &embedding_vec],
+            )
+            .await?;
+
+        match rows.first() {
+            Some(row) => {
+                let similarity: f64 = row.get("similarity");
+                if similarity >= threshold {
+                    Ok(Some(pg_row_to_agent_workspace(row)))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn find_top_matching_workspaces(
+        &self,
+        user_id: &str,
+        embedding: &[f32],
+        limit: i64,
+    ) -> Result<Vec<(AgentWorkspace, f64)>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let embedding_vec = Vector::from(embedding.to_vec());
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, user_id, topic, conversation_id, status,
+                       last_accessed, turn_count, created_at, summary,
+                       1 - (topic_embedding <=> $2) AS similarity
+                FROM agent_workspaces
+                WHERE user_id = $1
+                  AND status != 'archived'
+                  AND topic_embedding IS NOT NULL
+                ORDER BY topic_embedding <=> $2
+                LIMIT $3
+                "#,
+                &[&user_id, &embedding_vec, &limit],
+            )
+            .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let similarity: f64 = row.get("similarity");
+                (pg_row_to_agent_workspace(row), similarity)
+            })
+            .collect())
+    }
+
+    async fn get_agent_workspace(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<AgentWorkspace>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, user_id, topic, conversation_id, status,
+                       last_accessed, turn_count, created_at, summary
+                FROM agent_workspaces WHERE id = $1
+                "#,
+                &[&id],
+            )
+            .await?;
+        Ok(rows.first().map(pg_row_to_agent_workspace))
+    }
+
+    async fn get_agent_workspace_by_conversation(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<Option<AgentWorkspace>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, user_id, topic, conversation_id, status,
+                       last_accessed, turn_count, created_at, summary
+                FROM agent_workspaces WHERE conversation_id = $1
+                "#,
+                &[&conversation_id],
+            )
+            .await?;
+        Ok(rows.first().map(pg_row_to_agent_workspace))
+    }
+
+    async fn list_agent_workspaces(
+        &self,
+        user_id: &str,
+        status: Option<&str>,
+    ) -> Result<Vec<AgentWorkspace>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = match status {
+            Some(s) => {
+                conn.query(
+                    r#"
+                    SELECT id, user_id, topic, conversation_id, status,
+                           last_accessed, turn_count, created_at, summary
+                    FROM agent_workspaces
+                    WHERE user_id = $1 AND status = $2
+                    ORDER BY last_accessed DESC
+                    "#,
+                    &[&user_id, &s],
+                )
+                .await?
+            }
+            None => {
+                conn.query(
+                    r#"
+                    SELECT id, user_id, topic, conversation_id, status,
+                           last_accessed, turn_count, created_at, summary
+                    FROM agent_workspaces
+                    WHERE user_id = $1
+                    ORDER BY last_accessed DESC
+                    "#,
+                    &[&user_id],
+                )
+                .await?
+            }
+        };
+        Ok(rows.iter().map(pg_row_to_agent_workspace).collect())
+    }
+
+    async fn touch_agent_workspace(&self, id: Uuid) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "UPDATE agent_workspaces SET turn_count = turn_count + 1, last_accessed = now() WHERE id = $1",
+            &[&id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn update_agent_workspace_status(
+        &self,
+        id: Uuid,
+        status: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "UPDATE agent_workspaces SET status = $2 WHERE id = $1",
+            &[&id, &status],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn archive_stale_workspaces(
+        &self,
+        user_id: &str,
+        stale_days: i64,
+    ) -> Result<u64, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let n = conn
+            .execute(
+                r#"
+                UPDATE agent_workspaces SET status = 'archived'
+                WHERE user_id = $1
+                  AND status = 'active'
+                  AND last_accessed < now() - make_interval(days => $2)
+                "#,
+                &[&user_id, &stale_days],
+            )
+            .await?;
+        Ok(n)
+    }
+
+    async fn search_workspace_messages(
+        &self,
+        user_id: &str,
+        query: &str,
+        workspace_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<WorkspaceMessageResult>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let search_pattern = format!("%{query}%");
+
+        let rows = if let Some(ws_id) = workspace_id {
+            conn.query(
+                r#"
+                SELECT m.content, m.role, m.created_at, w.topic, w.id as workspace_id
+                FROM conversation_messages m
+                JOIN agent_workspaces w ON w.conversation_id = m.conversation_id
+                WHERE w.user_id = $1
+                  AND w.id = $4
+                  AND m.role IN ('user', 'assistant')
+                  AND m.content ILIKE $2
+                ORDER BY m.created_at DESC
+                LIMIT $3
+                "#,
+                &[&user_id, &search_pattern, &limit, &ws_id],
+            )
+            .await?
+        } else {
+            conn.query(
+                r#"
+                SELECT m.content, m.role, m.created_at, w.topic, w.id as workspace_id
+                FROM conversation_messages m
+                JOIN agent_workspaces w ON w.conversation_id = m.conversation_id
+                WHERE w.user_id = $1
+                  AND m.role IN ('user', 'assistant')
+                  AND m.content ILIKE $2
+                ORDER BY m.created_at DESC
+                LIMIT $3
+                "#,
+                &[&user_id, &search_pattern, &limit],
+            )
+            .await?
+        };
+
+        Ok(rows
+            .iter()
+            .map(|row| WorkspaceMessageResult {
+                content: row.get("content"),
+                role: row.get("role"),
+                created_at: row.get("created_at"),
+                topic: row.get("topic"),
+                workspace_id: row.get("workspace_id"),
+            })
+            .collect())
+    }
+
+    async fn update_agent_workspace_summary(
+        &self,
+        id: Uuid,
+        summary: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            "UPDATE agent_workspaces SET summary = $2 WHERE id = $1",
+            &[&id, &summary],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn get_workspace_embedding(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<Vec<f32>>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT topic_embedding FROM agent_workspaces WHERE id = $1",
+                &[&id],
+            )
+            .await?;
+        match rows.first() {
+            Some(row) => {
+                let embedding: Option<Vector> = row.get("topic_embedding");
+                Ok(embedding.map(|v| v.to_vec()))
+            }
+            None => Ok(None),
         }
     }
 }

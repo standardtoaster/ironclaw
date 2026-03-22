@@ -1091,6 +1091,99 @@ pub trait IdentityStore: Send + Sync {
     ) -> Result<(), DatabaseError>;
 }
 
+/// An agent workspace tracks a logical conversation topic.
+#[derive(Debug, Clone)]
+pub struct AgentWorkspace {
+    pub id: Uuid,
+    pub user_id: String,
+    pub topic: String,
+    pub conversation_id: Uuid,
+    pub status: String,
+    pub last_accessed: DateTime<Utc>,
+    pub turn_count: i32,
+    pub created_at: DateTime<Utc>,
+    pub summary: Option<String>,
+}
+
+#[async_trait]
+pub trait AgentWorkspaceStore: Send + Sync {
+    async fn create_agent_workspace(
+        &self,
+        user_id: &str,
+        conversation_id: Uuid,
+    ) -> Result<AgentWorkspace, DatabaseError>;
+    async fn update_agent_workspace_topic(
+        &self,
+        id: Uuid,
+        topic: &str,
+        embedding: &[f32],
+    ) -> Result<(), DatabaseError>;
+    async fn find_matching_workspace(
+        &self,
+        user_id: &str,
+        embedding: &[f32],
+        threshold: f64,
+    ) -> Result<Option<AgentWorkspace>, DatabaseError>;
+    /// Return the top-N workspaces by similarity, each paired with its score.
+    async fn find_top_matching_workspaces(
+        &self,
+        user_id: &str,
+        embedding: &[f32],
+        limit: i64,
+    ) -> Result<Vec<(AgentWorkspace, f64)>, DatabaseError>;
+    async fn get_agent_workspace(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<AgentWorkspace>, DatabaseError>;
+    async fn get_agent_workspace_by_conversation(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<Option<AgentWorkspace>, DatabaseError>;
+    async fn list_agent_workspaces(
+        &self,
+        user_id: &str,
+        status: Option<&str>,
+    ) -> Result<Vec<AgentWorkspace>, DatabaseError>;
+    async fn touch_agent_workspace(&self, id: Uuid) -> Result<(), DatabaseError>;
+    async fn update_agent_workspace_status(
+        &self,
+        id: Uuid,
+        status: &str,
+    ) -> Result<(), DatabaseError>;
+    async fn archive_stale_workspaces(
+        &self,
+        user_id: &str,
+        stale_days: i64,
+    ) -> Result<u64, DatabaseError>;
+    async fn search_workspace_messages(
+        &self,
+        user_id: &str,
+        query: &str,
+        workspace_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<WorkspaceMessageResult>, DatabaseError>;
+    async fn update_agent_workspace_summary(
+        &self,
+        id: Uuid,
+        summary: &str,
+    ) -> Result<(), DatabaseError>;
+    /// Retrieve the topic embedding vector for a workspace (PostgreSQL only).
+    async fn get_workspace_embedding(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<Vec<f32>>, DatabaseError>;
+}
+
+/// Result from searching across workspace conversation messages.
+#[derive(Debug, Clone)]
+pub struct WorkspaceMessageResult {
+    pub content: String,
+    pub role: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub topic: String,
+    pub workspace_id: Uuid,
+}
+
 /// Backend-agnostic database supertrait.
 ///
 /// Combines all sub-traits into one. Existing `Arc<dyn Database>` consumers
@@ -1106,6 +1199,7 @@ pub trait Database:
     + WorkspaceStore
     + UserStore
     + IdentityStore
+    + AgentWorkspaceStore
     + structured::StructuredStore
     + Send
     + Sync
