@@ -251,6 +251,7 @@ impl LlmProvider for ClaudeContainerProvider {
         pool.pending_replies.insert(thread_id, tx);
 
         // Send message to container.
+        tracing::info!(thread_id = %thread_id, ip = %session.container_ip, content_len = content.len(), "Sending message to container");
         if let Err(e) = pool.send_message(&session, &thread_id, &content).await {
             pool.pending_replies.remove(&thread_id);
             return Err(e);
@@ -260,8 +261,10 @@ impl LlmProvider for ClaudeContainerProvider {
 
         // Wait for reply with timeout.
         let timeout = Duration::from_secs(self.config.request_timeout_secs);
+        tracing::info!(thread_id = %thread_id, timeout_secs = self.config.request_timeout_secs, "Awaiting oneshot reply");
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(reply)) => {
+                tracing::info!(thread_id = %thread_id, content_len = reply.content.len(), "Oneshot resolved with reply");
                 if let Some(sid) = reply.session_id {
                     pool.update_session_id(&thread_id, sid).await;
                 }
@@ -275,6 +278,7 @@ impl LlmProvider for ClaudeContainerProvider {
                 })
             }
             Ok(Err(_)) => {
+                tracing::warn!(thread_id = %thread_id, "Oneshot sender dropped");
                 pool.pending_replies.remove(&thread_id);
                 Err(LlmError::RequestFailed {
                     provider: "claude_container".into(),
@@ -282,6 +286,7 @@ impl LlmProvider for ClaudeContainerProvider {
                 })
             }
             Err(_) => {
+                tracing::warn!(thread_id = %thread_id, timeout_secs = self.config.request_timeout_secs, "Oneshot timed out");
                 pool.pending_replies.remove(&thread_id);
                 Err(LlmError::RequestFailed {
                     provider: "claude_container".into(),
