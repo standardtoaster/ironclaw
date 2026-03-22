@@ -12,6 +12,11 @@ use tempfile::tempdir;
 
 use ironclaw::bootstrap::{save_bootstrap_env_to, upsert_bootstrap_var_to};
 
+/// Fake OpenAI API key for test use only. Mirrors the internal
+/// `TEST_OPENAI_API_KEY_LONG` constant from the main crate, which is not
+/// directly available to integration tests due to `#[cfg(test)]`.
+const TEST_OPENAI_API_KEY_LONG: &str = "sk-test-key-1234567890";
+
 /// Parse a .env file into a HashMap using dotenvy.
 fn read_env_map(path: &std::path::Path) -> HashMap<String, String> {
     dotenvy::from_path_iter(path)
@@ -51,6 +56,7 @@ fn bootstrap_env_round_trips_llm_backend() {
     for backend in &[
         "nearai",
         "anthropic",
+        "github_copilot",
         "ollama",
         "openai_compatible",
         "tinfoil",
@@ -77,7 +83,7 @@ fn bootstrap_env_round_trips_embedding_disabled() {
         &[
             ("DATABASE_BACKEND", "libsql"),
             ("EMBEDDING_ENABLED", "false"),
-            ("OPENAI_API_KEY", "sk-test-key-1234567890"),
+            ("OPENAI_API_KEY", TEST_OPENAI_API_KEY_LONG),
             ("ONBOARD_COMPLETED", "true"),
         ],
     )
@@ -92,7 +98,7 @@ fn bootstrap_env_round_trips_embedding_disabled() {
     );
     assert_eq!(
         map.get("OPENAI_API_KEY").map(String::as_str),
-        Some("sk-test-key-1234567890"),
+        Some(TEST_OPENAI_API_KEY_LONG),
         "OPENAI_API_KEY must be preserved alongside EMBEDDING_ENABLED"
     );
 }
