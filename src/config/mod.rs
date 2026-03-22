@@ -180,6 +180,7 @@ impl Config {
             search: WorkspaceSearchConfig::default(),
             workspace: WorkspaceConfig {
                 memory_layers: vec![],
+                read_scopes: vec![],
             },
             observability: crate::observability::ObservabilityConfig::default(),
             relay: None,

@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::error::WorkspaceError;
 
 use crate::workspace::document::{MemoryChunk, MemoryDocument, WorkspaceEntry};
-use crate::workspace::search::{RankedResult, SearchConfig, SearchResult, fuse_results};
+use crate::workspace::search::{RankedResult, SearchConfig, SearchResult, fuse_results, reciprocal_rank_fusion};
 
 /// Database repository for workspace operations.
 pub struct Repository {
@@ -572,6 +572,7 @@ impl Repository {
             .map(|(i, row)| RankedResult {
                 chunk_id: row.get("chunk_id"),
                 document_id: row.get("document_id"),
+                document_path: row.try_get("path").unwrap_or_default(),
                 content: row.get("content"),
                 rank: (i + 1) as u32,
             })
@@ -614,6 +615,7 @@ impl Repository {
             .map(|(i, row)| RankedResult {
                 chunk_id: row.get("chunk_id"),
                 document_id: row.get("document_id"),
+                document_path: row.try_get("path").unwrap_or_default(),
                 content: row.get("content"),
                 rank: (i + 1) as u32,
             })
