@@ -79,7 +79,7 @@ impl Agent {
         };
 
         // Select and prepare active skills (if skills system is enabled)
-        let active_skills = self.select_active_skills(&message.content);
+        let active_skills = self.select_active_skills(&message.content, Some(&message.user_id));
 
         // Build skill context block
         let skill_context = if !active_skills.is_empty() {
