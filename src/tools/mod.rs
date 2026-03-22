@@ -18,7 +18,7 @@ pub mod redaction;
 pub mod schema_validator;
 pub mod wasm;
 
-mod registry;
+pub(crate) mod registry;
 mod tool;
 
 pub use autonomy::{
@@ -35,5 +35,5 @@ pub use rate_limiter::RateLimiter;
 pub use registry::ToolRegistry;
 pub use tool::{
     ApprovalContext, ApprovalRequirement, RiskLevel, Tool, ToolDomain, ToolError, ToolOutput,
-    ToolRateLimitConfig, redact_params, validate_tool_schema,
+    ToolRateLimitConfig, ToolSchema, redact_params, validate_tool_schema,
 };

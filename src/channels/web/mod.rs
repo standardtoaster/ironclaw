@@ -111,6 +111,8 @@ impl GatewayChannel {
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
             active_config: server::ActiveConfigSnapshot::default(),
+            default_timezone: "UTC".to_string(),
+            mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
         });
 
         Self {
@@ -153,6 +155,8 @@ impl GatewayChannel {
             startup_time: std::time::Instant::now(),
             webhook_rate_limiter: server::RateLimiter::new(10, 60),
             active_config: server::ActiveConfigSnapshot::default(),
+            default_timezone: "UTC".to_string(),
+            mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
         });
 
         Self {
@@ -195,6 +199,8 @@ impl GatewayChannel {
             routine_engine: Arc::clone(&self.state.routine_engine),
             startup_time: self.state.startup_time,
             active_config: self.state.active_config.clone(),
+            default_timezone: self.state.default_timezone.clone(),
+            mcp_sessions: Arc::clone(&self.state.mcp_sessions),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);

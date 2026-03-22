@@ -93,6 +93,8 @@ impl TestGatewayBuilder {
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
             active_config: crate::channels::web::server::ActiveConfigSnapshot::default(),
+            default_timezone: "UTC".to_string(),
+            mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
         })
     }
 

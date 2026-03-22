@@ -34,7 +34,7 @@ pub mod config;
 pub mod factory;
 pub(crate) mod http_transport;
 pub(crate) mod process;
-mod protocol;
+pub mod protocol;
 pub mod session;
 pub(crate) mod stdio_transport;
 pub(crate) mod transport;

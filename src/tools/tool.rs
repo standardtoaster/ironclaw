@@ -177,6 +177,31 @@ pub enum ToolError {
     Sandbox(String),
 }
 
+/// Signal from a tool to the dispatcher for out-of-band actions.
+///
+/// Signals are intercepted by the dispatcher before the tool result reaches the
+/// LLM. They enable tools to trigger side-effects like model escalation or
+/// user-input pauses without the LLM needing to understand those mechanics.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum ToolSignal {
+    /// Escalate to a higher-tier model.
+    Escalate {
+        reason: String,
+        tier: Option<String>,
+    },
+    /// De-escalate back to the default model.
+    DeEscalate {
+        reason: Option<String>,
+    },
+    /// Pause the agent loop and ask the user for input.
+    UserInputNeeded {
+        question: String,
+        options: Option<Vec<String>>,
+        metadata: Option<serde_json::Value>,
+    },
+}
+
 /// Output from a tool execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutput {
@@ -189,6 +214,9 @@ pub struct ToolOutput {
     /// Raw output before sanitization (for debugging).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
+    /// Optional signal to the dispatcher (not serialized).
+    #[serde(skip)]
+    pub signal: Option<ToolSignal>,
 }
 
 impl ToolOutput {
@@ -199,6 +227,7 @@ impl ToolOutput {
             cost: None,
             duration,
             raw: None,
+            signal: None,
         }
     }
 
@@ -209,6 +238,7 @@ impl ToolOutput {
             cost: None,
             duration,
             raw: None,
+            signal: None,
         }
     }
 
@@ -221,6 +251,13 @@ impl ToolOutput {
     /// Set the raw output.
     pub fn with_raw(mut self, raw: impl Into<String>) -> Self {
         self.raw = Some(raw.into());
+        self
+    }
+
+    /// Attach a signal to the output for the dispatcher.
+    #[allow(dead_code)]
+    pub fn with_signal(mut self, signal: ToolSignal) -> Self {
+        self.signal = Some(signal);
         self
     }
 }

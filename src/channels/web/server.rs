@@ -314,6 +314,10 @@ pub struct GatewayState {
     pub startup_time: std::time::Instant,
     /// Snapshot of active (resolved) configuration for the frontend.
     pub active_config: ActiveConfigSnapshot,
+    /// Default timezone for user contexts (e.g. "America/New_York").
+    pub default_timezone: String,
+    /// Active MCP sessions for Streamable HTTP transport.
+    pub mcp_sessions: Arc<crate::channels::mcp::McpSessionStore>,
 }
 
 impl GatewayState {
@@ -3188,6 +3192,8 @@ mod tests {
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
             active_config: ActiveConfigSnapshot::default(),
+            default_timezone: "UTC".to_string(),
+            mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
         })
     }
 
