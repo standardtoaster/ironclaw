@@ -11,6 +11,11 @@
 pub mod jobs;
 pub mod skills;
 
+#[allow(dead_code)]
+pub mod collections;
+#[allow(dead_code)]
+pub mod events;
+
 // Modules not yet wired into server.rs router -- suppress dead_code until
 // they replace their inline counterparts.
 #[allow(dead_code)]
