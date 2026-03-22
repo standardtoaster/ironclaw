@@ -80,6 +80,8 @@ impl TestGatewayBuilder {
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
             llm_provider: self.llm_provider,
+            user_llm_providers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            user_tokens: None,
             skill_registry: None,
             skill_catalog: None,
             scheduler: None,
