@@ -19,16 +19,41 @@ pub mod catalog;
 pub mod gating;
 pub mod parser;
 pub mod registry;
+pub mod script_runner;
 pub mod selector;
 
 pub use attenuation::{AttenuationResult, attenuate_tools};
 pub use registry::SkillRegistry;
+pub(crate) use registry::load_and_validate_skill;
+pub use script_runner::run_activation_script;
 pub use selector::prefilter_skills;
 
 use std::path::PathBuf;
 
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
+
+/// Optional user scope for a skill. When set, the skill only activates for
+/// matching user IDs. Supports both a single string and a list via untagged
+/// serde deserialization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum SkillScope {
+    /// Skill is scoped to a single user.
+    Single(String),
+    /// Skill is scoped to multiple users.
+    Multiple(Vec<String>),
+}
+
+impl SkillScope {
+    /// Check if the given user_id is within this scope.
+    pub fn matches(&self, user_id: &str) -> bool {
+        match self {
+            SkillScope::Single(s) => s == user_id,
+            SkillScope::Multiple(v) => v.iter().any(|s| s == user_id),
+        }
+    }
+}
 
 /// Maximum number of keywords allowed per skill to prevent scoring manipulation.
 const MAX_KEYWORDS_PER_SKILL: usize = 20;
@@ -91,6 +116,33 @@ pub enum SkillSource {
     Bundled(PathBuf),
 }
 
+/// Script to run at skill activation time, capturing stdout as dynamic context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivationScript {
+    /// Interpreter language: "python", "bash", or "node".
+    pub language: String,
+    /// Inline script content (mutually exclusive with `source_file`).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Script file path relative to the skill directory (mutually exclusive with `source`).
+    #[serde(default)]
+    pub source_file: Option<String>,
+    /// Script execution timeout in milliseconds.
+    #[serde(default = "default_script_timeout")]
+    pub timeout_ms: u64,
+    /// Maximum bytes to capture from stdout.
+    #[serde(default = "default_max_output")]
+    pub max_output_bytes: usize,
+}
+
+fn default_script_timeout() -> u64 {
+    5000
+}
+
+fn default_max_output() -> usize {
+    4096
+}
+
 /// Activation criteria parsed from SKILL.md frontmatter `activation` section.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActivationCriteria {
@@ -112,6 +164,13 @@ pub struct ActivationCriteria {
     /// Maximum context tokens this skill's prompt should consume.
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: usize,
+    /// Tool name prefix to auto-discover when this skill activates.
+    /// When set, matching tools are loaded into the session automatically.
+    #[serde(default)]
+    pub tools_prefix: Option<String>,
+    /// Script to run at activation time; stdout is appended to prompt content.
+    #[serde(default)]
+    pub script: Option<ActivationScript>,
 }
 
 impl ActivationCriteria {
@@ -152,6 +211,10 @@ pub struct SkillManifest {
     /// Optional OpenClaw metadata.
     #[serde(default)]
     pub metadata: Option<SkillMetadata>,
+    /// Optional user_id scope. If set, the skill only activates for matching users.
+    /// Can be a single user_id or a list. If empty/None, activates for all users.
+    #[serde(default)]
+    pub scope: Option<SkillScope>,
 }
 
 fn default_version() -> String {
@@ -516,6 +579,7 @@ metadata:
                 description: String::new(),
                 activation: ActivationCriteria::default(),
                 metadata: None,
+                scope: None,
             },
             prompt_content: "test prompt".to_string(),
             trust: SkillTrust::Trusted,
