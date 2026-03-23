@@ -252,6 +252,25 @@ impl ToolRegistry {
         defs
     }
 
+    /// Get tool definitions filtered to core set. If `core_names` is empty, returns all.
+    ///
+    /// When `CORE_TOOLS` is configured, only the named tools are sent to the LLM each turn.
+    /// All other tools remain registered and executable (e.g. via `discover_tools`) but are
+    /// not included in the LLM's function-calling context.
+    pub async fn tool_definitions_core(&self, core_names: &[String]) -> Vec<ToolDefinition> {
+        if core_names.is_empty() {
+            return self.tool_definitions().await;
+        }
+        let tools = self.tools.read().await;
+        let mut defs: Vec<ToolDefinition> = tools
+            .values()
+            .filter(|t| core_names.iter().any(|c| c.as_str() == t.name()))
+            .map(Self::tool_definition)
+            .collect();
+        defs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        defs
+    }
+
     /// Get tool definitions for specific tools.
     pub async fn tool_definitions_for(&self, names: &[&str]) -> Vec<ToolDefinition> {
         let tools = self.tools.read().await;
