@@ -1252,7 +1252,6 @@ mod tests {
             thread_resolver: None,
             core_tools: Vec::new(),
             organize_rx: None,
-            workspace_pool: None,
         };
 
         Agent::new(
@@ -2124,7 +2123,6 @@ mod tests {
             thread_resolver: None,
             core_tools: Vec::new(),
             organize_rx: None,
-            workspace_pool: None,
         };
 
         Agent::new(
@@ -2249,7 +2247,6 @@ mod tests {
                 thread_resolver: None,
                 core_tools: Vec::new(),
                 organize_rx: None,
-                workspace_pool: None,
             };
 
             Agent::new(
@@ -2539,7 +2536,6 @@ mod tests {
             thread_resolver: None,
             core_tools: Vec::new(),
             organize_rx: None,
-            workspace_pool: None,
             tier_map: Some(Arc::new(
                 TierMap::new(vec![
                     TierEntry {

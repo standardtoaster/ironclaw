@@ -499,7 +499,6 @@ impl TestHarnessBuilder {
             thread_resolver: None,
             core_tools: Vec::new(),
             organize_rx: None,
-            workspace_pool: None,
         };
 
         TestHarness {

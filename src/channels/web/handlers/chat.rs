@@ -456,7 +456,7 @@ pub async fn chat_threads_handler(
         {
             // Build conversation_id → workspace topic map
             let workspace_topics: std::collections::HashMap<uuid::Uuid, String> = store
-                .list_agent_workspaces(&state.default_user_id, Some("active"))
+                .list_agent_workspaces(&state.user_id, Some("active"))
                 .await
                 .unwrap_or_default()
                 .into_iter()

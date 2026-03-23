@@ -290,7 +290,6 @@ mod tests {
 
     use super::*;
     use crate::channels::mcp::McpSessionStore;
-    use crate::channels::web::auth::UserIdentity;
     use crate::tools::mcp::protocol::PROTOCOL_VERSION;
 
     #[tokio::test]
@@ -383,17 +382,17 @@ mod tests {
 
     /// Verify the MCP handler enriches `JobContext` with workspace read scopes
     /// and timezone from the authenticated user and gateway state.
+    /// Note: UserIdentity comes from multi-tenant auth (later stack row).
+    /// This test uses raw fields to exercise the same enrichment logic.
     #[test]
     fn test_job_context_enrichment() {
-        let user = UserIdentity {
-            user_id: "andrew".to_string(),
-            workspace_read_scopes: vec!["grace".to_string(), "household".to_string()],
-        };
+        let user_id = "andrew".to_string();
+        let workspace_read_scopes = vec!["grace".to_string(), "household".to_string()];
         let default_timezone = "America/New_York".to_string();
 
         // Replicate the enrichment logic from mcp_post_handler.
-        let mut ctx = JobContext::with_user(&user.user_id, "mcp", "MCP tool call");
-        ctx.workspace_read_scopes = user.workspace_read_scopes.clone();
+        let mut ctx = JobContext::with_user(&user_id, "mcp", "MCP tool call");
+        ctx.workspace_read_scopes = workspace_read_scopes.clone();
         ctx.user_timezone = default_timezone.clone();
 
         assert_eq!(ctx.user_id, "andrew");
