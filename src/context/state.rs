@@ -203,6 +203,9 @@ pub struct JobContext {
     pub tool_signal_stash: Arc<tokio::sync::RwLock<HashMap<String, crate::tools::ToolSignal>>>,
     /// User's preferred timezone (IANA name, e.g. "America/New_York"). Defaults to "UTC".
     pub user_timezone: String,
+    /// Additional user scopes this job context can read from (multi-scope workspace reads).
+    #[serde(default)]
+    pub workspace_read_scopes: Vec<String>,
 }
 
 impl JobContext {
@@ -245,6 +248,7 @@ impl JobContext {
             tool_output_stash: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             tool_signal_stash: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             user_timezone: "UTC".to_string(),
+            workspace_read_scopes: Vec::new(),
         }
     }
 

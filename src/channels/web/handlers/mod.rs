@@ -8,6 +8,8 @@
 //! The remaining modules are in-progress migrations from inline server.rs
 //! handlers; their functions are not yet wired up, hence the `dead_code` allow.
 
+pub mod collections;
+pub mod events;
 pub mod ingest;
 pub mod skills;
 
