@@ -108,6 +108,8 @@ impl GatewayChannel {
             oidc_allowed_domains: Vec::new(),
         };
 
+        let user_tokens = config.user_tokens.clone();
+
         let state = Arc::new(GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
             sse: Arc::new(SseManager::new()),
@@ -164,9 +166,8 @@ impl GatewayChannel {
         let mut new_state = GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
             // Preserve the existing broadcast channel so sender handles remain valid.
-            sse: Arc::new(SseManager::from_sender(self.state.sse.sender())),
+            sse: SseManager::from_sender(self.state.sse.sender()),
             workspace: self.state.workspace.clone(),
-            workspace_pool: self.state.workspace_pool.clone(),
             session_manager: self.state.session_manager.clone(),
             log_broadcaster: self.state.log_broadcaster.clone(),
             log_level_handle: self.state.log_level_handle.clone(),
@@ -509,7 +510,7 @@ impl Channel for GatewayChannel {
                 ),
             })?;
 
-        server::start_server(addr, self.state.clone(), self.auth.clone()).await?;
+        server::start_server(addr, self.state.clone(), self.auth_token.clone()).await?;
 
         Ok(Box::pin(ReceiverStream::new(rx)))
     }
@@ -529,6 +530,7 @@ impl Channel for GatewayChannel {
             }
         };
 
+<<<<<<< HEAD
         self.state.sse.broadcast_for_user(
             &msg.user_id,
             AppEvent::Response {
@@ -536,6 +538,12 @@ impl Channel for GatewayChannel {
                 thread_id,
             },
         );
+=======
+        self.state.sse.broadcast(SseEvent::Response {
+            content: response.content,
+            thread_id,
+        });
+>>>>>>> 0ff7eaba (fix: adapt per-user-llm to current stack surface)
 
         Ok(())
     }
@@ -668,21 +676,13 @@ impl Channel for GatewayChannel {
             },
         };
 
-        // Scope events to the user when user_id is available in metadata.
-        // When user_id is missing (heartbeat, routines), events go to all
-        // subscribers. In multi-tenant mode this leaks status across users.
-        if let Some(uid) = metadata.get("user_id").and_then(|v| v.as_str()) {
-            self.state.sse.broadcast_for_user(uid, event);
-        } else {
-            tracing::debug!("Status event missing user_id in metadata; broadcasting globally");
-            self.state.sse.broadcast(event);
-        }
+        self.state.sse.broadcast(event);
         Ok(())
     }
 
     async fn broadcast(
         &self,
-        user_id: &str,
+        _user_id: &str,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
         let thread_id = match response.thread_id {
@@ -694,6 +694,7 @@ impl Channel for GatewayChannel {
                 });
             }
         };
+<<<<<<< HEAD
         self.state.sse.broadcast_for_user(
             user_id,
             AppEvent::Response {
@@ -701,6 +702,12 @@ impl Channel for GatewayChannel {
                 thread_id,
             },
         );
+=======
+        self.state.sse.broadcast(SseEvent::Response {
+            content: response.content,
+            thread_id,
+        });
+>>>>>>> 0ff7eaba (fix: adapt per-user-llm to current stack surface)
         Ok(())
     }
 
