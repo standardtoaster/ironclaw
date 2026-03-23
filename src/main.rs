@@ -619,9 +619,15 @@ async fn async_main() -> anyhow::Result<()> {
         }
         // Create per-user workspace pool for multi-user mode.
         if let Some(ref db) = components.db {
+            let emb_cache_config = ironclaw::workspace::EmbeddingCacheConfig {
+                max_entries: config.embeddings.cache_size,
+            };
             let pool = Arc::new(ironclaw::channels::web::server::WorkspacePool::new(
                 Arc::clone(db),
                 components.embeddings.clone(),
+                emb_cache_config,
+                config.search.clone(),
+                config.workspace.clone(),
             ));
             gw = gw.with_workspace_pool(pool);
         }

@@ -206,10 +206,14 @@ impl PerUserRateLimiter {
 /// Per-user workspace pool: lazily creates and caches workspaces keyed by user_id.
 ///
 /// In single-user mode, exactly one workspace is cached. In multi-user mode,
-/// each authenticated user gets their own workspace with appropriate scopes.
+/// each authenticated user gets their own workspace with appropriate scopes,
+/// search config, memory layers, and embedding cache settings.
 pub struct WorkspacePool {
     db: Arc<dyn Database>,
     embeddings: Option<Arc<dyn crate::workspace::EmbeddingProvider>>,
+    embedding_cache_config: crate::workspace::EmbeddingCacheConfig,
+    search_config: crate::config::WorkspaceSearchConfig,
+    workspace_config: crate::config::WorkspaceConfig,
     cache: tokio::sync::RwLock<std::collections::HashMap<String, Arc<Workspace>>>,
 }
 
@@ -217,15 +221,24 @@ impl WorkspacePool {
     pub fn new(
         db: Arc<dyn Database>,
         embeddings: Option<Arc<dyn crate::workspace::EmbeddingProvider>>,
+        embedding_cache_config: crate::workspace::EmbeddingCacheConfig,
+        search_config: crate::config::WorkspaceSearchConfig,
+        workspace_config: crate::config::WorkspaceConfig,
     ) -> Self {
         Self {
             db,
             embeddings,
+            embedding_cache_config,
+            search_config,
+            workspace_config,
             cache: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
     /// Get or create a workspace for the given user identity.
+    ///
+    /// Applies search config, memory layers, embedding cache, and read scopes
+    /// (both from global config and from the token's `workspace_read_scopes`).
     pub async fn get_or_create(&self, identity: &UserIdentity) -> Arc<Workspace> {
         // Fast path: check read lock
         {
@@ -242,10 +255,24 @@ impl WorkspacePool {
             return Arc::clone(ws);
         }
 
-        let mut ws = Workspace::new_with_db(&identity.user_id, Arc::clone(&self.db));
+        let mut ws = Workspace::new_with_db(&identity.user_id, Arc::clone(&self.db))
+            .with_search_config(&self.search_config);
+
         if let Some(ref emb) = self.embeddings {
-            ws = ws.with_embeddings(Arc::clone(emb));
+            ws = ws.with_embeddings_cached(Arc::clone(emb), self.embedding_cache_config.clone());
         }
+
+        // Apply global read scopes from config.
+        if !self.workspace_config.read_scopes.is_empty() {
+            ws = ws.with_additional_read_scopes(self.workspace_config.read_scopes.clone());
+        }
+
+        // Apply per-token read scopes from identity.
+        if !identity.workspace_read_scopes.is_empty() {
+            ws = ws.with_additional_read_scopes(identity.workspace_read_scopes.clone());
+        }
+
+        ws = ws.with_memory_layers(self.workspace_config.memory_layers.clone());
 
         let ws = Arc::new(ws);
         cache.insert(identity.user_id.clone(), Arc::clone(&ws));
@@ -2071,6 +2098,7 @@ async fn memory_search_handler(
 
 async fn logs_events_handler(
     State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(_user): AuthenticatedUser,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let broadcaster = state.log_broadcaster.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -2108,6 +2136,7 @@ async fn logs_events_handler(
 
 async fn logs_level_get_handler(
     State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(_user): AuthenticatedUser,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let handle = state.log_level_handle.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -2118,6 +2147,7 @@ async fn logs_level_get_handler(
 
 async fn logs_level_set_handler(
     State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let handle = state.log_level_handle.as_ref().ok_or((
@@ -2134,7 +2164,7 @@ async fn logs_level_set_handler(
         .set_level(level)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
-    tracing::info!("Log level changed to '{}'", handle.current_level());
+    tracing::info!(user_id = %user.user_id, "Log level changed to '{}'", handle.current_level());
     Ok(Json(serde_json::json!({ "level": handle.current_level() })))
 }
 
@@ -2210,6 +2240,7 @@ async fn extensions_list_handler(
 
 async fn extensions_tools_handler(
     State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(_user): AuthenticatedUser,
 ) -> Result<Json<ToolListResponse>, (StatusCode, String)> {
     let registry = state.tool_registry.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -2604,7 +2635,7 @@ async fn extensions_setup_submit_handler(
             if result.verification.is_none() {
                 // Broadcast auth_completed so the chat UI can dismiss any in-progress
                 // auth card or setup modal that was triggered by tool_auth/tool_activate.
-                state.sse.broadcast(SseEvent::AuthCompleted {
+                state.sse.broadcast_for_user(&user.user_id, SseEvent::AuthCompleted {
                     extension_name: name.clone(),
                     success: result.activated,
                     message: resp.message.clone(),
@@ -2845,6 +2876,7 @@ async fn settings_import_handler(
 
 async fn gateway_status_handler(
     State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(_user): AuthenticatedUser,
 ) -> Json<GatewayStatusResponse> {
     let sse_connections = state.sse.connection_count();
     let ws_connections = state

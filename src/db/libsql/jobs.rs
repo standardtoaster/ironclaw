@@ -277,6 +277,32 @@ impl JobStore for LibSqlBackend {
         Ok(summary)
     }
 
+    async fn agent_job_summary_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<AgentJobSummary, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT status, COUNT(*) as cnt FROM agent_jobs WHERE source = 'direct' AND user_id = ?1 GROUP BY status",
+                params![user_id],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut summary = AgentJobSummary::default();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            let status = get_text(&row, 0);
+            let count = get_i64(&row, 1) as usize;
+            summary.add_count(&status, count);
+        }
+        Ok(summary)
+    }
+
     async fn save_action(&self, job_id: Uuid, action: &ActionRecord) -> Result<(), DatabaseError> {
         let conn = self.connect().await?;
         let duration_ms = action.duration.as_millis() as i64;

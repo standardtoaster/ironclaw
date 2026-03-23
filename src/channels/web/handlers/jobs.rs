@@ -85,7 +85,7 @@ pub async fn jobs_list_handler(
 
 pub async fn jobs_summary_handler(
     State(state): State<Arc<GatewayState>>,
-    AuthenticatedUser(_user): AuthenticatedUser,
+    AuthenticatedUser(user): AuthenticatedUser,
 ) -> Result<Json<JobSummaryResponse>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -99,8 +99,8 @@ pub async fn jobs_summary_handler(
     let mut failed = 0;
     let mut stuck = 0;
 
-    // Sandbox job counts.
-    match store.sandbox_job_summary().await {
+    // Sandbox job counts scoped to this user.
+    match store.sandbox_job_summary_for_user(&user.user_id).await {
         Ok(s) => {
             total += s.total;
             pending += s.creating;
@@ -113,8 +113,8 @@ pub async fn jobs_summary_handler(
         }
     }
 
-    // Agent job counts.
-    match store.agent_job_summary().await {
+    // Agent job counts scoped to this user.
+    match store.agent_job_summary_for_user(&user.user_id).await {
         Ok(s) => {
             total += s.total;
             pending += s.pending;
@@ -474,6 +474,9 @@ pub async fn jobs_restart_handler(
 
     // Try agent job restart: dispatch a new job via the scheduler.
     if let Ok(Some(old_job)) = store.get_job(old_job_id).await {
+        if old_job.user_id != user.user_id {
+            return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
+        }
         if old_job.state.is_active() {
             return Err((
                 StatusCode::CONFLICT,
@@ -539,26 +542,6 @@ pub async fn jobs_prompt_handler(
         .parse()
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
 
-    // Verify ownership before queuing a prompt.
-    if let Some(ref store) = state.store {
-        match store.get_sandbox_job(job_id).await {
-            Ok(Some(job)) => {
-                if job.user_id != user.user_id {
-                    return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
-                }
-            }
-            Ok(None) => {
-                return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
-            }
-            Err(e) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Database error: {}", e),
-                ));
-            }
-        }
-    }
-
     let content = body
         .get("content")
         .and_then(|v| v.as_str())
@@ -570,10 +553,15 @@ pub async fn jobs_prompt_handler(
 
     let done = body.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    // Try sandbox job path: check if we have a sandbox record for this ID.
+    // Try sandbox job path first: verify ownership, then route to Claude Code or reject.
     if let Some(ref s) = state.store
-        && let Ok(Some(_)) = s.get_sandbox_job(job_id).await
+        && let Ok(Some(sandbox_job)) = s.get_sandbox_job(job_id).await
     {
+        // Verify ownership.
+        if sandbox_job.user_id != user.user_id {
+            return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
+        }
+
         // It's a sandbox job. Check if Claude Code mode.
         let mode = s.get_sandbox_job_mode(job_id).await.ok().flatten();
         if mode.as_deref() == Some("claude_code") {
@@ -598,7 +586,14 @@ pub async fn jobs_prompt_handler(
         }
     }
 
-    // Try agent job path: send via scheduler.
+    // Try agent job path: verify ownership, then send via scheduler.
+    if let Some(ref store) = state.store
+        && let Ok(Some(agent_job)) = store.get_job(job_id).await
+        && agent_job.user_id != user.user_id
+    {
+        return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
+    }
+
     let slot = state.scheduler.as_ref().ok_or((
         StatusCode::NOT_IMPLEMENTED,
         "Agent job prompts require the scheduler to be configured".to_string(),

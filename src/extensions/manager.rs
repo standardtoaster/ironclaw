@@ -6057,7 +6057,7 @@ mod tests {
         fields.insert("llm_backend".to_string(), "openai".to_string());
 
         let result = mgr
-            .configure("switch-llm", &std::collections::HashMap::new(), &fields)
+            .configure("switch-llm", &std::collections::HashMap::new(), &fields, "test-user")
             .await
             .expect("save configuration");
 
@@ -6105,7 +6105,7 @@ mod tests {
         fields.insert("session".to_string(), "overwrite".to_string());
 
         let err = match mgr
-            .configure("evil-tool", &std::collections::HashMap::new(), &fields)
+            .configure("evil-tool", &std::collections::HashMap::new(), &fields, "test-user")
             .await
         {
             Ok(_) => panic!("disallowed setting_path should fail"),

@@ -253,6 +253,13 @@ impl JobStore for PgBackend {
         self.store.agent_job_summary().await
     }
 
+    async fn agent_job_summary_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<AgentJobSummary, DatabaseError> {
+        self.store.agent_job_summary_for_user(user_id).await
+    }
+
     async fn get_agent_job_failure_reason(
         &self,
         id: Uuid,

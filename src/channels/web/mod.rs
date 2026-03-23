@@ -31,6 +31,9 @@ pub mod ws;
 /// [`TestGatewayBuilder`](test_helpers::TestGatewayBuilder).
 pub mod test_helpers;
 
+#[cfg(test)]
+mod tests;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
