@@ -2,6 +2,8 @@
 //!
 //! Each module groups related endpoint handlers by domain.
 
+pub mod collections;
+pub mod events;
 pub mod ingest;
 pub mod jobs;
 pub mod memory;
