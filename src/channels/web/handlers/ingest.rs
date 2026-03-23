@@ -56,7 +56,7 @@ pub async fn ingest_conversation_handler(
     // passive ingestion from interactive chat.
     let thread_id = req.title.as_deref();
     let conversation_id = db
-        .create_conversation("ingest", &state.user_id, thread_id)
+        .create_conversation("ingest", &state.default_user_id, thread_id)
         .await
         .map_err(|e| {
             (
