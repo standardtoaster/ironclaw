@@ -606,7 +606,7 @@ impl SkillRegistry {
 ///
 /// Reads the file, checks for symlinks and size limits, then delegates to
 /// `build_loaded_skill` for parsing, validation, and construction.
-async fn load_and_validate_skill(
+pub(crate) async fn load_and_validate_skill(
     path: &Path,
     trust: SkillTrust,
     source: SkillSource,
