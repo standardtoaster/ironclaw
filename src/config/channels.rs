@@ -59,6 +59,9 @@ pub struct GatewayConfig {
     pub memory_layers: Vec<crate::workspace::layer::MemoryLayer>,
     /// OIDC JWT authentication (e.g., behind AWS ALB with Okta).
     pub oidc: Option<GatewayOidcConfig>,
+    /// Per-user token configs for multi-tenant mode.
+    /// Parsed from `GATEWAY_USER_TOKENS` (JSON object mapping token → user config).
+    pub user_tokens: Option<HashMap<String, UserTokenConfig>>,
 }
 
 /// OIDC JWT authentication configuration for the web gateway.
@@ -281,6 +284,41 @@ impl ChannelsConfig {
                 }
             }
 
+            let user_tokens: Option<HashMap<String, UserTokenConfig>> =
+                match optional_env("GATEWAY_USER_TOKENS")? {
+                    Some(json_str) => {
+                        let tokens: HashMap<String, UserTokenConfig> = serde_json::from_str(
+                            &json_str,
+                        )
+                        .map_err(|e| ConfigError::InvalidValue {
+                            key: "GATEWAY_USER_TOKENS".to_string(),
+                            message: format!(
+                                "must be valid JSON object mapping tokens to user configs: {e}"
+                            ),
+                        })?;
+                        if tokens.is_empty() {
+                            return Err(ConfigError::InvalidValue {
+                            key: "GATEWAY_USER_TOKENS".to_string(),
+                            message:
+                                "token map is empty — remove the variable to use single-user mode"
+                                    .to_string(),
+                        });
+                        }
+                        for (tok, cfg) in &tokens {
+                            if cfg.user_id.trim().is_empty() {
+                                return Err(ConfigError::InvalidValue {
+                                    key: "GATEWAY_USER_TOKENS".to_string(),
+                                    message: format!(
+                                        "token '{}...' has an empty user_id",
+                                        &tok[..tok.len().min(8)]
+                                    ),
+                                });
+                            }
+                        }
+                        Some(tokens)
+                    }
+                    None => None,
+                };
             let workspace_read_scopes: Vec<String> = optional_env("WORKSPACE_READ_SCOPES")?
                 .map(|s| {
                     s.split(',')
@@ -340,6 +378,7 @@ impl ChannelsConfig {
                 workspace_read_scopes,
                 memory_layers,
                 oidc,
+                user_tokens,
             })
         } else {
             None
@@ -516,6 +555,7 @@ mod tests {
             workspace_read_scopes: vec![],
             memory_layers: vec![],
             oidc: None,
+            user_tokens: None,
         };
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 3000);
@@ -531,6 +571,7 @@ mod tests {
             workspace_read_scopes: vec![],
             memory_layers: vec![],
             oidc: None,
+            user_tokens: None,
         };
         assert!(cfg.auth_token.is_none());
     }
