@@ -147,7 +147,7 @@ pub async fn collections_list_handler(
                     all_collections.push(CollectionInfo {
                         collection: schema.collection,
                         description: schema.description,
-                        user_id: uid.clone(),
+                        user_id: uid.to_string(),
                         fields,
                     });
                 }
