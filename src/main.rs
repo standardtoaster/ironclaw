@@ -944,6 +944,27 @@ async fn async_main() -> anyhow::Result<()> {
         .as_ref()
         .map(|db| Arc::clone(db) as Arc<dyn ironclaw::db::SettingsStore>);
 
+    // Build workspace router for agent (routes prompts to workspaces by embedding similarity).
+    let workspace_router_for_agent: Option<Arc<ironclaw::agent::workspace_router::WorkspaceRouter>> =
+        match (&components.db, &components.embeddings) {
+            (Some(db), Some(embedder)) => {
+                let threshold = std::env::var("WORKSPACE_ROUTER_THRESHOLD")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.8);
+                Some(Arc::new(ironclaw::agent::workspace_router::WorkspaceRouter::new(
+                    Arc::clone(db) as Arc<dyn ironclaw::db::AgentWorkspaceStore>,
+                    Arc::clone(embedder),
+                    threshold,
+                )))
+            }
+            _ => None,
+        };
+
+    // Create organizer channel for async workspace organization signals.
+    let (organize_tx, organize_rx) =
+        tokio::sync::mpsc::channel::<ironclaw::agent::OrganizerSignal>(64);
+
     let thread_resolver_for_agent: Option<Arc<dyn ironclaw::agent::ThreadResolver>> =
         match (&workspace_router_for_agent, &components.db) {
             (Some(router), Some(db)) => {
@@ -961,45 +982,10 @@ async fn async_main() -> anyhow::Result<()> {
                 {
                     resolver_config.organizer_max_tokens = t;
                 }
-                // Build organizer LLM: dedicated provider (env vars) > cheap_llm > main LLM.
-                let organizer_llm = match (
-                    std::env::var("ORGANIZER_LLM_BACKEND"),
-                    std::env::var("ORGANIZER_LLM_MODEL"),
-                ) {
-                    (Ok(backend_str), Ok(model)) => {
-                        let backend = backend_str.parse::<ironclaw::config::LlmBackend>()
-                            .map_err(|e| tracing::warn!("Invalid ORGANIZER_LLM_BACKEND: {e}"))
-                            .ok();
-                        if let Some(backend) = backend {
-                            let user_config = ironclaw::config::UserLlmConfig {
-                                backend,
-                                model,
-                                api_key: std::env::var("ORGANIZER_LLM_API_KEY").ok()
-                                    .map(secrecy::SecretString::from),
-                                base_url: std::env::var("ORGANIZER_LLM_BASE_URL").ok(),
-                            };
-                            match ironclaw::llm::create_provider_from_user_config(&user_config) {
-                                Ok(provider) => {
-                                    tracing::info!(
-                                        backend = %backend_str,
-                                        model = %user_config.model,
-                                        "Organizer using dedicated LLM provider"
-                                    );
-                                    Some(provider)
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Failed to create organizer LLM: {e}, falling back");
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                }
-                .or_else(|| components.cheap_llm.clone())
-                .or_else(|| Some(Arc::clone(&components.llm)));
+                // Build organizer LLM: use cheap_llm > main LLM.
+                // (Dedicated organizer LLM backend requires LlmBackend enum from a later row.)
+                let organizer_llm = components.cheap_llm.clone()
+                    .or_else(|| Some(Arc::clone(&components.llm)));
                 Some(Arc::new(
                     ironclaw::agent::workspace_thread_resolver::WorkspaceThreadResolver::new(
                         Arc::clone(router),
@@ -1013,14 +999,6 @@ async fn async_main() -> anyhow::Result<()> {
             }
             _ => None,
         };
-
-    // Create per-user workspace pool for the agent (same pool the gateway uses).
-    let agent_workspace_pool = components.db.as_ref().map(|db| {
-        Arc::new(ironclaw::channels::web::server::WorkspacePool::new(
-            Arc::clone(db),
-            components.embeddings.clone(),
-        ))
-    });
 
     let mut deps = AgentDeps {
         owner_id: config.owner_id.clone(),
@@ -1064,7 +1042,6 @@ async fn async_main() -> anyhow::Result<()> {
         thread_resolver: thread_resolver_for_agent,
         core_tools: config.core_tools.clone(),
         organize_rx: Some(organize_rx),
-        workspace_pool: agent_workspace_pool,
     };
 
     // Initialize escalation tier map if configured.

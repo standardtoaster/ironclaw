@@ -9,7 +9,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
 
 #[derive(Debug, Deserialize)]
@@ -35,7 +34,6 @@ pub struct WorkspaceListResponse {
 
 pub async fn workspaces_list_handler(
     State(state): State<Arc<GatewayState>>,
-    AuthenticatedUser(user): AuthenticatedUser,
     Query(params): Query<WorkspaceListParams>,
 ) -> Result<Json<WorkspaceListResponse>, (StatusCode, String)> {
     let db = state.store.as_ref().ok_or((
@@ -44,7 +42,7 @@ pub async fn workspaces_list_handler(
     ))?;
 
     let workspaces = db
-        .list_agent_workspaces(&user.user_id, params.status.as_deref())
+        .list_agent_workspaces(&state.user_id, params.status.as_deref())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -66,9 +64,9 @@ pub async fn workspaces_list_handler(
 
 pub async fn workspaces_detail_handler(
     State(state): State<Arc<GatewayState>>,
-    AuthenticatedUser(_user): AuthenticatedUser,
     Path(id): Path<String>,
 ) -> Result<Json<WorkspaceInfoResponse>, (StatusCode, String)> {
+    let _ = &state;
     let db = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),

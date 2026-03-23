@@ -1578,7 +1578,6 @@ mod tests {
             thread_resolver: None,
             core_tools: Vec::new(),
             organize_rx: None,
-            workspace_pool: None,
         };
 
         Agent::new(
@@ -2473,7 +2472,6 @@ mod tests {
             thread_resolver: None,
             core_tools: Vec::new(),
             organize_rx: None,
-            workspace_pool: None,
         };
 
         Agent::new(
@@ -2611,7 +2609,6 @@ mod tests {
                 thread_resolver: None,
                 core_tools: Vec::new(),
                 organize_rx: None,
-                workspace_pool: None,
             };
 
             Agent::new(
@@ -2960,6 +2957,10 @@ mod tests {
             builder: None,
             llm_backend: "test".to_string(),
             tenant_rates: Arc::new(crate::tenant::TenantRateRegistry::new(4, 3)),
+            workspace_router: None,
+            thread_resolver: None,
+            core_tools: Vec::new(),
+            organize_rx: None,
             tier_map: Some(Arc::new(
                 TierMap::new(vec![
                     TierEntry {
