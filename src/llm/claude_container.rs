@@ -454,6 +454,7 @@ async fn handle_claude_approval(
         description,
         parameters,
         thread_id: payload.thread_id,
+        allow_always: true,
     });
 
     axum::http::StatusCode::OK

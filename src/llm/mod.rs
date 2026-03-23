@@ -966,41 +966,50 @@ pub fn create_provider_from_user_config(
                 ),
             })
         }
-        LlmBackend::ClaudeContainer => {
-            let config = claude_container::ContainerProviderConfig {
-                model: user_config.model.clone(),
-                image: std::env::var("CLAUDE_CONTAINER_IMAGE")
-                    .unwrap_or_else(|_| "percy-claude:latest".to_string()),
-                socket_path: std::env::var("CLAUDE_CONTAINER_SOCKET")
-                    .unwrap_or_else(|_| "/run/podman/podman.sock".to_string()),
-                lens: lens.to_string(),
-                network: std::env::var("CLAUDE_CONTAINER_NETWORK")
-                    .unwrap_or_else(|_| "percy_proxy-network".to_string()),
-                request_timeout_secs: 300,
-                auth_volume: std::env::var("CLAUDE_CONTAINER_AUTH_VOLUME")
-                    .unwrap_or_else(|_| "claude-auth".to_string()),
-                skip_permissions: true,
-                extra_env: vec![],
-                lens_data_volume: Some(format!("claude-data-{lens}")),
-                lens_config_path: std::env::var("CLAUDE_CONTAINER_LENS_CONFIG").ok(),
-                callback_host: std::env::var("CLAUDE_CONTAINER_CALLBACK_HOST").ok(),
-                callback_port: std::env::var("CLAUDE_CONTAINER_CALLBACK_PORT")
-                    .ok()
-                    .and_then(|s| s.parse().ok()),
-                auth_token: std::env::var("GATEWAY_AUTH_TOKEN").ok(),
-            };
-            tracing::info!(
-                user_model = %user_config.model,
-                backend = %user_config.backend,
-                "Per-user Claude container provider created"
-            );
-            Arc::new(claude_container::ClaudeContainerProvider::new(config))
-                as Arc<dyn LlmProvider>
-        }
-    };
+    }
+}
 
-    // Wrap with CleaningProvider to strip thinking tags from all output
-    Ok(Arc::new(CleaningProvider::new(provider)))
+/// Create a per-user LLM provider with a specific lens name.
+///
+/// The `lens` parameter is used as the container label for ClaudeContainer
+/// providers, enabling per-lens container isolation and data volumes.
+/// For non-container backends, this delegates to `create_provider_from_user_config`.
+pub fn create_provider_from_user_config_with_lens(
+    user_config: &crate::config::UserLlmConfig,
+    lens: &str,
+) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    if user_config.backend.as_str() == "claude_container" {
+        let config = claude_container::ContainerProviderConfig {
+            model: user_config.model.clone(),
+            image: std::env::var("CLAUDE_CONTAINER_IMAGE")
+                .unwrap_or_else(|_| "percy-claude:latest".to_string()),
+            socket_path: std::env::var("CLAUDE_CONTAINER_SOCKET")
+                .unwrap_or_else(|_| "/run/podman/podman.sock".to_string()),
+            lens: lens.to_string(),
+            network: std::env::var("CLAUDE_CONTAINER_NETWORK")
+                .unwrap_or_else(|_| "percy_proxy-network".to_string()),
+            request_timeout_secs: 300,
+            auth_volume: std::env::var("CLAUDE_CONTAINER_AUTH_VOLUME")
+                .unwrap_or_else(|_| "claude-auth".to_string()),
+            skip_permissions: true,
+            extra_env: vec![],
+            lens_data_volume: Some(format!("claude-data-{lens}")),
+            lens_config_path: std::env::var("CLAUDE_CONTAINER_LENS_CONFIG").ok(),
+            callback_host: std::env::var("CLAUDE_CONTAINER_CALLBACK_HOST").ok(),
+            callback_port: std::env::var("CLAUDE_CONTAINER_CALLBACK_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            auth_token: std::env::var("GATEWAY_AUTH_TOKEN").ok(),
+        };
+        tracing::info!(
+            user_model = %user_config.model,
+            backend = %user_config.backend,
+            "Per-user Claude container provider created"
+        );
+        return Ok(Arc::new(claude_container::ClaudeContainerProvider::new(config)));
+    }
+
+    create_provider_from_user_config(user_config)
 }
 
 #[cfg(test)]
