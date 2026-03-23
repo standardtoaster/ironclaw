@@ -62,6 +62,11 @@ pub struct GatewayChannel {
     state: Arc<GatewayState>,
     /// The actual auth token in use (generated or from config).
     auth_token: String,
+    /// Extra routes to merge into the gateway router (e.g., Claude container callbacks).
+    ///
+    /// These must already have their own state applied (i.e., be `Router<()>`) so they
+    /// merge cleanly into the outer router regardless of its state type.
+    extra_routes: Vec<axum::Router>,
 }
 
 impl GatewayChannel {
@@ -106,12 +111,14 @@ impl GatewayChannel {
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
             active_config: server::ActiveConfigSnapshot::default(),
+            container_pool: None,
         });
 
         Self {
             config,
             state,
             auth_token,
+            extra_routes: Vec::new(),
         }
     }
 
@@ -147,6 +154,7 @@ impl GatewayChannel {
             routine_engine: Arc::clone(&self.state.routine_engine),
             startup_time: self.state.startup_time,
             active_config: self.state.active_config.clone(),
+            container_pool: self.state.container_pool.clone(),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
@@ -264,6 +272,27 @@ impl GatewayChannel {
         self
     }
 
+    /// Inject a shared container pool for Claude container providers.
+    ///
+    /// When set, the gateway registers callback routes (`/api/claude/*`) and
+    /// per-user `ClaudeContainer` providers reuse this pool.
+    pub fn with_container_pool(
+        mut self,
+        pool: Arc<crate::llm::container_pool::ContainerPool>,
+    ) -> Self {
+        self.rebuild_state(|s| s.container_pool = Some(pool));
+        self
+    }
+
+    /// Add extra routes to merge into the gateway router.
+    ///
+    /// The routes must already have their own state applied (be `Router<()>`)
+    /// so they merge cleanly. Used for Claude container callback endpoints.
+    pub fn with_extra_routes(mut self, routes: axum::Router) -> Self {
+        self.extra_routes.push(routes);
+        self
+    }
+
     /// Get the auth token (for printing to console on startup).
     pub fn auth_token(&self) -> &str {
         &self.auth_token
@@ -295,7 +324,7 @@ impl Channel for GatewayChannel {
                 ),
             })?;
 
-        server::start_server(addr, self.state.clone(), self.auth_token.clone()).await?;
+        server::start_server(addr, self.state.clone(), self.auth_token.clone(), &self.extra_routes).await?;
 
         Ok(Box::pin(ReceiverStream::new(rx)))
     }

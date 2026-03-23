@@ -213,6 +213,12 @@ pub struct GatewayState {
     pub startup_time: std::time::Instant,
     /// Snapshot of active (resolved) configuration for the frontend.
     pub active_config: ActiveConfigSnapshot,
+    /// Shared container pool for Claude container providers.
+    ///
+    /// When present, callback routes (`/api/claude/*`) are registered on the
+    /// gateway and per-user `ClaudeContainer` providers reuse this pool instead
+    /// of creating their own.
+    pub container_pool: Option<Arc<crate::llm::container_pool::ContainerPool>>,
 }
 
 impl GatewayState {
@@ -240,14 +246,19 @@ impl GatewayState {
             if let Some(cfg) = user_config {
                 match cfg.llm_config() {
                     Ok(Some(llm_cfg)) => {
-                        // Per-user provider construction — simplified for this base
-                        match {
-                            let _llm_cfg = llm_cfg; // Will be used when per-user LLM is wired
-                            Err::<std::sync::Arc<dyn crate::llm::LlmProvider>, crate::llm::LlmError>(crate::llm::LlmError::RequestFailed {
-                                provider: "per_user".to_string(),
-                                reason: "Per-user LLM not yet available on this base".to_string(),
-                            })
-                        } {
+                        // If a shared container pool exists and the user wants
+                        // claude_container, build the provider with the shared pool
+                        // so callbacks route to the correct DashMaps.
+                        let provider_result = if llm_cfg.backend.as_str() == "claude_container" {
+                            if let Some(ref pool) = self.container_pool {
+                                crate::llm::create_container_provider_with_pool(&llm_cfg, user_id, Arc::clone(pool))
+                            } else {
+                                crate::llm::create_provider_from_user_config_with_lens(&llm_cfg, user_id)
+                            }
+                        } else {
+                            crate::llm::create_provider_from_user_config_with_lens(&llm_cfg, user_id)
+                        };
+                        match provider_result {
                             Ok(provider) => {
                                 let mut cache = self.user_llm_providers.write().await;
                                 // Double-check after acquiring write lock
@@ -292,6 +303,7 @@ pub async fn start_server(
     addr: SocketAddr,
     state: Arc<GatewayState>,
     auth_token: String,
+    extra_routes: &[axum::Router],
 ) -> Result<SocketAddr, crate::error::ChannelError> {
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
         crate::error::ChannelError::StartupFailed {
@@ -487,7 +499,7 @@ pub async fn start_server(
         ]))
         .allow_credentials(true);
 
-    let app = Router::new()
+    let mut app = Router::new()
         .merge(public)
         .merge(statics)
         .merge(projects)
@@ -518,6 +530,27 @@ pub async fn start_server(
             ),
         ))
         .with_state(state.clone());
+
+    // Register Claude container callback routes when a container pool is configured.
+    // These routes carry their own `ChannelCallbackState` (via `.with_state()`),
+    // so they are `Router<()>` and merge cleanly after the outer `.with_state()`.
+    if let Some(ref pool) = state.container_pool {
+        // Create a lightweight SseManager sharing the same broadcast channel.
+        let sse_for_callbacks = Arc::new(SseManager::from_sender(state.sse.sender()));
+        let callback_router = crate::llm::claude_container::ClaudeContainerProvider::callback_routes(
+            Arc::clone(pool),
+            sse_for_callbacks,
+        );
+        app = app.merge(callback_router);
+        tracing::info!("Claude container callback routes registered");
+    }
+
+    // Merge any extra routes passed by the caller.
+    for routes in extra_routes {
+        app = app.merge(routes.clone());
+    }
+
+    let app = app;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     *state.shutdown_tx.write().await = Some(shutdown_tx);
@@ -3003,6 +3036,7 @@ mod tests {
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
             active_config: ActiveConfigSnapshot::default(),
+            container_pool: None,
         })
     }
 

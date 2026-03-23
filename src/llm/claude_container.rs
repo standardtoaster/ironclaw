@@ -93,6 +93,30 @@ impl ClaudeContainerProvider {
         }
     }
 
+    /// Create a new container provider with a pre-initialized pool.
+    ///
+    /// Use this when the pool needs to be shared (e.g., with callback routes
+    /// registered on the web gateway).
+    pub fn new_with_pool(config: ContainerProviderConfig, pool: Arc<ContainerPool>) -> Self {
+        let model_label = format!("claude-container/{}", config.model);
+        let cell = OnceCell::new();
+        // OnceCell::set cannot fail here since the cell is freshly created.
+        let _ = cell.set(pool);
+        Self {
+            config,
+            pool: cell,
+            model_label,
+        }
+    }
+
+    /// Get the pool if it has been initialized.
+    ///
+    /// Returns `None` if no request has been made yet (lazy init not triggered).
+    /// Use this to obtain the pool for building callback routes.
+    pub fn initialized_pool(&self) -> Option<&Arc<ContainerPool>> {
+        self.pool.get()
+    }
+
     /// Get or initialize the container pool.
     async fn pool(&self) -> Result<&Arc<ContainerPool>, LlmError> {
         self.pool
@@ -227,6 +251,7 @@ impl LlmProvider for ClaudeContainerProvider {
         pool.pending_replies.insert(thread_id, tx);
 
         // Send message to container.
+        tracing::info!(thread_id = %thread_id, ip = %session.container_ip, content_len = content.len(), "Sending message to container");
         if let Err(e) = pool.send_message(&session, &thread_id, &content).await {
             pool.pending_replies.remove(&thread_id);
             return Err(e);
@@ -236,8 +261,10 @@ impl LlmProvider for ClaudeContainerProvider {
 
         // Wait for reply with timeout.
         let timeout = Duration::from_secs(self.config.request_timeout_secs);
+        tracing::info!(thread_id = %thread_id, timeout_secs = self.config.request_timeout_secs, "Awaiting oneshot reply");
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(reply)) => {
+                tracing::info!(thread_id = %thread_id, content_len = reply.content.len(), "Oneshot resolved with reply");
                 if let Some(sid) = reply.session_id {
                     pool.update_session_id(&thread_id, sid).await;
                 }
@@ -251,6 +278,7 @@ impl LlmProvider for ClaudeContainerProvider {
                 })
             }
             Ok(Err(_)) => {
+                tracing::warn!(thread_id = %thread_id, "Oneshot sender dropped");
                 pool.pending_replies.remove(&thread_id);
                 Err(LlmError::RequestFailed {
                     provider: "claude_container".into(),
@@ -258,6 +286,7 @@ impl LlmProvider for ClaudeContainerProvider {
                 })
             }
             Err(_) => {
+                tracing::warn!(thread_id = %thread_id, timeout_secs = self.config.request_timeout_secs, "Oneshot timed out");
                 pool.pending_replies.remove(&thread_id);
                 Err(LlmError::RequestFailed {
                     provider: "claude_container".into(),
