@@ -13,7 +13,10 @@ mod anthropic_oauth;
 mod bedrock;
 pub mod circuit_breaker;
 mod cleaning_provider;
+pub mod claude_container;
+pub mod claude_protocol;
 pub mod claude_sidecar;
+pub mod container_pool;
 pub(crate) mod codex_auth;
 mod codex_chatgpt;
 pub mod config;
@@ -726,21 +729,30 @@ pub async fn create_escalation_tier_map(
     }
 
     let mut entries = Vec::with_capacity(config.escalation_tiers.len());
+    let registry = crate::llm::registry::ProviderRegistry::load();
     for (i, tier) in config.escalation_tiers.iter().enumerate() {
-        // Build a minimal LlmConfig for this tier.
+        // Build a minimal LlmConfig for this tier using the registry.
+        let provider_def = registry.find(&tier.backend)
+            .or_else(|| registry.find("openai_compatible"));
+        let provider_config = provider_def.map(|def| config::RegistryProviderConfig {
+            protocol: def.protocol,
+            provider_id: def.id.clone(),
+            api_key: tier.api_key.clone(),
+            base_url: tier.base_url.clone().unwrap_or_else(|| def.default_base_url.clone().unwrap_or_default()),
+            model: tier.model.clone(),
+            extra_headers: Vec::new(),
+            oauth_token: None,
+            is_codex_chatgpt: false,
+            refresh_token: None,
+            auth_path: None,
+            cache_retention: config::CacheRetention::default(),
+            unsupported_params: Vec::new(),
+        });
         let tier_config = LlmConfig {
-            backend: format!("{}", tier.backend),
+            backend: tier.backend.clone(),
             session: config.session.clone(),
             nearai: config.nearai.clone(),
-            provider: Some(config::RegistryProviderConfig {
-                backend_id: format!("{}", tier.backend),
-                protocol: crate::llm::registry::ProviderProtocol::OpenAiChat,
-                model: tier.model.clone(),
-                base_url: tier.base_url.clone().unwrap_or_default(),
-                api_key: tier.api_key.clone(),
-                extra_headers: Vec::new(),
-                unsupported_params: Vec::new(),
-            }),
+            provider: provider_config,
             bedrock: None,
             gemini_oauth: None,
             openai_codex: None,

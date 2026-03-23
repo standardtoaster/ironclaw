@@ -20,7 +20,7 @@ use axum::{
 use crate::channels::mcp::dispatch::{
     handle_initialize, handle_ping, handle_tools_call, handle_tools_list,
 };
-use crate::channels::web::auth::AuthenticatedUser;
+// AuthenticatedUser not available on this base yet — multi-tenant auth comes in a later row.
 use crate::channels::web::server::GatewayState;
 use crate::context::JobContext;
 use crate::tools::mcp::protocol::{McpError, McpRequest, McpResponse};
@@ -40,7 +40,6 @@ const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 /// on initialize responses. Notifications (no id) return 202 Accepted.
 pub async fn mcp_post_handler(
     State(state): State<Arc<GatewayState>>,
-    AuthenticatedUser(user): AuthenticatedUser,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
@@ -79,13 +78,14 @@ pub async fn mcp_post_handler(
         return (StatusCode::BAD_REQUEST, HeaderMap::new(), Json(serde_json::json!(error_response))).into_response();
     }
 
-    // Build a JobContext scoped to the authenticated user.
-    let mut ctx = JobContext::with_user(&user.user_id, "mcp", "MCP tool call");
-    ctx.workspace_read_scopes = user.workspace_read_scopes.clone();
-    ctx.user_timezone = state.default_timezone.clone();
+    // Build a JobContext for MCP tool calls.
+    let ctx = JobContext::new("mcp", "MCP tool call");
 
     let registry = state.tool_registry.as_deref();
-    let sessions = &state.mcp_sessions;
+    // MCP session store — shared static until wired into GatewayState
+    static MCP_SESSIONS: std::sync::LazyLock<crate::channels::mcp::session::McpSessionStore> =
+        std::sync::LazyLock::new(crate::channels::mcp::session::McpSessionStore::new);
+    let sessions = &*MCP_SESSIONS;
 
     // Check if client wants SSE format.
     let wants_sse = headers
@@ -116,7 +116,7 @@ pub async fn mcp_post_handler(
 
         // If this is an initialize request, create a session.
         if request.method == "initialize" {
-            let sid = sessions.create(&user.user_id);
+            let sid = sessions.create("default");
             session_id_header = Some(sid.to_string());
         }
 
@@ -161,9 +161,7 @@ pub async fn mcp_post_handler(
 /// Claude Code opens a GET SSE stream for server-initiated messages.
 /// We don't send server-initiated messages, but returning a valid SSE
 /// response signals to the client that we're a Streamable HTTP MCP server.
-pub async fn mcp_get_handler(
-    AuthenticatedUser(_user): AuthenticatedUser,
-) -> impl IntoResponse {
+pub async fn mcp_get_handler() -> impl IntoResponse {
     // Return a valid SSE response with just the headers.
     // The stream stays open (empty) — no server-initiated messages.
     let mut headers = HeaderMap::new();
@@ -187,7 +185,8 @@ pub async fn mcp_delete_handler(
         && let Ok(sid_str) = sid_val.to_str()
         && let Ok(sid) = sid_str.parse::<uuid::Uuid>()
     {
-        state.mcp_sessions.remove(&sid);
+        // TODO: wire mcp_sessions into GatewayState
+        let _ = sid;
     }
     StatusCode::OK
 }

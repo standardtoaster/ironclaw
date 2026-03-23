@@ -235,7 +235,14 @@ impl GatewayState {
             if let Some(cfg) = user_config {
                 match cfg.llm_config() {
                     Ok(Some(llm_cfg)) => {
-                        match crate::llm::create_provider_from_user_config_with_lens(&llm_cfg, user_id) {
+                        // Per-user provider construction — simplified for this base
+                        match {
+                            let _llm_cfg = llm_cfg; // Will be used when per-user LLM is wired
+                            Err::<std::sync::Arc<dyn crate::llm::LlmProvider>, crate::llm::LlmError>(crate::llm::LlmError::RequestFailed {
+                                provider: "per_user".to_string(),
+                                reason: "Per-user LLM not yet available on this base".to_string(),
+                            })
+                        } {
                             Ok(provider) => {
                                 let mut cache = self.user_llm_providers.write().await;
                                 // Double-check after acquiring write lock
@@ -405,7 +412,7 @@ pub async fn start_server(
         // Gateway control plane
         .route("/api/gateway/status", get(gateway_status_handler))
         // MCP server (JSON-RPC over HTTP)
-        .route("/mcp", post(crate::channels::mcp::mcp_handler))
+        .route("/mcp", post(crate::channels::mcp::mcp_post_handler))
         // OpenAI-compatible API
         .route(
             "/v1/chat/completions",

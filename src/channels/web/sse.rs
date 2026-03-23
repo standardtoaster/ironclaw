@@ -146,7 +146,6 @@ impl SseManager {
                     SseEvent::Suggestions { .. } => "suggestions",
                     SseEvent::TurnCost { .. } => "turn_cost",
                     SseEvent::ExtensionStatus { .. } => "extension_status",
-                    SseEvent::WorkspaceRouted { .. } => "workspace_routed",
                     SseEvent::Escalated { .. } => "escalated",
                     SseEvent::DeEscalated { .. } => "de_escalated",
                     SseEvent::ContainerStatus { .. } => "container_status",
