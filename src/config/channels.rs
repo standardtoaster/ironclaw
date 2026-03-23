@@ -86,8 +86,6 @@ pub struct GatewayOidcConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UserTokenConfig {
     pub user_id: String,
-    #[serde(default)]
-    pub workspace_read_scopes: Vec<String>,
     /// LLM backend override for this user (e.g. "anthropic", "ollama", "openai").
     #[serde(default)]
     pub llm_backend: Option<String>,
