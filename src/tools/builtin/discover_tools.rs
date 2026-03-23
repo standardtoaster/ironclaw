@@ -48,7 +48,7 @@ impl DiscoverToolsTool {
     }
 
     /// Build an McpClient from a ServiceConfig, injecting credentials as headers.
-    fn build_mcp_client_for_service(service: &ServiceConfig) -> McpClient {
+    fn build_mcp_client_for_service(service: &ServiceConfig) -> Result<McpClient, ToolError> {
         let mut headers = HashMap::new();
         match &service.auth {
             ServiceAuth::Bearer { credential } => {
@@ -98,7 +98,7 @@ impl DiscoverToolsTool {
         }
 
         // Connect to MCP server and fetch all tools
-        let client = Self::build_mcp_client_for_service(service);
+        let client = Self::build_mcp_client_for_service(service)?;
         let mcp_tools = client.list_tools().await?;
 
         // Cache ALL tools (unfiltered) — filtering is per-user at query time
@@ -230,7 +230,13 @@ impl Tool for DiscoverToolsTool {
 
                 if load {
                     // Create a persistent McpClient for this service
-                    let client = Self::build_mcp_client_for_service(service);
+                    let client = match Self::build_mcp_client_for_service(service) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!("Failed to create MCP client for {}: {}", service.name, e);
+                            continue;
+                        }
+                    };
 
                     match client.create_tools().await {
                         Ok(tools) => {
@@ -386,7 +392,7 @@ mod tests {
             tier: "read".to_string(),
             lens_overrides: HashMap::new(),
         };
-        let client = DiscoverToolsTool::build_mcp_client_for_service(&service);
+        let client = DiscoverToolsTool::build_mcp_client_for_service(&service).unwrap();
         assert_eq!(client.server_name(), "test_svc");
         assert_eq!(client.server_url(), "http://localhost:8080/mcp");
     }
@@ -409,7 +415,7 @@ mod tests {
             tier: "read".to_string(),
             lens_overrides: HashMap::new(),
         };
-        let client = DiscoverToolsTool::build_mcp_client_for_service(&service);
+        let client = DiscoverToolsTool::build_mcp_client_for_service(&service).unwrap();
         assert_eq!(client.server_name(), "custom_svc");
     }
 

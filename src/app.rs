@@ -828,7 +828,7 @@ impl AppBuilder {
             dev_loaded_tool_names,
             service_registry,
             service_cache,
-        ) = self.init_extensions(&tools, &hooks, &workspace).await?;
+        ) = self.init_extensions(&tools, &hooks).await?;
 
         // Load bootstrap-completed flag from settings so that existing users
         // who already completed onboarding don't re-get bootstrap injection.

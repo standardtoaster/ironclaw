@@ -1,15 +1,8 @@
 //! Built-in tools that come with the agent.
 
 pub mod ask_user;
-pub mod collections;
 mod conversation;
-mod create_workspace;
-mod delegate_workspace;
 pub mod discover_tools;
-mod list_workspaces;
-mod search_workspace_history;
-mod set_workspace_topic;
-mod workspace_summary;
 mod echo;
 pub mod escalate;
 pub mod extension_tools;
