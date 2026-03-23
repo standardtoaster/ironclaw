@@ -252,6 +252,25 @@ impl ToolRegistry {
         defs
     }
 
+    /// Get tool definitions filtered to core set. If `core_names` is empty, returns all.
+    ///
+    /// When `CORE_TOOLS` is configured, only the named tools are sent to the LLM each turn.
+    /// All other tools remain registered and executable (e.g. via `discover_tools`) but are
+    /// not included in the LLM's function-calling context.
+    pub async fn tool_definitions_core(&self, core_names: &[String]) -> Vec<ToolDefinition> {
+        if core_names.is_empty() {
+            return self.tool_definitions().await;
+        }
+        let tools = self.tools.read().await;
+        let mut defs: Vec<ToolDefinition> = tools
+            .values()
+            .filter(|t| core_names.iter().any(|c| c.as_str() == t.name()))
+            .map(Self::tool_definition)
+            .collect();
+        defs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        defs
+    }
+
     /// Get tool definitions for specific tools.
     pub async fn tool_definitions_for(&self, names: &[&str]) -> Vec<ToolDefinition> {
         let tools = self.tools.read().await;
@@ -1124,5 +1143,28 @@ mod tests {
         registry.retain_only(&[]).await;
         let after = registry.list().await.len();
         assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn tool_definitions_core_filters_to_named_tools() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        let all_defs = registry.tool_definitions().await;
+        assert!(all_defs.len() > 3, "should have multiple built-in tools");
+
+        let core = vec!["echo".to_string(), "time".to_string()];
+        let filtered = registry.tool_definitions_core(&core).await;
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().any(|d| d.name == "echo"));
+        assert!(filtered.iter().any(|d| d.name == "time"));
+    }
+
+    #[tokio::test]
+    async fn tool_definitions_core_empty_returns_all() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        let all_defs = registry.tool_definitions().await;
+        let core_defs = registry.tool_definitions_core(&[]).await;
+        assert_eq!(all_defs.len(), core_defs.len());
     }
 }
