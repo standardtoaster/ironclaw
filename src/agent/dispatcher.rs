@@ -190,6 +190,21 @@ impl Agent {
 
         // Build system prompts once for this turn. Two variants: with tools
         // (normal iterations) and without (force_text final iteration).
+        let initial_tool_defs = self
+            .tools()
+            .tool_definitions_core(&self.config.core_tools)
+            .await;
+        tracing::debug!(
+            total_registered = self.tools().count(),
+            core_filtered = initial_tool_defs.len(),
+            core_tools_configured = !self.config.core_tools.is_empty(),
+            "Tool definitions for LLM turn"
+        );
+        let initial_tool_defs = if !active_skills.is_empty() {
+            crate::skills::attenuate_tools(&initial_tool_defs, &active_skills).tools
+        } else {
+            initial_tool_defs
+        };
         let cached_prompt = reasoning.build_system_prompt_with_tools(&initial_tool_defs);
         let cached_prompt_no_tools = reasoning.build_system_prompt_with_tools(&[]);
 
@@ -339,6 +354,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
         // Refresh tool definitions each iteration so newly built tools become visible.
         // Filter by user_id so per-user tools (e.g. collection CRUD) only appear
         // for their owner. Scopes come from the authenticated user's token config.
+        // When CORE_TOOLS is configured, only the core set is sent to the LLM.
         let tool_defs = self
             .agent
             .tools()

@@ -47,6 +47,10 @@ pub struct AgentConfig {
     /// Enable engine v2 routing (Strategy C parallel deployment).
     /// Set via `ENGINE_V2=true` env var or programmatically in tests.
     pub engine_v2: bool,
+    /// Tool names to always include in LLM context (comma-separated via `CORE_TOOLS`).
+    /// All other registered tools are discoverable but not sent unless loaded.
+    /// If empty/unset, ALL tools are sent (backward compatible).
+    pub core_tools: Vec<String>,
 }
 
 impl AgentConfig {
@@ -75,6 +79,7 @@ impl AgentConfig {
             max_llm_concurrent_per_user: None,
             max_jobs_concurrent_per_user: None,
             engine_v2: false,
+            core_tools: Vec::new(),
         }
     }
 
@@ -157,6 +162,11 @@ impl AgentConfig {
             max_llm_concurrent_per_user: parse_option_env("TENANT_MAX_LLM_CONCURRENT")?,
             max_jobs_concurrent_per_user: parse_option_env("TENANT_MAX_JOBS_CONCURRENT")?,
             engine_v2: parse_bool_env("ENGINE_V2", false)?,
+            core_tools: std::env::var("CORE_TOOLS")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
+                .unwrap_or_default(),
         })
     }
 }
@@ -179,5 +189,29 @@ mod tests {
         let settings = Settings::default(); // default is "UTC"
         let config = AgentConfig::resolve(&settings).expect("resolve");
         assert_eq!(config.default_timezone, "UTC");
+    }
+
+    #[test]
+    fn test_core_tools_empty_by_default() {
+        let settings = Settings::default();
+        let config = AgentConfig::resolve(&settings).expect("resolve");
+        assert!(
+            config.core_tools.is_empty(),
+            "core_tools should be empty when CORE_TOOLS env var is unset"
+        );
+    }
+
+    #[test]
+    fn test_core_tools_parsed_from_env() {
+        // Use a unique env var name to avoid conflicts with parallel tests
+        std::env::set_var("CORE_TOOLS", "memory_search, memory_write, time");
+        let settings = Settings::default();
+        let config = AgentConfig::resolve(&settings).expect("resolve");
+        std::env::remove_var("CORE_TOOLS");
+
+        assert_eq!(
+            config.core_tools,
+            vec!["memory_search", "memory_write", "time"]
+        );
     }
 }
