@@ -1487,28 +1487,9 @@ impl Workspace {
             .await
     }
 
-    /// Paths excluded from search results.
-    ///
-    /// Identity and system files are already injected into the system prompt —
-    /// returning them from search pollutes results with content the model already
-    /// has, pushing actual user data below the relevance cutoff.
-    const SEARCH_EXCLUDED_PATHS: &[&str] = &[
-        paths::AGENTS,
-        paths::SOUL,
-        paths::USER,
-        paths::IDENTITY,
-        paths::TOOLS,
-        paths::HEARTBEAT,
-        paths::BOOTSTRAP,
-        paths::MEMORY,  // already in system prompt
-        paths::README,  // workspace boilerplate
-    ];
-
     /// Search with custom configuration.
     ///
     /// When multi-scope reads are configured, searches across all read scopes.
-    /// Results from identity/system files are automatically excluded — they are
-    /// already in the system prompt and would otherwise pollute search rankings.
     pub async fn search_with_config(
         &self,
         query: &str,
@@ -1568,13 +1549,6 @@ impl Workspace {
                 )
                 .await?
         };
-
-        // Filter out identity/system files — they're already in the system prompt.
-        memory_results.retain(|r| {
-            !Self::SEARCH_EXCLUDED_PATHS
-                .iter()
-                .any(|p| r.document_path == *p)
-        });
 
         // Also search conversation messages via FTS and merge via simple
         // score interleaving. Conversation results participate in the final
