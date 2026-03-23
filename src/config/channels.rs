@@ -46,10 +46,6 @@ pub struct GatewayConfig {
     /// Bearer token for authentication. Random hex generated at startup if unset.
     pub auth_token: Option<String>,
     pub user_id: String,
-    /// Additional user scopes for workspace reads.
-    pub workspace_read_scopes: Vec<String>,
-    /// Memory layer definitions (JSON in env var, or from external config).
-    pub memory_layers: Vec<crate::workspace::layer::MemoryLayer>,
     /// Multi-user token map. When set, each token maps to a user identity.
     /// Parsed from `GATEWAY_USER_TOKENS` (JSON string). When absent, falls back
     /// to single-user mode via `auth_token` + `user_id`.
@@ -249,54 +245,6 @@ impl ChannelsConfig {
                 }
             }
 
-            let memory_layers: Vec<crate::workspace::layer::MemoryLayer> =
-                match optional_env("MEMORY_LAYERS")? {
-                    Some(json_str) => {
-                        serde_json::from_str(&json_str).map_err(|e| ConfigError::InvalidValue {
-                            key: "MEMORY_LAYERS".to_string(),
-                            message: format!("must be valid JSON array of layer objects: {e}"),
-                        })?
-                    }
-                    None => crate::workspace::layer::MemoryLayer::default_for_user(&user_id),
-                };
-            for layer in &memory_layers {
-                if layer.name.trim().is_empty() {
-                    return Err(ConfigError::InvalidValue {
-                        key: "MEMORY_LAYERS".to_string(),
-                        message: "layer name must not be empty".to_string(),
-                    });
-                }
-                if layer.name.len() > 64 {
-                    return Err(ConfigError::InvalidValue {
-                        key: "MEMORY_LAYERS".to_string(),
-                        message: format!("layer name '{}' exceeds 64 characters", layer.name),
-                    });
-                }
-                if !layer.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-                    return Err(ConfigError::InvalidValue {
-                        key: "MEMORY_LAYERS".to_string(),
-                        message: format!("layer name '{}' contains invalid characters (allowed: a-z, A-Z, 0-9, _, -)", layer.name),
-                    });
-                }
-                if layer.scope.trim().is_empty() {
-                    return Err(ConfigError::InvalidValue {
-                        key: "MEMORY_LAYERS".to_string(),
-                        message: format!("layer '{}' has an empty scope", layer.name),
-                    });
-                }
-            }
-            {
-                let mut seen = std::collections::HashSet::new();
-                for layer in &memory_layers {
-                    if !seen.insert(&layer.name) {
-                        return Err(ConfigError::InvalidValue {
-                            key: "MEMORY_LAYERS".to_string(),
-                            message: format!("duplicate layer name '{}'", layer.name),
-                        });
-                    }
-                }
-            }
-
             let user_tokens: Option<HashMap<String, UserTokenConfig>> =
                 match optional_env("GATEWAY_USER_TOKENS")? {
                     Some(json_str) => {
@@ -361,8 +309,6 @@ impl ChannelsConfig {
                 auth_token: optional_env("GATEWAY_AUTH_TOKEN")?
                     .or_else(|| cs.gateway_auth_token.clone()),
                 user_id,
-                workspace_read_scopes,
-                memory_layers,
                 user_tokens,
             })
         } else {
@@ -519,8 +465,6 @@ mod tests {
             port: 3000,
             auth_token: Some("tok-abc".to_string()),
             user_id: "default".to_string(),
-            workspace_read_scopes: vec![],
-            memory_layers: vec![],
             user_tokens: None,
         };
         assert_eq!(cfg.host, "127.0.0.1");
@@ -536,8 +480,6 @@ mod tests {
             port: 3001,
             auth_token: None,
             user_id: "anon".to_string(),
-            workspace_read_scopes: vec![],
-            memory_layers: vec![],
             user_tokens: None,
         };
         assert!(cfg.auth_token.is_none());
