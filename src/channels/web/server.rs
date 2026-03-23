@@ -36,6 +36,10 @@ use crate::channels::web::handlers::jobs::{
     jobs_events_handler, jobs_list_handler, jobs_prompt_handler, jobs_restart_handler,
     jobs_summary_handler,
 };
+use crate::channels::web::handlers::collections::{
+    collections_delete_handler, collections_insert_handler, collections_list_handler,
+    collections_query_handler, collections_register_handler, collections_update_handler,
+};
 use crate::channels::web::handlers::routines::{
     routines_delete_handler, routines_detail_handler, routines_list_handler,
     routines_summary_handler, routines_toggle_handler, routines_trigger_handler,
@@ -441,6 +445,17 @@ pub async fn start_server(
         .route("/api/memory/read", get(memory_read_handler))
         .route("/api/memory/write", post(memory_write_handler))
         .route("/api/memory/search", post(memory_search_handler))
+        // Collections REST API
+        .route("/api/collections", get(collections_list_handler).post(collections_register_handler))
+        .route(
+            "/api/collections/{name}",
+            get(collections_query_handler).post(collections_insert_handler),
+        )
+        .route(
+            "/api/collections/{name}/{id}",
+            axum::routing::patch(collections_update_handler)
+                .delete(collections_delete_handler),
+        )
         // Jobs
         .route("/api/jobs", get(jobs_list_handler))
         .route("/api/jobs/summary", get(jobs_summary_handler))

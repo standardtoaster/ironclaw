@@ -11,7 +11,6 @@
 pub mod jobs;
 pub mod skills;
 
-#[allow(dead_code)]
 pub mod collections;
 #[allow(dead_code)]
 pub mod events;
