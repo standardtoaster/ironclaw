@@ -52,13 +52,10 @@ pub async fn jobs_list_handler(
         }
     }
 
-    // Fetch agent (non-sandbox) jobs from database, deduplicating by ID.
-    match store.list_agent_jobs().await {
+    // Fetch agent (non-sandbox) jobs scoped to this user, deduplicating by ID.
+    match store.list_agent_jobs_for_user(&user.user_id).await {
         Ok(agent_jobs) => {
             for j in &agent_jobs {
-                if j.user_id != user.user_id {
-                    continue;
-                }
                 if seen_ids.contains(&j.id) {
                     continue;
                 }

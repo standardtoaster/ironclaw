@@ -82,6 +82,7 @@ pub async fn extensions_list_handler(
 
 pub async fn extensions_tools_handler(
     State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(_user): AuthenticatedUser,
 ) -> Result<Json<ToolListResponse>, (StatusCode, String)> {
     let registry = state.tool_registry.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,

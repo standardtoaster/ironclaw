@@ -770,7 +770,7 @@ async fn oauth_callback_handler(
         );
         // Notify UI so auth card can show error instead of staying stuck
         if let Some(ref sse) = flow.sse_manager {
-            sse.broadcast(SseEvent::AuthCompleted {
+            sse.broadcast_for_user(&flow.user_id, SseEvent::AuthCompleted {
                 extension_name: flow.extension_name.clone(),
                 success: false,
                 message: "OAuth flow expired. Please try again.".to_string(),
@@ -909,7 +909,7 @@ async fn oauth_callback_handler(
 
     // Broadcast SSE event to notify the web UI
     if let Some(ref sse) = flow.sse_manager {
-        sse.broadcast(SseEvent::AuthCompleted {
+        sse.broadcast_for_user(&flow.user_id, SseEvent::AuthCompleted {
             extension_name: flow.extension_name,
             success,
             message: final_message.clone(),
