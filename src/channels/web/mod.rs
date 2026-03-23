@@ -55,7 +55,6 @@ use crate::workspace::Workspace;
 
 use self::log_layer::{LogBroadcaster, LogLevelHandle};
 
-use self::auth::MultiAuthState;
 use self::server::GatewayState;
 use self::sse::SseManager;
 use self::types::SseEvent;
@@ -64,15 +63,14 @@ use self::types::SseEvent;
 pub struct GatewayChannel {
     config: GatewayConfig,
     state: Arc<GatewayState>,
-    /// Multi-user auth state (replaces bare auth_token).
-    auth: MultiAuthState,
+    /// The actual auth token in use (generated or from config).
+    auth_token: String,
 }
 
 impl GatewayChannel {
     /// Create a new gateway channel.
     ///
     /// If no auth token is configured, generates a random one and prints it.
-    /// Builds a single-user `MultiAuthState` from the config.
     pub fn new(config: GatewayConfig) -> Self {
         let auth_token = config.auth_token.clone().unwrap_or_else(|| {
             use rand::RngCore;
@@ -82,13 +80,10 @@ impl GatewayChannel {
             bytes.iter().map(|b| format!("{b:02x}")).collect()
         });
 
-        let auth = MultiAuthState::single(auth_token, config.user_id.clone());
-
         let state = Arc::new(GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
-            sse: Arc::new(SseManager::new()),
+            sse: SseManager::new(),
             workspace: None,
-            workspace_pool: None,
             session_manager: None,
             log_broadcaster: None,
             log_level_handle: None,
@@ -98,7 +93,7 @@ impl GatewayChannel {
             job_manager: None,
             prompt_queue: None,
             scheduler: None,
-            default_user_id: config.user_id.clone(),
+            user_id: config.user_id.clone(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(ws::WsConnectionTracker::new())),
             llm_provider: None,
@@ -106,7 +101,7 @@ impl GatewayChannel {
             user_tokens: None,
             skill_registry: None,
             skill_catalog: None,
-            chat_rate_limiter: server::PerUserRateLimiter::new(30, 60),
+            chat_rate_limiter: server::RateLimiter::new(30, 60),
             oauth_rate_limiter: server::RateLimiter::new(10, 60),
             webhook_rate_limiter: server::RateLimiter::new(10, 60),
             registry_entries: Vec::new(),
@@ -119,49 +114,7 @@ impl GatewayChannel {
         Self {
             config,
             state,
-            auth,
-        }
-    }
-
-    /// Create a gateway channel with a pre-built multi-user auth state.
-    pub fn new_multi_auth(config: GatewayConfig, auth: MultiAuthState) -> Self {
-        let user_tokens = config.user_tokens.clone();
-        let state = Arc::new(GatewayState {
-            msg_tx: tokio::sync::RwLock::new(None),
-            sse: Arc::new(SseManager::new()),
-            workspace: None,
-            workspace_pool: None,
-            session_manager: None,
-            log_broadcaster: None,
-            log_level_handle: None,
-            extension_manager: None,
-            tool_registry: None,
-            store: None,
-            job_manager: None,
-            prompt_queue: None,
-            scheduler: None,
-            default_user_id: config.user_id.clone(),
-            shutdown_tx: tokio::sync::RwLock::new(None),
-            ws_tracker: Some(Arc::new(ws::WsConnectionTracker::new())),
-            llm_provider: None,
-            user_llm_providers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-            user_tokens,
-            skill_registry: None,
-            skill_catalog: None,
-            chat_rate_limiter: server::PerUserRateLimiter::new(30, 60),
-            oauth_rate_limiter: server::RateLimiter::new(10, 60),
-            registry_entries: Vec::new(),
-            cost_guard: None,
-            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
-            startup_time: std::time::Instant::now(),
-            webhook_rate_limiter: server::RateLimiter::new(10, 60),
-            active_config: server::ActiveConfigSnapshot::default(),
-        });
-
-        Self {
-            config,
-            state,
-            auth,
+            auth_token,
         }
     }
 
@@ -170,9 +123,8 @@ impl GatewayChannel {
         let mut new_state = GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
             // Preserve the existing broadcast channel so sender handles remain valid.
-            sse: Arc::new(SseManager::from_sender(self.state.sse.sender())),
+            sse: SseManager::from_sender(self.state.sse.sender()),
             workspace: self.state.workspace.clone(),
-            workspace_pool: self.state.workspace_pool.clone(),
             session_manager: self.state.session_manager.clone(),
             log_broadcaster: self.state.log_broadcaster.clone(),
             log_level_handle: self.state.log_level_handle.clone(),
@@ -182,7 +134,7 @@ impl GatewayChannel {
             job_manager: self.state.job_manager.clone(),
             prompt_queue: self.state.prompt_queue.clone(),
             scheduler: self.state.scheduler.clone(),
-            default_user_id: self.state.default_user_id.clone(),
+            user_id: self.state.user_id.clone(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: self.state.ws_tracker.clone(),
             llm_provider: self.state.llm_provider.clone(),
@@ -190,7 +142,7 @@ impl GatewayChannel {
             user_tokens: self.state.user_tokens.clone(),
             skill_registry: self.state.skill_registry.clone(),
             skill_catalog: self.state.skill_catalog.clone(),
-            chat_rate_limiter: server::PerUserRateLimiter::new(30, 60),
+            chat_rate_limiter: server::RateLimiter::new(30, 60),
             oauth_rate_limiter: server::RateLimiter::new(10, 60),
             webhook_rate_limiter: server::RateLimiter::new(10, 60),
             registry_entries: self.state.registry_entries.clone(),
@@ -315,15 +267,9 @@ impl GatewayChannel {
         self
     }
 
-    /// Inject the per-user workspace pool for multi-user mode.
-    pub fn with_workspace_pool(mut self, pool: Arc<server::WorkspacePool>) -> Self {
-        self.rebuild_state(|s| s.workspace_pool = Some(pool));
-        self
-    }
-
-    /// Get the first auth token (for printing to console on startup).
+    /// Get the auth token (for printing to console on startup).
     pub fn auth_token(&self) -> &str {
-        self.auth.first_token().unwrap_or("")
+        &self.auth_token
     }
 
     /// Get a reference to the shared gateway state (for the agent to push SSE events).
@@ -352,7 +298,7 @@ impl Channel for GatewayChannel {
                 ),
             })?;
 
-        server::start_server(addr, self.state.clone(), self.auth.clone()).await?;
+        server::start_server(addr, self.state.clone(), self.auth_token.clone()).await?;
 
         Ok(Box::pin(ReceiverStream::new(rx)))
     }
@@ -372,13 +318,10 @@ impl Channel for GatewayChannel {
             }
         };
 
-        self.state.sse.broadcast_for_user(
-            &msg.user_id,
-            SseEvent::Response {
-                content: response.content,
-                thread_id,
-            },
-        );
+        self.state.sse.broadcast(SseEvent::Response {
+            content: response.content,
+            thread_id,
+        });
 
         Ok(())
     }
@@ -491,21 +434,13 @@ impl Channel for GatewayChannel {
             },
         };
 
-        // Scope events to the user when user_id is available in metadata.
-        // When user_id is missing (heartbeat, routines), events go to all
-        // subscribers. In multi-tenant mode this leaks status across users.
-        if let Some(uid) = metadata.get("user_id").and_then(|v| v.as_str()) {
-            self.state.sse.broadcast_for_user(uid, event);
-        } else {
-            tracing::debug!("Status event missing user_id in metadata; broadcasting globally");
-            self.state.sse.broadcast(event);
-        }
+        self.state.sse.broadcast(event);
         Ok(())
     }
 
     async fn broadcast(
         &self,
-        user_id: &str,
+        _user_id: &str,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
         let thread_id = match response.thread_id {
@@ -517,13 +452,10 @@ impl Channel for GatewayChannel {
                 return Ok(());
             }
         };
-        self.state.sse.broadcast_for_user(
-            user_id,
-            SseEvent::Response {
-                content: response.content,
-                thread_id,
-            },
-        );
+        self.state.sse.broadcast(SseEvent::Response {
+            content: response.content,
+            thread_id,
+        });
         Ok(())
     }
 
