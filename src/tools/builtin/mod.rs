@@ -1,7 +1,6 @@
 //! Built-in tools that come with the agent.
 
 pub mod ask_user;
-pub mod collections;
 mod conversation;
 pub mod generic_collections;
 mod echo;

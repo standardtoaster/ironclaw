@@ -16,8 +16,7 @@ use crate::tools::builder::{
 };
 use crate::tools::builtin::{
     ApplyPatchTool, AskUserTool, CancelJobTool, ConversationLoadTool, CreateJobTool,
-    CreateWorkspaceTool, DeescalateTool, DelegateToWorkspaceTool, DiscoverToolsTool, EchoTool,
-    EscalateTool,
+    DeescalateTool, DiscoverToolsTool, EchoTool, EscalateTool,
     ExtensionInfoTool, HttpTool, JobEventsTool, JobPromptTool, JobStatusTool, JsonTool,
     ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool,
     PlanUpdateTool, PromptQueue, ReadFileTool, ShellTool, SkillInstallTool, SkillListTool,
