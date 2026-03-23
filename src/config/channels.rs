@@ -189,6 +189,54 @@ impl ChannelsConfig {
                 .or_else(|| cs.gateway_user_id.clone())
                 .unwrap_or_else(|| "default".to_string());
 
+            let memory_layers: Vec<crate::workspace::layer::MemoryLayer> =
+                match optional_env("MEMORY_LAYERS")? {
+                    Some(json_str) => {
+                        serde_json::from_str(&json_str).map_err(|e| ConfigError::InvalidValue {
+                            key: "MEMORY_LAYERS".to_string(),
+                            message: format!("must be valid JSON array of layer objects: {e}"),
+                        })?
+                    }
+                    None => crate::workspace::layer::MemoryLayer::default_for_user(&user_id),
+                };
+            for layer in &memory_layers {
+                if layer.name.trim().is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        key: "MEMORY_LAYERS".to_string(),
+                        message: "layer name must not be empty".to_string(),
+                    });
+                }
+                if layer.name.len() > 64 {
+                    return Err(ConfigError::InvalidValue {
+                        key: "MEMORY_LAYERS".to_string(),
+                        message: format!("layer name '{}' exceeds 64 characters", layer.name),
+                    });
+                }
+                if !layer.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+                    return Err(ConfigError::InvalidValue {
+                        key: "MEMORY_LAYERS".to_string(),
+                        message: format!("layer name '{}' contains invalid characters (allowed: a-z, A-Z, 0-9, _, -)", layer.name),
+                    });
+                }
+                if layer.scope.trim().is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        key: "MEMORY_LAYERS".to_string(),
+                        message: format!("layer '{}' has an empty scope", layer.name),
+                    });
+                }
+            }
+            {
+                let mut seen = std::collections::HashSet::new();
+                for layer in &memory_layers {
+                    if !seen.insert(&layer.name) {
+                        return Err(ConfigError::InvalidValue {
+                            key: "MEMORY_LAYERS".to_string(),
+                            message: format!("duplicate layer name '{}'", layer.name),
+                        });
+                    }
+                }
+            }
+
             let user_tokens: Option<HashMap<String, UserTokenConfig>> =
                 match optional_env("GATEWAY_USER_TOKENS")? {
                     Some(json_str) => {
@@ -222,6 +270,22 @@ impl ChannelsConfig {
                     }
                     None => None,
                 };
+            let workspace_read_scopes: Vec<String> = optional_env("WORKSPACE_READ_SCOPES")?
+                .map(|s| {
+                    s.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for scope in &workspace_read_scopes {
+                if scope.len() > 128 {
+                    return Err(ConfigError::InvalidValue {
+                        key: "WORKSPACE_READ_SCOPES".to_string(),
+                        message: format!("scope '{}...' exceeds 128 characters", &scope[..32]),
+                    });
+                }
+            }
 
             Some(GatewayConfig {
                 host: optional_env("GATEWAY_HOST")?
@@ -234,6 +298,8 @@ impl ChannelsConfig {
                 auth_token: optional_env("GATEWAY_AUTH_TOKEN")?
                     .or_else(|| cs.gateway_auth_token.clone()),
                 user_id,
+                workspace_read_scopes,
+                memory_layers,
                 user_tokens,
             })
         } else {
