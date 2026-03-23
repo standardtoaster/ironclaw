@@ -18,6 +18,7 @@ fn test_gateway() -> GatewayChannel {
             workspace_read_scopes: vec![],
             memory_layers: vec![],
             oidc: None,
+            user_tokens: None,
         },
         "test-user".to_string(),
     )

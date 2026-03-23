@@ -2946,6 +2946,8 @@ mod tests {
             document_extraction: None,
             sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
             builder: None,
+            llm_backend: "test".to_string(),
+            tenant_rates: Arc::new(crate::tenant::TenantRateRegistry::new(4, 3)),
             tier_map: Some(Arc::new(
                 TierMap::new(vec![
                     TierEntry {
@@ -3006,7 +3008,14 @@ mod tests {
                 auto_approve_tools: false,
                 default_timezone: "UTC".to_string(),
                 max_tokens_per_job: 0,
+                multi_tenant: false,
+                max_cost_per_user_per_day_cents: None,
+                max_jobs_per_user: None,
+                max_llm_concurrent_per_user: None,
+                max_jobs_concurrent_per_user: None,
+                engine_v2: false,
                 core_tools: Vec::new(),
+                tool_description_mode: crate::config::agent::ToolDescriptionMode::Full,
             },
             deps,
             Arc::new(ChannelManager::new()),

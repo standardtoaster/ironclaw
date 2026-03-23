@@ -45,6 +45,11 @@ use crate::channels::web::handlers::engine::{
     engine_project_detail_handler, engine_projects_handler, engine_thread_detail_handler,
     engine_thread_events_handler, engine_thread_steps_handler, engine_threads_handler,
 };
+use crate::channels::web::handlers::collections::{
+    collections_delete_handler, collections_insert_handler, collections_list_handler,
+    collections_query_handler, collections_register_handler, collections_update_handler,
+};
+use crate::channels::web::handlers::events::events_ingest_handler;
 use crate::channels::web::handlers::ingest::ingest_conversation_handler;
 use crate::channels::web::handlers::jobs::{
     job_files_list_handler, job_files_read_handler, jobs_cancel_handler, jobs_detail_handler,
@@ -624,6 +629,19 @@ pub async fn start_server(
         .route("/api/memory/read", get(memory_read_handler))
         .route("/api/memory/write", post(memory_write_handler))
         .route("/api/memory/search", post(memory_search_handler))
+        // Collections REST API
+        .route("/api/collections", get(collections_list_handler).post(collections_register_handler))
+        .route(
+            "/api/collections/{name}",
+            get(collections_query_handler).post(collections_insert_handler),
+        )
+        .route(
+            "/api/collections/{name}/{id}",
+            axum::routing::patch(collections_update_handler)
+                .delete(collections_delete_handler),
+        )
+        // Event ingest
+        .route("/api/events/ingest", post(events_ingest_handler))
         // Conversations
         .route("/api/conversations/ingest", post(ingest_conversation_handler))
         // Jobs
@@ -5044,7 +5062,7 @@ mod tests {
             job_manager: None,
             prompt_queue: None,
             scheduler: None,
-            default_user_id: "default".to_string(),
+            owner_id: "default".to_string(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: None,
             llm_provider: None,
@@ -5053,7 +5071,7 @@ mod tests {
             skill_registry: None,
             skill_catalog: None,
             chat_rate_limiter: PerUserRateLimiter::new(30, 60),
-            oauth_rate_limiter: RateLimiter::new(10, 60),
+            oauth_rate_limiter: PerUserRateLimiter::new(10, 60),
             webhook_rate_limiter: RateLimiter::new(10, 60),
             registry_entries: vec![],
             cost_guard: None,
@@ -5064,6 +5082,18 @@ mod tests {
                 llm_model: "test-model".to_string(),
                 enabled_channels: vec![],
             },
+            secrets_store: None,
+            db_auth: None,
+            oauth_providers: None,
+            oauth_state_store: None,
+            oauth_base_url: None,
+            oauth_allowed_domains: Vec::new(),
+            near_nonce_store: None,
+            near_rpc_url: None,
+            near_network: None,
+            oauth_sweep_shutdown: None,
+            collection_write_tx: None,
+            skills_dir: None,
         });
 
         // Should resolve a per-user provider for "andrew"

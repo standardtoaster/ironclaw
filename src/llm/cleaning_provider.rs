@@ -280,6 +280,7 @@ mod tests {
                         id: "call_123".to_string(),
                         name: "web_search".to_string(),
                         arguments: serde_json::json!({"query": "test"}),
+                        reasoning: None,
                     }],
                     input_tokens: 20,
                     output_tokens: 15,

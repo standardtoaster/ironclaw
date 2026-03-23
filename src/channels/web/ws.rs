@@ -546,6 +546,7 @@ mod tests {
             },
             &state,
             "user1",
+            &[],
             &direct_tx,
         )
         .await;
@@ -578,6 +579,7 @@ mod tests {
             },
             &state,
             "user1",
+            &[],
             &direct_tx,
         )
         .await;
@@ -609,6 +611,7 @@ mod tests {
             },
             &state,
             "user1",
+            &[],
             &direct_tx,
         )
         .await;
@@ -640,6 +643,7 @@ mod tests {
             },
             &state,
             "alice",
+            &[],
             &direct_tx,
         )
         .await;

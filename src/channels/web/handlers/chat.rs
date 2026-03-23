@@ -425,6 +425,7 @@ pub async fn chat_new_thread_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::channel::IncomingMessage;
     use crate::channels::web::util::build_turns_from_db_messages;
 
     #[test]

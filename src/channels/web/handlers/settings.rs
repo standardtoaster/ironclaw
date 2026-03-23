@@ -690,6 +690,8 @@ mod tests {
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: None,
             llm_provider: None,
+            user_llm_providers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            user_tokens: None,
             skill_registry: None,
             skill_catalog: None,
             chat_rate_limiter: crate::channels::web::server::PerUserRateLimiter::new(30, 60),
