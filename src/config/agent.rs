@@ -203,11 +203,15 @@ mod tests {
 
     #[test]
     fn test_core_tools_parsed_from_env() {
-        // Use a unique env var name to avoid conflicts with parallel tests
-        std::env::set_var("CORE_TOOLS", "memory_search, memory_write, time");
+        // SAFETY: test-only; modifies process env for config resolution.
+        unsafe {
+            std::env::set_var("CORE_TOOLS", "memory_search, memory_write, time");
+        }
         let settings = Settings::default();
         let config = AgentConfig::resolve(&settings).expect("resolve");
-        std::env::remove_var("CORE_TOOLS");
+        unsafe {
+            std::env::remove_var("CORE_TOOLS");
+        }
 
         assert_eq!(
             config.core_tools,
