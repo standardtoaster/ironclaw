@@ -47,10 +47,6 @@ pub struct GatewayConfig {
     pub auth_token: Option<String>,
     pub user_id: String,
     /// Additional user scopes for workspace reads.
-    ///
-    /// When set, the workspace will be able to read (search, read, list) from
-    /// these additional user scopes while writes remain isolated to `user_id`.
-    /// Parsed from `WORKSPACE_READ_SCOPES` (comma-separated).
     pub workspace_read_scopes: Vec<String>,
     /// Memory layer definitions (JSON in env var, or from external config).
     pub memory_layers: Vec<crate::workspace::layer::MemoryLayer>,
@@ -394,6 +390,8 @@ mod tests {
             port: 3000,
             auth_token: Some("tok-abc".to_string()),
             user_id: "default".to_string(),
+            workspace_read_scopes: vec![],
+            memory_layers: vec![],
             user_tokens: None,
         };
         assert_eq!(cfg.host, "127.0.0.1");
@@ -409,6 +407,8 @@ mod tests {
             port: 3001,
             auth_token: None,
             user_id: "anon".to_string(),
+            workspace_read_scopes: vec![],
+            memory_layers: vec![],
             user_tokens: None,
         };
         assert!(cfg.auth_token.is_none());
