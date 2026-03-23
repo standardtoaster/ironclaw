@@ -1154,4 +1154,27 @@ mod tests {
         let after = registry.list().await.len();
         assert_eq!(before, after);
     }
+
+    #[tokio::test]
+    async fn tool_definitions_core_filters_to_named_tools() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        let all_defs = registry.tool_definitions().await;
+        assert!(all_defs.len() > 3, "should have multiple built-in tools");
+
+        let core = vec!["echo".to_string(), "time".to_string()];
+        let filtered = registry.tool_definitions_core(&core).await;
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().any(|d| d.name == "echo"));
+        assert!(filtered.iter().any(|d| d.name == "time"));
+    }
+
+    #[tokio::test]
+    async fn tool_definitions_core_empty_returns_all() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        let all_defs = registry.tool_definitions().await;
+        let core_defs = registry.tool_definitions_core(&[]).await;
+        assert_eq!(all_defs.len(), core_defs.len());
+    }
 }
