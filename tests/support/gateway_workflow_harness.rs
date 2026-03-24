@@ -239,6 +239,8 @@ impl GatewayWorkflowHarness {
             cost_guard: Some(Arc::clone(&components.cost_guard)),
             routine_engine: Arc::clone(&routine_slot),
             startup_time: Instant::now(),
+            user_llm_providers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            user_tokens: None,
             active_config: ironclaw::channels::web::server::ActiveConfigSnapshot::default(),
         });
 

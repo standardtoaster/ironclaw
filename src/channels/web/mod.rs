@@ -65,6 +65,9 @@ pub struct GatewayChannel {
     state: Arc<GatewayState>,
     /// The actual auth token in use (generated or from config).
     auth_token: String,
+    /// Optional multi-user auth state override. When set, `start()` uses this
+    /// instead of constructing a single-user `MultiAuthState` from `auth_token`.
+    auth_override: Option<auth::MultiAuthState>,
 }
 
 impl GatewayChannel {
@@ -82,8 +85,9 @@ impl GatewayChannel {
 
         let state = Arc::new(GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
-            sse: SseManager::new(),
+            sse: Arc::new(SseManager::new()),
             workspace: None,
+            workspace_pool: None,
             session_manager: None,
             log_broadcaster: None,
             log_level_handle: None,
@@ -93,7 +97,7 @@ impl GatewayChannel {
             job_manager: None,
             prompt_queue: None,
             scheduler: None,
-            user_id: config.user_id.clone(),
+            default_user_id: config.user_id.clone(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(ws::WsConnectionTracker::new())),
             llm_provider: None,
@@ -101,7 +105,7 @@ impl GatewayChannel {
             user_tokens: None,
             skill_registry: None,
             skill_catalog: None,
-            chat_rate_limiter: server::RateLimiter::new(30, 60),
+            chat_rate_limiter: server::PerUserRateLimiter::new(30, 60),
             oauth_rate_limiter: server::RateLimiter::new(10, 60),
             webhook_rate_limiter: server::RateLimiter::new(10, 60),
             registry_entries: Vec::new(),
@@ -115,7 +119,18 @@ impl GatewayChannel {
             config,
             state,
             auth_token,
+            auth_override: None,
         }
+    }
+
+    /// Create a gateway channel with multi-user authentication.
+    ///
+    /// The provided `MultiAuthState` maps bearer tokens to user identities,
+    /// enabling per-user LLM provider selection and workspace isolation.
+    pub fn new_multi_auth(config: GatewayConfig, auth: auth::MultiAuthState) -> Self {
+        let mut channel = Self::new(config);
+        channel.auth_override = Some(auth);
+        channel
     }
 
     /// Helper to rebuild state, copying existing fields and applying a mutation.
@@ -123,8 +138,9 @@ impl GatewayChannel {
         let mut new_state = GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
             // Preserve the existing broadcast channel so sender handles remain valid.
-            sse: SseManager::from_sender(self.state.sse.sender()),
+            sse: Arc::new(SseManager::from_sender(self.state.sse.sender())),
             workspace: self.state.workspace.clone(),
+            workspace_pool: self.state.workspace_pool.clone(),
             session_manager: self.state.session_manager.clone(),
             log_broadcaster: self.state.log_broadcaster.clone(),
             log_level_handle: self.state.log_level_handle.clone(),
@@ -134,7 +150,7 @@ impl GatewayChannel {
             job_manager: self.state.job_manager.clone(),
             prompt_queue: self.state.prompt_queue.clone(),
             scheduler: self.state.scheduler.clone(),
-            user_id: self.state.user_id.clone(),
+            default_user_id: self.state.default_user_id.clone(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: self.state.ws_tracker.clone(),
             llm_provider: self.state.llm_provider.clone(),
@@ -142,7 +158,7 @@ impl GatewayChannel {
             user_tokens: self.state.user_tokens.clone(),
             skill_registry: self.state.skill_registry.clone(),
             skill_catalog: self.state.skill_catalog.clone(),
-            chat_rate_limiter: server::RateLimiter::new(30, 60),
+            chat_rate_limiter: server::PerUserRateLimiter::new(30, 60),
             oauth_rate_limiter: server::RateLimiter::new(10, 60),
             webhook_rate_limiter: server::RateLimiter::new(10, 60),
             registry_entries: self.state.registry_entries.clone(),
@@ -158,6 +174,21 @@ impl GatewayChannel {
     /// Inject the workspace reference for the memory API.
     pub fn with_workspace(mut self, workspace: Arc<Workspace>) -> Self {
         self.rebuild_state(|s| s.workspace = Some(workspace));
+        self
+    }
+
+    /// Inject the per-user workspace pool for multi-tenant workspace isolation.
+    pub fn with_workspace_pool(mut self, pool: Arc<server::WorkspacePool>) -> Self {
+        self.rebuild_state(|s| s.workspace_pool = Some(pool));
+        self
+    }
+
+    /// Inject the per-user token configuration for multi-tenant LLM provider selection.
+    pub fn with_user_tokens(
+        mut self,
+        tokens: std::collections::HashMap<String, crate::config::UserTokenConfig>,
+    ) -> Self {
+        self.rebuild_state(|s| s.user_tokens = Some(tokens));
         self
     }
 
@@ -298,7 +329,13 @@ impl Channel for GatewayChannel {
                 ),
             })?;
 
-        server::start_server(addr, self.state.clone(), self.auth_token.clone()).await?;
+        let auth = self.auth_override.clone().unwrap_or_else(|| {
+            auth::MultiAuthState::single(
+                self.auth_token.clone(),
+                self.state.default_user_id.clone(),
+            )
+        });
+        server::start_server(addr, self.state.clone(), auth).await?;
 
         Ok(Box::pin(ReceiverStream::new(rx)))
     }

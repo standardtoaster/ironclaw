@@ -601,7 +601,7 @@ async fn async_main() -> anyhow::Result<()> {
                         token.clone(),
                         UserIdentity {
                             user_id: cfg.user_id.clone(),
-                            workspace_read_scopes: cfg.workspace_read_scopes.clone(),
+                            workspace_read_scopes: Vec::new(),
                         },
                     )
                 })
