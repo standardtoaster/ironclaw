@@ -893,3 +893,503 @@ fn validate_partial_passes_system_fields_through() {
     assert_eq!(result["name"], "bread");
     assert_eq!(result["_history"][0]["op"], "insert");
 }
+
+// ==================== Edge Case: Empty Schema ====================
+
+#[test]
+fn schema_with_no_fields_validates_empty_record() {
+    let schema = CollectionSchema {
+        collection: "empty".to_string(),
+        description: None,
+        fields: BTreeMap::new(),
+        source_scope: None,
+    };
+    let data = serde_json::json!({});
+    let result = schema.validate_record(&data).unwrap();
+    assert_eq!(result, serde_json::json!({}));
+}
+
+#[test]
+fn schema_with_no_fields_rejects_unknown_field() {
+    let schema = CollectionSchema {
+        collection: "empty".to_string(),
+        description: None,
+        fields: BTreeMap::new(),
+        source_scope: None,
+    };
+    let data = serde_json::json!({"foo": "bar"});
+    assert!(matches!(
+        schema.validate_record(&data),
+        Err(ValidationError::UnknownField { .. })
+    ));
+}
+
+#[test]
+fn schema_with_no_fields_allows_system_fields() {
+    let schema = CollectionSchema {
+        collection: "empty".to_string(),
+        description: None,
+        fields: BTreeMap::new(),
+        source_scope: None,
+    };
+    let data = serde_json::json!({"_source": "test", "_timestamp": "2025-01-01"});
+    let result = schema.validate_record(&data).unwrap();
+    assert_eq!(result["_source"], "test");
+    assert_eq!(result["_timestamp"], "2025-01-01");
+}
+
+// ==================== Edge Case: Coercion ====================
+
+#[test]
+fn number_coercion_integer_string() {
+    let schema = time_entry_schema();
+    let data = serde_json::json!({
+        "date": "2025-01-01",
+        "hours": "8",
+        "category": "development",
+        "description": "coding"
+    });
+    let result = schema.validate_record(&data).unwrap();
+    // "8" should be coerced to 8
+    assert_eq!(result["hours"], serde_json::json!(8));
+    assert!(result["hours"].is_number());
+}
+
+#[test]
+fn number_coercion_float_string() {
+    let schema = time_entry_schema();
+    let data = serde_json::json!({
+        "date": "2025-01-01",
+        "hours": "7.5",
+        "category": "development",
+        "description": "coding"
+    });
+    let result = schema.validate_record(&data).unwrap();
+    assert_eq!(result["hours"], serde_json::json!(7.5));
+}
+
+#[test]
+fn bool_coercion_string_true() {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "active".to_string(),
+        FieldDef {
+            field_type: FieldType::Bool,
+            required: true,
+            default: None,
+        },
+    );
+    let schema = CollectionSchema {
+        collection: "flags".to_string(),
+        description: None,
+        fields,
+        source_scope: None,
+    };
+    let data = serde_json::json!({"active": "true"});
+    let result = schema.validate_record(&data).unwrap();
+    assert_eq!(result["active"], serde_json::json!(true));
+    assert!(result["active"].is_boolean());
+}
+
+#[test]
+fn bool_coercion_string_false() {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "active".to_string(),
+        FieldDef {
+            field_type: FieldType::Bool,
+            required: true,
+            default: None,
+        },
+    );
+    let schema = CollectionSchema {
+        collection: "flags".to_string(),
+        description: None,
+        fields,
+        source_scope: None,
+    };
+    let data = serde_json::json!({"active": "false"});
+    let result = schema.validate_record(&data).unwrap();
+    assert_eq!(result["active"], serde_json::json!(false));
+}
+
+// ==================== Edge Case: Validation Boundaries ====================
+
+#[test]
+fn validate_record_rejects_non_object() {
+    let schema = grocery_schema();
+    let data = serde_json::json!("not an object");
+    assert!(matches!(
+        schema.validate_record(&data),
+        Err(ValidationError::TypeMismatch { field, .. }) if field == "(root)"
+    ));
+}
+
+#[test]
+fn validate_record_rejects_array() {
+    let schema = grocery_schema();
+    let data = serde_json::json!([{"name": "bread"}]);
+    assert!(matches!(
+        schema.validate_record(&data),
+        Err(ValidationError::TypeMismatch { field, .. }) if field == "(root)"
+    ));
+}
+
+#[test]
+fn validate_record_rejects_null_for_required_field() {
+    let schema = grocery_schema();
+    let data = serde_json::json!({"name": null});
+    assert!(matches!(
+        schema.validate_record(&data),
+        Err(ValidationError::MissingRequired { field }) if field == "name"
+    ));
+}
+
+#[test]
+fn validate_partial_rejects_non_object() {
+    let schema = grocery_schema();
+    let data = serde_json::json!(42);
+    assert!(matches!(
+        schema.validate_partial(&data),
+        Err(ValidationError::TypeMismatch { field, .. }) if field == "(root)"
+    ));
+}
+
+// ==================== Edge Case: Multiple System Fields ====================
+
+#[test]
+fn multiple_system_fields_all_pass_through() {
+    let schema = grocery_schema();
+    let data = serde_json::json!({
+        "name": "milk",
+        "_history": [{"op": "insert"}],
+        "_lineage": {"source": "api"},
+        "_source": "whatsapp",
+        "_timestamp": "2025-01-01T00:00:00Z",
+        "_custom_system": "anything"
+    });
+    let result = schema.validate_record(&data).unwrap();
+    assert_eq!(result["_history"][0]["op"], "insert");
+    assert_eq!(result["_lineage"]["source"], "api");
+    assert_eq!(result["_source"], "whatsapp");
+    assert_eq!(result["_timestamp"], "2025-01-01T00:00:00Z");
+    assert_eq!(result["_custom_system"], "anything");
+}
+
+// ==================== Edge Case: Alteration Safety ====================
+
+#[test]
+fn alter_add_field_with_empty_enum_rejected() {
+    let schema = grocery_schema();
+    let alt = Alteration {
+        operation: AlterOperation::AddField,
+        field: "status".to_string(),
+        field_type: Some(FieldType::Enum {
+            values: Vec::new(),
+        }),
+        required: None,
+        default: None,
+        value: None,
+    };
+    assert!(schema.apply_alteration(&alt).is_err());
+}
+
+#[test]
+fn alter_add_field_validates_field_name() {
+    let schema = grocery_schema();
+    // Field name with spaces should be rejected
+    let alt = Alteration {
+        operation: AlterOperation::AddField,
+        field: "bad field".to_string(),
+        field_type: Some(FieldType::Text),
+        required: None,
+        default: None,
+        value: None,
+    };
+    assert!(matches!(
+        schema.apply_alteration(&alt),
+        Err(ValidationError::InvalidName { .. })
+    ));
+}
+
+#[test]
+fn alter_add_field_rejects_system_field_name() {
+    let schema = grocery_schema();
+    let alt = Alteration {
+        operation: AlterOperation::AddField,
+        field: "_hidden".to_string(),
+        field_type: Some(FieldType::Text),
+        required: None,
+        default: None,
+        value: None,
+    };
+    assert!(matches!(
+        schema.apply_alteration(&alt),
+        Err(ValidationError::InvalidName { .. })
+    ));
+}
+
+#[test]
+fn alter_remove_enum_value_from_non_enum_field() {
+    let schema = time_entry_schema();
+    let alt = Alteration {
+        operation: AlterOperation::RemoveEnumValue,
+        field: "hours".to_string(), // Number field, not enum
+        field_type: None,
+        required: None,
+        default: None,
+        value: Some("anything".to_string()),
+    };
+    assert!(matches!(
+        schema.apply_alteration(&alt),
+        Err(ValidationError::TypeMismatch { .. })
+    ));
+}
+
+// ==================== History Tracking Edge Cases ====================
+
+#[test]
+fn init_history_on_empty_record() {
+    let mut data = serde_json::json!({});
+    init_history(&mut data, "test");
+    let history = data["_history"].as_array().expect("_history should be array");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["op"], "insert");
+    assert_eq!(history[0]["source"], "test");
+    // Fields should be an empty object (no user fields in empty record)
+    assert_eq!(history[0]["fields"], serde_json::json!({}));
+}
+
+#[test]
+fn init_history_filters_all_system_fields() {
+    let mut data = serde_json::json!({
+        "name": "test",
+        "amount": 5,
+        "_source": "api",
+        "_timestamp": "2025-01-01",
+        "_lineage": {"id": "abc"},
+        "_internal": true
+    });
+    init_history(&mut data, "tool");
+    let fields = &data["_history"][0]["fields"];
+    assert_eq!(fields["name"], "test");
+    assert_eq!(fields["amount"], 5);
+    // None of the system fields should appear in the history snapshot
+    assert!(fields.get("_source").is_none());
+    assert!(fields.get("_timestamp").is_none());
+    assert!(fields.get("_lineage").is_none());
+    assert!(fields.get("_internal").is_none());
+}
+
+#[test]
+fn append_history_multiple_updates() {
+    let mut data = serde_json::json!({
+        "name": "original",
+        "_history": [{
+            "op": "insert",
+            "time": "2025-01-01T00:00:00Z",
+            "source": "api",
+            "fields": {"name": "original"}
+        }]
+    });
+    let update1 = serde_json::json!({"name": "updated1"});
+    append_history(&mut data, &update1, "tool");
+    let update2 = serde_json::json!({"name": "updated2"});
+    append_history(&mut data, &update2, "api");
+    let history = data["_history"].as_array().unwrap();
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0]["op"], "insert");
+    assert_eq!(history[1]["op"], "update");
+    assert_eq!(history[1]["fields"]["name"], "updated1");
+    assert_eq!(history[2]["op"], "update");
+    assert_eq!(history[2]["fields"]["name"], "updated2");
+    assert_eq!(history[2]["source"], "api");
+}
+
+#[test]
+fn append_history_on_non_object_data() {
+    // append_history should handle non-object changed_fields gracefully
+    let mut data = serde_json::json!({"_history": []});
+    let changed = serde_json::json!("not an object");
+    append_history(&mut data, &changed, "test");
+    let history = data["_history"].as_array().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["fields"], serde_json::Value::Null);
+}
+
+// ==================== Name Validation Boundary Cases ====================
+
+#[test]
+fn collection_name_exactly_64_chars() {
+    let name = "a".repeat(64);
+    assert!(CollectionSchema::validate_name(&name).is_ok());
+}
+
+#[test]
+fn collection_name_65_chars_rejected() {
+    let name = "a".repeat(65);
+    assert!(CollectionSchema::validate_name(&name).is_err());
+}
+
+#[test]
+fn collection_name_single_char() {
+    assert!(CollectionSchema::validate_name("x").is_ok());
+}
+
+#[test]
+fn collection_name_all_underscores_after_first_char() {
+    assert!(CollectionSchema::validate_name("a___").is_ok());
+}
+
+#[test]
+fn collection_name_with_digits() {
+    assert!(CollectionSchema::validate_name("item123").is_ok());
+}
+
+#[test]
+fn collection_name_with_hyphen_rejected() {
+    assert!(CollectionSchema::validate_name("my-collection").is_err());
+}
+
+#[test]
+fn collection_name_with_space_rejected() {
+    assert!(CollectionSchema::validate_name("my collection").is_err());
+}
+
+#[test]
+fn collection_name_with_dot_rejected() {
+    assert!(CollectionSchema::validate_name("my.collection").is_err());
+}
+
+// ==================== Default Validation ====================
+
+#[test]
+fn validate_defaults_rejects_type_mismatch() {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "count".to_string(),
+        FieldDef {
+            field_type: FieldType::Number,
+            required: false,
+            default: Some(serde_json::json!("not a number")), // Wrong type
+        },
+    );
+    let schema = CollectionSchema {
+        collection: "bad_defaults".to_string(),
+        description: None,
+        fields,
+        source_scope: None,
+    };
+    assert!(schema.validate_defaults().is_err());
+}
+
+#[test]
+fn validate_defaults_accepts_valid_default() {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "count".to_string(),
+        FieldDef {
+            field_type: FieldType::Number,
+            required: false,
+            default: Some(serde_json::json!(0)),
+        },
+    );
+    let schema = CollectionSchema {
+        collection: "good_defaults".to_string(),
+        description: None,
+        fields,
+        source_scope: None,
+    };
+    assert!(schema.validate_defaults().is_ok());
+}
+
+// ==================== Time Validation ====================
+
+#[test]
+fn valid_time_hh_mm() {
+    use crate::db::structured::validate_field_value;
+    let ft = FieldType::Time;
+    assert!(validate_field_value("t", &ft, &serde_json::json!("14:30")).is_ok());
+}
+
+#[test]
+fn valid_time_hh_mm_ss() {
+    use crate::db::structured::validate_field_value;
+    let ft = FieldType::Time;
+    assert!(validate_field_value("t", &ft, &serde_json::json!("14:30:59")).is_ok());
+}
+
+#[test]
+fn invalid_time_format() {
+    use crate::db::structured::validate_field_value;
+    let ft = FieldType::Time;
+    assert!(validate_field_value("t", &ft, &serde_json::json!("2pm")).is_err());
+}
+
+#[test]
+fn time_rejects_non_string() {
+    use crate::db::structured::validate_field_value;
+    let ft = FieldType::Time;
+    assert!(validate_field_value("t", &ft, &serde_json::json!(1430)).is_err());
+}
+
+// ==================== Source Scope ====================
+
+#[test]
+fn schema_with_source_scope_serializes() {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "name".to_string(),
+        FieldDef {
+            field_type: FieldType::Text,
+            required: true,
+            default: None,
+        },
+    );
+    let schema = CollectionSchema {
+        collection: "shared_data".to_string(),
+        description: Some("Cross-lens collection".to_string()),
+        fields,
+        source_scope: Some("household".to_string()),
+    };
+    let json = serde_json::to_value(&schema).unwrap();
+    assert_eq!(json["source_scope"], "household");
+
+    // Round-trip
+    let deserialized: CollectionSchema = serde_json::from_value(json).unwrap();
+    assert_eq!(deserialized.source_scope, Some("household".to_string()));
+}
+
+#[test]
+fn schema_without_source_scope_omits_field() {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "name".to_string(),
+        FieldDef {
+            field_type: FieldType::Text,
+            required: true,
+            default: None,
+        },
+    );
+    let schema = CollectionSchema {
+        collection: "private_data".to_string(),
+        description: None,
+        fields,
+        source_scope: None,
+    };
+    let json = serde_json::to_value(&schema).unwrap();
+    assert!(json.get("source_scope").is_none());
+}
+
+// ==================== json_to_text ====================
+
+#[test]
+fn json_to_text_conversions() {
+    use crate::db::structured::json_to_text;
+    assert_eq!(json_to_text(&serde_json::json!("hello")), "hello");
+    assert_eq!(json_to_text(&serde_json::json!(42)), "42");
+    assert_eq!(json_to_text(&serde_json::json!(3.14)), "3.14");
+    assert_eq!(json_to_text(&serde_json::json!(true)), "true");
+    assert_eq!(json_to_text(&serde_json::json!(false)), "false");
+    assert_eq!(json_to_text(&serde_json::json!(null)), "");
+}
