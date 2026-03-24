@@ -305,13 +305,13 @@ impl Agent {
         &self.deps.llm
     }
 
-    /// Get the currently active LLM provider, accounting for escalation.
+    /// Get the currently active LLM provider for a user, accounting for escalation.
     ///
-    /// If a tier map is configured, returns the current tier's provider.
+    /// If a tier map is configured, returns the user's current tier's provider.
     /// Otherwise, falls back to the default provider from `deps.llm`.
-    pub(super) fn active_llm(&self) -> Arc<dyn LlmProvider> {
+    pub(super) fn active_llm(&self, user_id: &str) -> Arc<dyn LlmProvider> {
         if let Some(ref tier_map) = self.deps.tier_map {
-            tier_map.current_provider()
+            tier_map.current_provider(user_id)
         } else {
             self.deps.llm.clone()
         }
