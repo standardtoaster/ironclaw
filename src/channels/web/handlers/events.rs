@@ -9,6 +9,7 @@ use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
 
 /// Request body for the event ingest endpoint.
@@ -40,9 +41,10 @@ pub struct EventIngestResponse {
 /// system field for provenance tracking.
 pub async fn events_ingest_handler(
     State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
     Json(req): Json<EventIngestRequest>,
 ) -> impl IntoResponse {
-    let user_id = &state.user_id;
+    let user_id = &user.user_id;
     let db = match &state.store {
         Some(db) => Arc::clone(db),
         None => {
