@@ -581,4 +581,335 @@ mod tests {
         let result = router.route("user-1", "anything").await.unwrap();
         assert!(result.is_none(), "empty store should return None");
     }
+
+    // ── route_with_confidence tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn route_with_confidence_strong_match() {
+        // Score >= high_threshold → routes unconditionally, ambiguous=false
+        let embedder = Arc::new(FakeEmbedder::new(64));
+        let store = Arc::new(FakeWorkspaceStore::new());
+
+        let ws = make_workspace("user-1");
+        let ws_id = ws.id;
+        let emb = embedder.embed_sync("grocery list");
+        store.insert(ws, emb);
+
+        // Exact text match → cosine=1.0, well above high_threshold=0.5
+        let router = WorkspaceRouter::new(store, embedder, 0.1).with_high_threshold(0.5);
+        let result = router
+            .route_with_confidence("user-1", "grocery list")
+            .await
+            .unwrap();
+
+        assert!(result.workspace.is_some(), "strong match should route");
+        assert_eq!(result.workspace.unwrap().id, ws_id);
+        assert!(!result.ambiguous);
+        assert!(
+            result.score >= 0.5,
+            "score {} should be >= high_threshold 0.5",
+            result.score
+        );
+    }
+
+    #[tokio::test]
+    async fn route_with_confidence_single_candidate_moderate() {
+        // Single candidate above low_threshold but below high_threshold.
+        // gap is -1.0 (only one candidate) so it routes confidently.
+        let embedder = Arc::new(FakeEmbedder::new(64));
+        let store = Arc::new(FakeWorkspaceStore::new());
+
+        let ws = make_workspace("user-1");
+        let ws_id = ws.id;
+        let emb = embedder.embed_sync("grocery list");
+        store.insert(ws, emb);
+
+        // high_threshold=2.0 (unreachable), low_threshold=0.1
+        // Exact match → score=1.0, above low but below high. Only one candidate → gap=-1.0
+        let router = WorkspaceRouter::new(store, embedder, 0.1).with_high_threshold(2.0);
+        let result = router
+            .route_with_confidence("user-1", "grocery list")
+            .await
+            .unwrap();
+
+        assert!(
+            result.workspace.is_some(),
+            "single candidate above low_threshold should route"
+        );
+        assert_eq!(result.workspace.unwrap().id, ws_id);
+        assert!(!result.ambiguous);
+        assert!(
+            result.gap < 0.0,
+            "gap should be -1.0 for single candidate, got {}",
+            result.gap
+        );
+    }
+
+    #[tokio::test]
+    async fn route_with_confidence_confident_moderate_gap() {
+        // Two candidates, best above low_threshold but below high_threshold,
+        // gap > confident_gap → routes confidently, ambiguous=false.
+        let embedder = Arc::new(FakeEmbedder::new(64));
+        let store = Arc::new(FakeWorkspaceStore::new());
+
+        // First workspace: exact match for our query
+        let ws1 = make_workspace("user-1");
+        let ws1_id = ws1.id;
+        let emb1 = embedder.embed_sync("grocery list");
+        store.insert(ws1, emb1);
+
+        // Second workspace: different embedding (some unrelated topic)
+        let ws2 = make_workspace("user-1");
+        let emb2 = embedder.embed_sync("quantum physics homework assignment");
+        store.insert(ws2, emb2);
+
+        // high_threshold=2.0 (unreachable), low_threshold=0.0, confident_gap=0.01
+        // Query "grocery list" → score=1.0 for ws1, much lower for ws2 → large gap
+        let router = WorkspaceRouter::new(store, embedder, 0.0)
+            .with_high_threshold(2.0)
+            .with_confident_gap(0.01);
+        let result = router
+            .route_with_confidence("user-1", "grocery list")
+            .await
+            .unwrap();
+
+        assert!(
+            result.workspace.is_some(),
+            "confident moderate match should route"
+        );
+        assert_eq!(result.workspace.unwrap().id, ws1_id);
+        assert!(!result.ambiguous);
+        assert!(
+            result.gap > 0.01,
+            "gap {} should exceed confident_gap 0.01",
+            result.gap
+        );
+    }
+
+    #[tokio::test]
+    async fn route_with_confidence_ambiguous_same_embedding() {
+        // Two workspaces with the SAME embedding → gap=0.0 → ambiguous=true
+        let embedder = Arc::new(FakeEmbedder::new(64));
+        let store = Arc::new(FakeWorkspaceStore::new());
+
+        let emb = embedder.embed_sync("grocery list");
+
+        let ws1 = make_workspace("user-1");
+        store.insert(ws1, emb.clone());
+
+        let ws2 = make_workspace("user-1");
+        store.insert(ws2, emb);
+
+        // high_threshold=2.0 (unreachable), low_threshold=0.0, confident_gap=0.05
+        // Both score identically → gap=0.0 < 0.05 → ambiguous
+        let router = WorkspaceRouter::new(store, embedder, 0.0)
+            .with_high_threshold(2.0)
+            .with_confident_gap(0.05);
+        let result = router
+            .route_with_confidence("user-1", "grocery list")
+            .await
+            .unwrap();
+
+        assert!(
+            result.workspace.is_none(),
+            "ambiguous result should not route"
+        );
+        assert!(result.ambiguous, "should be marked ambiguous");
+        assert!(
+            result.gap <= 0.05,
+            "gap {} should be <= confident_gap",
+            result.gap
+        );
+        assert_eq!(
+            result.candidates.len(),
+            2,
+            "should have two candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_with_confidence_below_low_threshold() {
+        // Best score below low_threshold → no match, ambiguous=false
+        let embedder = Arc::new(FakeEmbedder::new(64));
+        let store = Arc::new(FakeWorkspaceStore::new());
+
+        let ws = make_workspace("user-1");
+        let emb = embedder.embed_sync("grocery list");
+        store.insert(ws, emb);
+
+        // low_threshold=2.0 (unreachable) — no score can reach it
+        let router = WorkspaceRouter::new(store, embedder, 2.0);
+        let result = router
+            .route_with_confidence("user-1", "quantum physics")
+            .await
+            .unwrap();
+
+        assert!(result.workspace.is_none(), "below threshold should not route");
+        assert!(!result.ambiguous, "below threshold is not ambiguous");
+    }
+
+    #[tokio::test]
+    async fn route_with_confidence_empty_store() {
+        // Empty store → no match, score=0.0, gap=-1.0, ambiguous=false
+        let embedder = Arc::new(FakeEmbedder::new(64));
+        let store = Arc::new(FakeWorkspaceStore::new());
+
+        let router = WorkspaceRouter::new(store, embedder, 0.5);
+        let result = router
+            .route_with_confidence("user-1", "anything")
+            .await
+            .unwrap();
+
+        assert!(result.workspace.is_none());
+        assert_eq!(result.score, 0.0);
+        assert_eq!(result.gap, -1.0);
+        assert!(!result.ambiguous);
+        assert!(result.candidates.is_empty());
+        assert!(
+            result.message_embedding.is_some(),
+            "should still return the computed embedding"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_with_confidence_returns_candidates() {
+        // Verify candidates vec is populated with (id, score) pairs
+        let embedder = Arc::new(FakeEmbedder::new(64));
+        let store = Arc::new(FakeWorkspaceStore::new());
+
+        let ws1 = make_workspace("user-1");
+        let ws1_id = ws1.id;
+        let emb1 = embedder.embed_sync("grocery list");
+        store.insert(ws1, emb1);
+
+        let ws2 = make_workspace("user-1");
+        let ws2_id = ws2.id;
+        let emb2 = embedder.embed_sync("hardware store shopping");
+        store.insert(ws2, emb2);
+
+        let router = WorkspaceRouter::new(store, embedder, 0.0).with_high_threshold(0.5);
+        let result = router
+            .route_with_confidence("user-1", "grocery list")
+            .await
+            .unwrap();
+
+        assert!(
+            !result.candidates.is_empty(),
+            "candidates should be populated"
+        );
+        // First candidate should be the best match
+        assert_eq!(result.candidates[0].0, ws1_id);
+        assert!(
+            result.candidates[0].1 >= result.candidates.last().unwrap().1,
+            "candidates should be sorted by score descending"
+        );
+        // Both workspaces should appear
+        let candidate_ids: Vec<Uuid> = result.candidates.iter().map(|(id, _)| *id).collect();
+        assert!(candidate_ids.contains(&ws1_id));
+        assert!(candidate_ids.contains(&ws2_id));
+    }
+
+    #[tokio::test]
+    async fn route_with_confidence_message_embedding_always_returned() {
+        // message_embedding should be set even when routing fails
+        let embedder = Arc::new(FakeEmbedder::new(64));
+        let store = Arc::new(FakeWorkspaceStore::new());
+
+        // No workspaces — should still get an embedding back
+        let router = WorkspaceRouter::new(store.clone(), embedder.clone(), 0.5);
+        let result = router
+            .route_with_confidence("user-1", "hello world")
+            .await
+            .unwrap();
+        assert!(
+            result.message_embedding.is_some(),
+            "embedding should be returned even with no match"
+        );
+        let expected = embedder.embed_sync("hello world");
+        assert_eq!(result.message_embedding.unwrap(), expected);
+
+        // With a workspace but below threshold
+        let ws = make_workspace("user-1");
+        let emb = embedder.embed_sync("something else");
+        store.insert(ws, emb);
+
+        let result2 = router
+            .route_with_confidence("user-1", "hello world")
+            .await
+            .unwrap();
+        assert!(result2.message_embedding.is_some());
+    }
+
+    // ── Multi-tenant isolation ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn route_isolates_users() {
+        // user-1's workspace should not be visible to user-2
+        let embedder = Arc::new(FakeEmbedder::new(64));
+        let store = Arc::new(FakeWorkspaceStore::new());
+
+        let ws = make_workspace("user-1");
+        let emb = embedder.embed_sync("grocery list");
+        store.insert(ws, emb);
+
+        let router = WorkspaceRouter::new(store, embedder, 0.0);
+        let result = router.route("user-2", "grocery list").await.unwrap();
+        assert!(
+            result.is_none(),
+            "user-2 should not see user-1's workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_with_confidence_isolates_users() {
+        // Same as above but via route_with_confidence
+        let embedder = Arc::new(FakeEmbedder::new(64));
+        let store = Arc::new(FakeWorkspaceStore::new());
+
+        let ws = make_workspace("user-1");
+        let emb = embedder.embed_sync("grocery list");
+        store.insert(ws, emb);
+
+        let router = WorkspaceRouter::new(store, embedder, 0.0);
+        let result = router
+            .route_with_confidence("user-2", "grocery list")
+            .await
+            .unwrap();
+
+        assert!(result.workspace.is_none());
+        assert_eq!(result.score, 0.0);
+        assert!(result.candidates.is_empty());
+        assert!(!result.ambiguous);
+    }
+
+    #[tokio::test]
+    async fn route_each_user_sees_own_workspaces() {
+        // Two users with workspaces on the same topic — each sees only their own
+        let embedder = Arc::new(FakeEmbedder::new(64));
+        let store = Arc::new(FakeWorkspaceStore::new());
+
+        let ws1 = make_workspace("user-1");
+        let ws1_id = ws1.id;
+        let emb1 = embedder.embed_sync("grocery list");
+        store.insert(ws1, emb1);
+
+        let ws2 = make_workspace("user-2");
+        let ws2_id = ws2.id;
+        let emb2 = embedder.embed_sync("grocery list");
+        store.insert(ws2, emb2);
+
+        let router = WorkspaceRouter::new(store, embedder, 0.0).with_high_threshold(0.5);
+
+        let r1 = router
+            .route_with_confidence("user-1", "grocery list")
+            .await
+            .unwrap();
+        let r2 = router
+            .route_with_confidence("user-2", "grocery list")
+            .await
+            .unwrap();
+
+        assert_eq!(r1.workspace.unwrap().id, ws1_id);
+        assert_eq!(r2.workspace.unwrap().id, ws2_id);
+    }
 }

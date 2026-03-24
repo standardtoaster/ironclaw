@@ -1077,4 +1077,192 @@ mod tests {
         let projects = parse_organizer_response(input).expect("should parse");
         assert_eq!(projects.len(), 1);
     }
+
+    // ── Additional is_reply_like tests ──────────────────────────────
+
+    #[test]
+    fn reply_like_empty_string() {
+        // Empty string has 0 words → < 5 → reply-like
+        assert!(is_reply_like("", 15));
+    }
+
+    #[test]
+    fn reply_like_punctuation_only() {
+        // "??" splits into zero words → < 5 → reply-like
+        assert!(is_reply_like("??", 15));
+        assert!(is_reply_like("...", 15));
+        assert!(is_reply_like("!", 15));
+    }
+
+    #[test]
+    fn reply_like_exactly_max_words_boundary() {
+        // Exactly at max_words (5 words): should not be short-message-triggered
+        // but could still match on markers. "one two three four five" has no
+        // anaphora or markers and has exactly 5 words (not < 5).
+        assert!(
+            !is_reply_like("one two three four five", 5),
+            "5 words with max_words=5 should not be reply-like"
+        );
+        // 4 words with max_words=5: below the < 5 threshold
+        assert!(
+            is_reply_like("one two three four", 5),
+            "4 words should be reply-like (< 5)"
+        );
+    }
+
+    #[test]
+    fn reply_like_max_words_zero() {
+        // max_words=0 → anything with > 0 words fails the word-count check.
+        // Empty string still passes (0 words → 0 <= 0, but < 5 check also applies).
+        // Actually: words.len() > 0 since split_whitespace of "yes" gives 1 word > 0.
+        assert!(
+            !is_reply_like("yes", 0),
+            "max_words=0 should reject single-word messages"
+        );
+    }
+
+    #[test]
+    fn reply_like_anaphora_not_substring() {
+        // "thermal" contains "the" as a substring but "the" is an anaphora.
+        // The word-boundary check should prevent false matches.
+        // "thermal" is 1 word < 5, so it's reply-like via short-message rule.
+        // Use a longer sentence to test word-boundary specifically.
+        assert!(
+            !is_reply_like(
+                "thermal imaging sensors work well for detecting building insulation problems across residential areas",
+                15
+            ),
+            "'thermal' should not match anaphora 'the'"
+        );
+    }
+
+    #[test]
+    fn reply_like_anaphora_with_possessive() {
+        // "it's" splits on apostrophe boundary: "it" + "s", so "it" should match
+        assert!(is_reply_like("it's on the table over there", 15));
+    }
+
+    #[test]
+    fn reply_like_by_the_way_marker() {
+        // Multi-word follow-up marker "by the way"
+        assert!(is_reply_like("by the way can you check that", 15));
+    }
+
+    #[test]
+    fn reply_like_btw_marker() {
+        assert!(is_reply_like("btw I forgot to mention the deadline", 15));
+    }
+
+    #[test]
+    fn not_reply_like_exceeds_max_words() {
+        // 16 words, no markers or anaphora → not reply-like with max_words=15
+        let msg = "please schedule a meeting with the team for next tuesday morning at nine am sharp";
+        let words: Vec<&str> = msg.split_whitespace().collect();
+        assert!(words.len() > 15, "test sentence should exceed 15 words");
+        assert!(
+            !is_reply_like(msg, 15),
+            "long message without markers should not be reply-like"
+        );
+    }
+
+    #[test]
+    fn reply_like_case_insensitive() {
+        // Anaphora matching should be case-insensitive
+        assert!(is_reply_like("THAT is interesting info", 15));
+        assert!(is_reply_like("Actually I changed my mind", 15));
+    }
+
+    // ── Additional parse_organizer_response tests ───────────────────
+
+    #[test]
+    fn parse_organizer_whitespace_padded_json() {
+        let input = "   \n  [{\"name\": \"Trip\", \"description\": \"A trip\"}]  \n  ";
+        let projects = parse_organizer_response(input).expect("should parse padded JSON");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "Trip");
+    }
+
+    #[test]
+    fn parse_organizer_empty_string() {
+        assert!(
+            parse_organizer_response("").is_none(),
+            "empty string should return None"
+        );
+    }
+
+    #[test]
+    fn parse_organizer_only_whitespace() {
+        assert!(
+            parse_organizer_response("   \n\t  ").is_none(),
+            "whitespace-only should return None"
+        );
+    }
+
+    #[test]
+    fn parse_organizer_json_object_not_array() {
+        // A JSON object instead of array should fail
+        let input = r#"{"name": "Trip", "description": "A trip"}"#;
+        assert!(
+            parse_organizer_response(input).is_none(),
+            "JSON object (not array) should return None"
+        );
+    }
+
+    #[test]
+    fn parse_organizer_array_missing_required_fields() {
+        // Array of objects missing "name" field
+        let input = r#"[{"description": "A trip without a name"}]"#;
+        assert!(
+            parse_organizer_response(input).is_none(),
+            "missing required 'name' should return None"
+        );
+    }
+
+    #[test]
+    fn parse_organizer_array_missing_description() {
+        // Array of objects missing "description" field
+        let input = r#"[{"name": "Trip"}]"#;
+        assert!(
+            parse_organizer_response(input).is_none(),
+            "missing required 'description' should return None"
+        );
+    }
+
+    #[test]
+    fn parse_organizer_nested_backticks() {
+        // Triple backticks inside content, then the actual code block
+        let input = "Some text\n```json\n[{\"name\": \"Code review\", \"description\": \"Review PR with ``` blocks\"}]\n```\n";
+        let projects = parse_organizer_response(input).expect("should handle nested backticks");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "Code review");
+    }
+
+    #[test]
+    fn parse_organizer_plain_code_block_no_lang_tag() {
+        // Code block without "json" language tag
+        let input = "```\n[{\"name\": \"Meeting\", \"description\": \"Weekly standup\"}]\n```";
+        let projects =
+            parse_organizer_response(input).expect("should parse code block without lang tag");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "Meeting");
+    }
+
+    #[test]
+    fn parse_organizer_extra_fields_ignored() {
+        // Extra unknown fields beyond name/description should be silently ignored
+        let input = r#"[{"name": "Trip", "description": "A trip", "priority": "high", "tags": ["travel"]}]"#;
+        let projects = parse_organizer_response(input).expect("should ignore extra fields");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "Trip");
+    }
+
+    #[test]
+    fn parse_organizer_array_of_strings() {
+        // Array but not of objects — should fail
+        let input = r#"["grocery list", "school applications"]"#;
+        assert!(
+            parse_organizer_response(input).is_none(),
+            "array of strings should return None"
+        );
+    }
 }
