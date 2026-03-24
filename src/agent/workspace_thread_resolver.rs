@@ -1156,7 +1156,7 @@ mod tests {
     #[test]
     fn not_reply_like_exceeds_max_words() {
         // 16 words, no markers or anaphora → not reply-like with max_words=15
-        let msg = "please schedule a meeting with the team for next tuesday morning at nine am sharp";
+        let msg = "please schedule a new appointment on friday morning then confirm my reservation at noon promptly every week";
         let words: Vec<&str> = msg.split_whitespace().collect();
         assert!(words.len() > 15, "test sentence should exceed 15 words");
         assert!(
