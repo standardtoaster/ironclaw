@@ -58,6 +58,17 @@ pub(crate) fn truncate_for_preview(output: &str, max_chars: usize) -> String {
     }
 }
 
+/// Check whether a message's metadata requests response suppression.
+///
+/// Returns `true` when the metadata object contains `"suppress_response": true`.
+/// Any other value (missing, null, non-bool) returns `false`.
+pub(crate) fn should_suppress_response(metadata: &serde_json::Value) -> bool {
+    metadata
+        .get("suppress_response")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 fn resolve_routine_notification_user(metadata: &serde_json::Value) -> Option<String> {
     resolve_owner_scope_notification_user(
@@ -910,11 +921,7 @@ impl Agent {
             self.store_extracted_documents(&message).await;
 
             // Check if the caller requested response suppression (passive ingestion).
-            let suppress = message
-                .metadata
-                .get("suppress_response")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let suppress = should_suppress_response(&message.metadata);
 
             match self.handle_message(&message).await {
                 Ok(Some(response)) if !response.is_empty() && !suppress => {
@@ -1650,10 +1657,71 @@ impl Agent {
 mod tests {
     use super::{
         chat_tool_execution_metadata, is_single_message_repl, resolve_routine_notification_user,
-        should_fallback_routine_notification, truncate_for_preview,
+        should_fallback_routine_notification, should_suppress_response, truncate_for_preview,
     };
     use crate::channels::IncomingMessage;
     use crate::error::ChannelError;
+
+    // ---- should_suppress_response tests ----
+
+    #[test]
+    fn suppress_response_true_in_metadata() {
+        let meta = serde_json::json!({"suppress_response": true});
+        assert!(should_suppress_response(&meta));
+    }
+
+    #[test]
+    fn suppress_response_false_in_metadata() {
+        let meta = serde_json::json!({"suppress_response": false});
+        assert!(!should_suppress_response(&meta));
+    }
+
+    #[test]
+    fn suppress_response_missing_key() {
+        let meta = serde_json::json!({"thread_id": "t1"});
+        assert!(!should_suppress_response(&meta));
+    }
+
+    #[test]
+    fn suppress_response_null_metadata() {
+        assert!(!should_suppress_response(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn suppress_response_non_bool_value_string() {
+        let meta = serde_json::json!({"suppress_response": "true"});
+        assert!(!should_suppress_response(&meta));
+    }
+
+    #[test]
+    fn suppress_response_non_bool_value_number() {
+        let meta = serde_json::json!({"suppress_response": 1});
+        assert!(!should_suppress_response(&meta));
+    }
+
+    #[test]
+    fn suppress_response_null_value() {
+        let meta = serde_json::json!({"suppress_response": null});
+        assert!(!should_suppress_response(&meta));
+    }
+
+    #[test]
+    fn suppress_response_coexists_with_other_metadata() {
+        let meta = serde_json::json!({
+            "thread_id": "t1",
+            "suppress_response": true,
+            "extra_field": 42
+        });
+        assert!(should_suppress_response(&meta));
+    }
+
+    #[test]
+    fn suppress_response_empty_object() {
+        let meta = serde_json::json!({});
+        assert!(!should_suppress_response(&meta));
+    }
+
+    // ---- truncate_for_preview tests ----
 
     #[test]
     fn test_truncate_short_input() {

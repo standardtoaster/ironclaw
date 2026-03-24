@@ -597,4 +597,108 @@ mod tests {
         assert_eq!(turns[0].response.as_deref(), Some("Hi!"));
         assert_eq!(turns[0].state, "Completed");
     }
+
+    // ---- suppress_response metadata propagation tests ----
+    //
+    // These validate that IncomingMessage metadata is built correctly for the
+    // combinations the agent_loop will read from. The agent loop extracts
+    // suppress_response via:
+    //     message.metadata.get("suppress_response").and_then(|v| v.as_bool())
+
+    /// Helper that mirrors chat_send_handler's metadata construction logic.
+    fn build_chat_metadata(
+        thread_id: Option<&str>,
+        suppress_response: bool,
+    ) -> serde_json::Value {
+        let mut meta = serde_json::Map::new();
+        if let Some(tid) = thread_id {
+            meta.insert("thread_id".to_string(), serde_json::json!(tid));
+        }
+        if suppress_response {
+            meta.insert("suppress_response".to_string(), serde_json::json!(true));
+        }
+        if meta.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Object(meta)
+        }
+    }
+
+    #[test]
+    fn test_metadata_suppress_only() {
+        let meta = build_chat_metadata(None, true);
+        assert_eq!(
+            meta.get("suppress_response").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(meta.get("thread_id").is_none());
+    }
+
+    #[test]
+    fn test_metadata_thread_only() {
+        let meta = build_chat_metadata(Some("t1"), false);
+        assert_eq!(meta.get("thread_id").and_then(|v| v.as_str()), Some("t1"));
+        assert!(meta.get("suppress_response").is_none());
+    }
+
+    #[test]
+    fn test_metadata_both_suppress_and_thread() {
+        let meta = build_chat_metadata(Some("t1"), true);
+        assert_eq!(meta.get("thread_id").and_then(|v| v.as_str()), Some("t1"));
+        assert_eq!(
+            meta.get("suppress_response").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_metadata_neither() {
+        let meta = build_chat_metadata(None, false);
+        assert!(meta.is_null());
+    }
+
+    #[test]
+    fn test_incoming_message_metadata_survives_with_metadata_call() {
+        // Verify that with_metadata sets the metadata correctly and the
+        // agent_loop's extraction pattern works on the result.
+        let meta = build_chat_metadata(Some("t1"), true);
+        let msg = IncomingMessage::new("gateway", "user1", "hello").with_metadata(meta);
+
+        // This is exactly how agent_loop.rs reads it (line 783-787).
+        let suppress = msg
+            .metadata
+            .get("suppress_response")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(suppress);
+
+        // thread_id metadata also survives.
+        let tid = msg
+            .metadata
+            .get("thread_id")
+            .and_then(|v| v.as_str());
+        assert_eq!(tid, Some("t1"));
+    }
+
+    #[test]
+    fn test_suppress_false_not_in_metadata() {
+        // When suppress_response=false, it should NOT appear in metadata at all.
+        // The agent_loop defaults to false when the key is missing, so omitting
+        // it is correct and avoids metadata bloat.
+        let meta = build_chat_metadata(None, false);
+        assert!(meta.is_null());
+    }
+
+    #[test]
+    fn test_agent_loop_extraction_on_null_metadata() {
+        // Agent loop should default to false for Null metadata.
+        let msg = IncomingMessage::new("gateway", "user1", "hello");
+        assert!(msg.metadata.is_null());
+        let suppress = msg
+            .metadata
+            .get("suppress_response")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(!suppress);
+    }
 }
