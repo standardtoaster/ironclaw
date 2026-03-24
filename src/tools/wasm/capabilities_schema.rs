@@ -379,6 +379,20 @@ impl CredentialMappingSchema {
     }
 }
 
+/// Reference to a workspace file for resolving a value at tool setup time.
+///
+/// Used by `CredentialLocationSchema::Basic` to read the username from a
+/// workspace config file instead of hardcoding it in capabilities.json.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceValueRef {
+    /// Workspace file path (e.g., "CALDAV_CONFIG").
+    pub path: String,
+    /// If the workspace file contains JSON, extract this field.
+    /// When `None`, the entire file content is used as the value.
+    #[serde(default)]
+    pub json_field: Option<String>,
+}
+
 /// Credential injection location schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -386,8 +400,17 @@ pub enum CredentialLocationSchema {
     /// Bearer token in Authorization header.
     Bearer,
 
-    /// Basic auth (password from secret, username in config).
-    Basic { username: String },
+    /// Basic auth (password from secret, username from config or workspace).
+    ///
+    /// Exactly one of `username` or `username_from_workspace` must be set.
+    /// When `username_from_workspace` is set, the host resolves it at tool
+    /// setup time by reading the referenced workspace file.
+    Basic {
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        username_from_workspace: Option<WorkspaceValueRef>,
+    },
 
     /// Custom header.
     Header {
@@ -405,13 +428,36 @@ pub enum CredentialLocationSchema {
 }
 
 impl CredentialLocationSchema {
+    /// Convert to a `CredentialLocation` without workspace resolution.
+    ///
+    /// When `username_from_workspace` is set, this produces a placeholder
+    /// username. Call `resolve_workspace_refs()` after wiring up the
+    /// workspace reader to replace it with the actual value.
     fn to_credential_location(&self) -> CredentialLocation {
         match self {
             CredentialLocationSchema::Bearer => CredentialLocation::AuthorizationBearer,
-            CredentialLocationSchema::Basic { username } => {
-                CredentialLocation::AuthorizationBasic {
-                    username: username.clone(),
-                }
+            CredentialLocationSchema::Basic {
+                username,
+                username_from_workspace,
+            } => {
+                let resolved = username.clone().unwrap_or_else(|| {
+                    if let Some(ws_ref) = username_from_workspace {
+                        // Placeholder — host-side setup pipeline resolves this
+                        // via resolve_workspace_refs() before the tool is active.
+                        format!(
+                            "{{workspace:{}{}}}",
+                            ws_ref.path,
+                            ws_ref
+                                .json_field
+                                .as_deref()
+                                .map(|f| format!(".{}", f))
+                                .unwrap_or_default()
+                        )
+                    } else {
+                        String::new()
+                    }
+                });
+                CredentialLocation::AuthorizationBasic { username: resolved }
             }
             CredentialLocationSchema::Header { name, prefix } => CredentialLocation::Header {
                 name: name.clone(),
@@ -424,6 +470,17 @@ impl CredentialLocationSchema {
                 placeholder: placeholder.clone(),
             },
         }
+    }
+
+    /// Returns `true` if this location has unresolved workspace references.
+    pub fn needs_workspace_resolution(&self) -> bool {
+        matches!(
+            self,
+            CredentialLocationSchema::Basic {
+                username: None,
+                username_from_workspace: Some(_),
+            }
+        )
     }
 }
 
@@ -1588,5 +1645,198 @@ mod tests {
             super::MAX_DESCRIPTION_CHARS,
             desc.len()
         );
+    }
+
+    /// Regression test for issue #977: oversized parameters schema is dropped.
+    #[test]
+    fn test_oversized_parameters_schema_dropped() {
+        // Build a parameters schema larger than MAX_PARAMETERS_SCHEMA_BYTES
+        let mut properties = serde_json::Map::new();
+        for i in 0..2000 {
+            properties.insert(
+                format!("field_{i}"),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "x".repeat(50)
+                }),
+            );
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": properties,
+        });
+        let json = serde_json::json!({
+            "parameters": schema,
+        });
+        let caps = CapabilitiesFile::from_json(&json.to_string()).unwrap();
+        assert!(
+            caps.parameters.is_none(),
+            "oversized parameters schema should be dropped"
+        );
+    }
+
+    // ── Basic auth with workspace username ref ──────────────────────────
+
+    #[test]
+    fn test_parse_basic_auth_with_literal_username() {
+        let json = r#"{
+            "http": {
+                "allowlist": [{ "host": "caldav.example.com" }],
+                "credentials": {
+                    "password": {
+                        "secret_name": "caldav_password",
+                        "location": { "type": "basic", "username": "user@example.com" },
+                        "host_patterns": ["caldav.example.com"]
+                    }
+                }
+            }
+        }"#;
+
+        let caps = CapabilitiesFile::from_json(json).unwrap();
+        let http = caps.http.unwrap();
+        let cred = http.credentials.get("password").unwrap();
+        match &cred.location {
+            CredentialLocationSchema::Basic {
+                username,
+                username_from_workspace,
+            } => {
+                assert_eq!(username.as_deref(), Some("user@example.com"));
+                assert!(username_from_workspace.is_none());
+                assert!(!cred.location.needs_workspace_resolution());
+            }
+            _ => panic!("Expected Basic location"),
+        }
+    }
+
+    #[test]
+    fn test_parse_basic_auth_with_workspace_ref() {
+        let json = r#"{
+            "http": {
+                "allowlist": [{ "host": "caldav.icloud.com" }],
+                "credentials": {
+                    "caldav_password": {
+                        "secret_name": "caldav_password",
+                        "location": {
+                            "type": "basic",
+                            "username_from_workspace": {
+                                "path": "CALDAV_CONFIG",
+                                "json_field": "username"
+                            }
+                        },
+                        "host_patterns": ["caldav.icloud.com"]
+                    }
+                }
+            }
+        }"#;
+
+        let caps = CapabilitiesFile::from_json(json).unwrap();
+        let http = caps.http.unwrap();
+        let cred = http.credentials.get("caldav_password").unwrap();
+        match &cred.location {
+            CredentialLocationSchema::Basic {
+                username,
+                username_from_workspace,
+            } => {
+                assert!(username.is_none());
+                let ws_ref = username_from_workspace.as_ref().unwrap();
+                assert_eq!(ws_ref.path, "CALDAV_CONFIG");
+                assert_eq!(ws_ref.json_field.as_deref(), Some("username"));
+                assert!(cred.location.needs_workspace_resolution());
+            }
+            _ => panic!("Expected Basic location"),
+        }
+    }
+
+    #[test]
+    fn test_parse_basic_auth_workspace_ref_without_json_field() {
+        let json = r#"{
+            "http": {
+                "allowlist": [{ "host": "dav.example.com" }],
+                "credentials": {
+                    "dav_pass": {
+                        "secret_name": "dav_password",
+                        "location": {
+                            "type": "basic",
+                            "username_from_workspace": { "path": "DAV_USERNAME" }
+                        },
+                        "host_patterns": ["dav.example.com"]
+                    }
+                }
+            }
+        }"#;
+
+        let caps = CapabilitiesFile::from_json(json).unwrap();
+        let http = caps.http.unwrap();
+        let cred = http.credentials.get("dav_pass").unwrap();
+        match &cred.location {
+            CredentialLocationSchema::Basic {
+                username_from_workspace,
+                ..
+            } => {
+                let ws_ref = username_from_workspace.as_ref().unwrap();
+                assert_eq!(ws_ref.path, "DAV_USERNAME");
+                assert!(ws_ref.json_field.is_none());
+            }
+            _ => panic!("Expected Basic location"),
+        }
+    }
+
+    #[test]
+    fn test_basic_auth_to_credential_location_literal() {
+        let schema = CredentialLocationSchema::Basic {
+            username: Some("admin@host.com".to_string()),
+            username_from_workspace: None,
+        };
+        let loc = schema.to_credential_location();
+        match loc {
+            crate::secrets::CredentialLocation::AuthorizationBasic { username } => {
+                assert_eq!(username, "admin@host.com");
+            }
+            _ => panic!("Expected AuthorizationBasic"),
+        }
+    }
+
+    #[test]
+    fn test_basic_auth_to_credential_location_workspace_placeholder() {
+        use crate::tools::wasm::capabilities_schema::WorkspaceValueRef;
+
+        let schema = CredentialLocationSchema::Basic {
+            username: None,
+            username_from_workspace: Some(WorkspaceValueRef {
+                path: "CALDAV_CONFIG".to_string(),
+                json_field: Some("username".to_string()),
+            }),
+        };
+        let loc = schema.to_credential_location();
+        match loc {
+            crate::secrets::CredentialLocation::AuthorizationBasic { username } => {
+                // Before host-side resolution, produces a placeholder
+                assert_eq!(username, "{workspace:CALDAV_CONFIG.username}");
+            }
+            _ => panic!("Expected AuthorizationBasic"),
+        }
+    }
+
+    #[test]
+    fn test_basic_auth_literal_takes_precedence_over_workspace() {
+        use crate::tools::wasm::capabilities_schema::WorkspaceValueRef;
+
+        let schema = CredentialLocationSchema::Basic {
+            username: Some("literal@user.com".to_string()),
+            username_from_workspace: Some(WorkspaceValueRef {
+                path: "CONFIG".to_string(),
+                json_field: None,
+            }),
+        };
+        // Literal username wins
+        let loc = schema.to_credential_location();
+        match loc {
+            crate::secrets::CredentialLocation::AuthorizationBasic { username } => {
+                assert_eq!(username, "literal@user.com");
+            }
+            _ => panic!("Expected AuthorizationBasic"),
+        }
+        // Still doesn't need resolution since literal is present
+        assert!(!schema.needs_workspace_resolution());
     }
 }

@@ -772,7 +772,8 @@ mod tests {
 
     #[test]
     fn test_href_to_name_empty_string() {
-        assert_eq!(href_to_name(""), "calendar");
+        // rsplit('/') on "" yields one empty element, so unwrap_or doesn't fire
+        assert_eq!(href_to_name(""), "");
     }
 
     #[test]

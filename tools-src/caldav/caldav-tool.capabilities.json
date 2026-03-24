@@ -25,7 +25,10 @@
     "credentials": {
       "caldav_password": {
         "secret_name": "caldav_password",
-        "location": { "type": "basic", "username": "CALDAV_USERNAME_PLACEHOLDER" },
+        "location": {
+          "type": "basic",
+          "username_from_workspace": { "path": "CALDAV_CONFIG", "json_field": "username" }
+        },
         "host_patterns": ["caldav.icloud.com", "*.icloud.com", "caldav.fastmail.com", "www.google.com"]
       }
     },
