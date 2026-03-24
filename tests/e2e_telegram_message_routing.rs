@@ -204,6 +204,10 @@ mod tests {
 
             tenant_rates: std::sync::Arc::new(ironclaw::tenant::TenantRateRegistry::new(4, 3)),
             tier_map: None,
+            workspace_router: None,
+            thread_resolver: None,
+            core_tools: Vec::new(),
+            organize_rx: None,
         };
 
         let gateway = Arc::new(TestChannel::new());

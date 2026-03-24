@@ -5097,6 +5097,7 @@ mod tests {
             oauth_sweep_shutdown: None,
             collection_write_tx: None,
             skills_dir: None,
+            workspace_pool: None,
         });
 
         // Should resolve a per-user provider for "andrew"

@@ -168,7 +168,8 @@ async fn test_mcp_client_fetches_tools_with_prefix() {
         oauth: None,
         enabled: true,
         description: Some(service.description.clone()),
-    });
+    })
+    .expect("should create client");
 
     let tools = client.create_tools().await.expect("should create tools");
 
@@ -272,7 +273,8 @@ async fn test_full_discovery_flow() {
         oauth: None,
         enabled: true,
         description: None,
-    });
+    })
+    .expect("should create client");
 
     let tools = client.create_tools().await.expect("create tools");
     assert_eq!(tools.len(), 3);

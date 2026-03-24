@@ -358,7 +358,7 @@ mod tests {
             _channel: &str,
             _user_id: &str,
             _thread_id: Option<&str>,
-        ) -> Result<(), DatabaseError> {
+        ) -> Result<bool, DatabaseError> {
             unimplemented!()
         }
         async fn list_conversations_with_preview(
@@ -469,7 +469,19 @@ mod tests {
         async fn list_agent_jobs(&self) -> Result<Vec<AgentJobRecord>, DatabaseError> {
             unimplemented!()
         }
+        async fn list_agent_jobs_for_user(
+            &self,
+            _user_id: &str,
+        ) -> Result<Vec<AgentJobRecord>, DatabaseError> {
+            unimplemented!()
+        }
         async fn agent_job_summary(&self) -> Result<AgentJobSummary, DatabaseError> {
+            unimplemented!()
+        }
+        async fn agent_job_summary_for_user(
+            &self,
+            _user_id: &str,
+        ) -> Result<AgentJobSummary, DatabaseError> {
             unimplemented!()
         }
         async fn get_agent_job_failure_reason(
@@ -678,11 +690,26 @@ mod tests {
         ) -> Result<i64, DatabaseError> {
             unimplemented!()
         }
+        async fn count_running_routine_runs_batch(
+            &self,
+            _routine_ids: &[Uuid],
+        ) -> Result<std::collections::HashMap<Uuid, i64>, DatabaseError> {
+            unimplemented!()
+        }
         async fn link_routine_run_to_job(
             &self,
             _run_id: Uuid,
             _job_id: Uuid,
         ) -> Result<(), DatabaseError> {
+            unimplemented!()
+        }
+        async fn get_webhook_routine_by_path(
+            &self,
+            _path: &str,
+        ) -> Result<Option<Routine>, DatabaseError> {
+            unimplemented!()
+        }
+        async fn list_dispatched_routine_runs(&self) -> Result<Vec<RoutineRun>, DatabaseError> {
             unimplemented!()
         }
     }
@@ -859,6 +886,14 @@ mod tests {
             _query: &str,
             _embedding: Option<&[f32]>,
             _config: &SearchConfig,
+        ) -> Result<Vec<SearchResult>, WorkspaceError> {
+            unimplemented!()
+        }
+        async fn search_conversation_messages(
+            &self,
+            _user_id: &str,
+            _query: &str,
+            _limit: usize,
         ) -> Result<Vec<SearchResult>, WorkspaceError> {
             unimplemented!()
         }
