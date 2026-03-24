@@ -71,4 +71,61 @@ mod tests {
         };
         assert!(scope.is_allowed("ha_turn_on", "anyone"));
     }
+
+    #[test]
+    fn test_multiple_deny_patterns() {
+        let scope = ToolScope {
+            service_name: "ha".to_string(),
+            allowed_users: vec![],
+            denied_patterns: vec!["delete_*".to_string(), "remove_*".to_string()],
+        };
+        assert!(!scope.is_allowed("ha_delete_entity", "andrew"));
+        assert!(!scope.is_allowed("ha_remove_entity", "andrew"));
+        assert!(scope.is_allowed("ha_turn_on", "andrew"));
+    }
+
+    #[test]
+    fn test_tool_without_service_prefix() {
+        let scope = ToolScope {
+            service_name: "ha".to_string(),
+            allowed_users: vec![],
+            denied_patterns: vec!["delete_*".to_string()],
+        };
+        assert!(!scope.is_allowed("delete_entity", "andrew"));
+    }
+
+    #[test]
+    fn test_user_and_deny_both_checked() {
+        let scope = ToolScope {
+            service_name: "ha".to_string(),
+            allowed_users: vec!["andrew".to_string()],
+            denied_patterns: vec!["delete_*".to_string()],
+        };
+        assert!(!scope.is_allowed("ha_delete_entity", "andrew"));
+        assert!(!scope.is_allowed("ha_turn_on", "grace"));
+        assert!(scope.is_allowed("ha_turn_on", "andrew"));
+    }
+
+    #[test]
+    fn test_multiple_allowed_users() {
+        let scope = ToolScope {
+            service_name: "ha".to_string(),
+            allowed_users: vec!["andrew".to_string(), "grace".to_string()],
+            denied_patterns: vec![],
+        };
+        assert!(scope.is_allowed("ha_turn_on", "andrew"));
+        assert!(scope.is_allowed("ha_turn_on", "grace"));
+        assert!(!scope.is_allowed("ha_turn_on", "stranger"));
+    }
+
+    #[test]
+    fn test_deny_pattern_exact_match() {
+        let scope = ToolScope {
+            service_name: "ha".to_string(),
+            allowed_users: vec![],
+            denied_patterns: vec!["turn_on".to_string()],
+        };
+        assert!(!scope.is_allowed("ha_turn_on", "andrew"));
+        assert!(scope.is_allowed("ha_turn_off", "andrew"));
+    }
 }

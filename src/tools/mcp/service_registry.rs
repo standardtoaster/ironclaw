@@ -276,6 +276,240 @@ mod tests {
         assert!(!config.is_tool_allowed("automation_create", "grace"));
     }
 
+    // ---- glob_match edge cases ----
+
+    #[test]
+    fn test_glob_match_exact() {
+        assert!(glob_match("turn_on", "turn_on"));
+        assert!(!glob_match("turn_on", "turn_off"));
+    }
+
+    #[test]
+    fn test_glob_match_prefix_wildcard() {
+        assert!(glob_match("delete_*", "delete_entity"));
+        assert!(glob_match("delete_*", "delete_"));
+        assert!(!glob_match("delete_*", "remove_entity"));
+    }
+
+    #[test]
+    fn test_glob_match_suffix_wildcard() {
+        assert!(glob_match("*_entity", "delete_entity"));
+        assert!(glob_match("*_entity", "create_entity"));
+        assert!(!glob_match("*_entity", "delete_item"));
+    }
+
+    #[test]
+    fn test_glob_match_star_alone_matches_all() {
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn test_glob_match_empty_pattern() {
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "something"));
+    }
+
+    #[test]
+    fn test_glob_match_case_sensitive() {
+        assert!(!glob_match("Delete_*", "delete_entity"));
+        assert!(glob_match("Delete_*", "Delete_entity"));
+    }
+
+    // ---- is_tool_allowed edge cases ----
+
+    #[test]
+    fn test_tool_allowed_with_empty_allow_list() {
+        let mut config = make_test_config("ha", vec!["light"]);
+        config.allow = vec![];
+        assert!(config.is_tool_allowed("turn_on", "andrew"));
+    }
+
+    #[test]
+    fn test_tool_allowed_with_specific_allow() {
+        let mut config = make_test_config("ha", vec!["light"]);
+        config.allow = vec!["turn_*".to_string(), "get_*".to_string()];
+        assert!(config.is_tool_allowed("turn_on", "andrew"));
+        assert!(config.is_tool_allowed("get_status", "andrew"));
+        assert!(!config.is_tool_allowed("delete_entity", "andrew"));
+    }
+
+    #[test]
+    fn test_tool_multiple_deny_patterns() {
+        let mut config = make_test_config("ha", vec!["light"]);
+        config.deny = vec!["delete_*".to_string(), "remove_*".to_string(), "destroy_*".to_string()];
+        assert!(!config.is_tool_allowed("delete_entity", "andrew"));
+        assert!(!config.is_tool_allowed("remove_entity", "andrew"));
+        assert!(!config.is_tool_allowed("destroy_all", "andrew"));
+        assert!(config.is_tool_allowed("turn_on", "andrew"));
+    }
+
+    #[test]
+    fn test_lens_override_allow_restricts() {
+        let mut config = make_test_config("ha", vec!["light"]);
+        config.lens_overrides.insert(
+            "grace".to_string(),
+            LensOverride {
+                allow: vec!["get_*".to_string()],
+                deny: vec![],
+                tier: None,
+            },
+        );
+        assert!(config.is_tool_allowed("turn_on", "andrew"));
+        assert!(config.is_tool_allowed("get_status", "andrew"));
+        assert!(config.is_tool_allowed("get_status", "grace"));
+        assert!(!config.is_tool_allowed("turn_on", "grace"));
+    }
+
+    #[test]
+    fn test_lens_override_deny_and_allow_combined() {
+        let mut config = make_test_config("ha", vec!["light"]);
+        config.lens_overrides.insert(
+            "grace".to_string(),
+            LensOverride {
+                allow: vec!["*".to_string()],
+                deny: vec!["automation_*".to_string(), "delete_*".to_string()],
+                tier: None,
+            },
+        );
+        assert!(config.is_tool_allowed("turn_on", "grace"));
+        assert!(!config.is_tool_allowed("automation_create", "grace"));
+        assert!(!config.is_tool_allowed("delete_entity", "grace"));
+    }
+
+    // ---- ServiceRegistry edge cases ----
+
+    #[test]
+    fn test_search_by_service_name() {
+        let registry = ServiceRegistry::from_configs(vec![
+            make_test_config("home_assistant", vec!["light"]),
+        ]);
+        let results = registry.search("home_assistant", "andrew");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_case_insensitive() {
+        let registry = ServiceRegistry::from_configs(vec![
+            make_test_config("home_assistant", vec!["Light", "HOME"]),
+        ]);
+        let results = registry.search("LIGHT", "andrew");
+        assert_eq!(results.len(), 1);
+        let results = registry.search("home", "andrew");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_multi_word_query() {
+        let registry = ServiceRegistry::from_configs(vec![
+            make_test_config("home_assistant", vec!["light", "sensor"]),
+            make_test_config("media", vec!["movie", "music"]),
+        ]);
+        let results = registry.search("light sensor", "andrew");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "home_assistant");
+    }
+
+    #[test]
+    fn test_search_no_matching_services() {
+        let registry = ServiceRegistry::from_configs(vec![
+            make_test_config("ha", vec!["light"]),
+        ]);
+        let results = registry.search("zzz_no_match", "andrew");
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_get_service_by_name() {
+        let registry = ServiceRegistry::from_configs(vec![
+            make_test_config("ha", vec!["light"]),
+            make_test_config("media", vec!["movie"]),
+        ]);
+        let result = registry.get("ha", "andrew");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "ha");
+
+        let result = registry.get("nonexistent", "andrew");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_respects_scope() {
+        let mut config = make_test_config("ha", vec!["light"]);
+        config.scopes = vec!["andrew".to_string()];
+        let registry = ServiceRegistry::from_configs(vec![config]);
+
+        assert!(registry.get("ha", "andrew").is_some());
+        assert!(registry.get("ha", "grace").is_none());
+    }
+
+    #[test]
+    fn test_empty_registry() {
+        let registry = ServiceRegistry::new();
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+        assert_eq!(registry.search("anything", "anyone").len(), 0);
+        assert!(registry.get("anything", "anyone").is_none());
+    }
+
+    #[test]
+    fn test_load_from_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("services.json");
+        let json = serde_json::json!([{
+            "name": "ha",
+            "description": "Home Assistant",
+            "url": "http://localhost:8123/api/mcp",
+            "auth": {"type": "bearer", "credential": "token"},
+            "keywords": ["light"]
+        }]);
+        std::fs::write(&config_path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let registry = ServiceRegistry::load_from_file(&config_path).unwrap();
+        assert_eq!(registry.len(), 1);
+        let service = registry.get("ha", "anyone").unwrap();
+        assert_eq!(service.allow, vec!["*"]);
+        assert_eq!(service.tier, "read");
+        assert!(service.deny.is_empty());
+    }
+
+    #[test]
+    fn test_load_from_file_invalid_json() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("bad.json");
+        std::fs::write(&config_path, "not json").unwrap();
+        assert!(ServiceRegistry::load_from_file(&config_path).is_err());
+    }
+
+    #[test]
+    fn test_load_from_file_missing() {
+        let path = std::path::Path::new("/tmp/nonexistent_mcp_config_12345.json");
+        assert!(ServiceRegistry::load_from_file(path).is_err());
+    }
+
+    #[test]
+    fn test_multiple_services_different_scopes() {
+        let mut ha = make_test_config("ha", vec!["light"]);
+        ha.scopes = vec!["andrew".to_string(), "grace".to_string()];
+        let mut admin = make_test_config("admin", vec!["config"]);
+        admin.scopes = vec!["andrew".to_string()];
+        let mut public = make_test_config("weather", vec!["weather"]);
+        public.scopes = vec![];
+
+        let registry = ServiceRegistry::from_configs(vec![ha, admin, public]);
+
+        assert_eq!(registry.search("light", "andrew").len(), 1);
+        assert_eq!(registry.search("config", "andrew").len(), 1);
+        assert_eq!(registry.search("weather", "andrew").len(), 1);
+
+        assert_eq!(registry.search("light", "grace").len(), 1);
+        assert_eq!(registry.search("config", "grace").len(), 0);
+        assert_eq!(registry.search("weather", "grace").len(), 1);
+
+        assert_eq!(registry.search("light", "unknown").len(), 0);
+        assert_eq!(registry.search("weather", "unknown").len(), 1);
+    }
+
     fn make_test_config(name: &str, keywords: Vec<&str>) -> ServiceConfig {
         ServiceConfig {
             name: name.to_string(),
