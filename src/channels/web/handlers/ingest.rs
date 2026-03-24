@@ -10,6 +10,7 @@ use axum::{Json, extract::State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
+use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +39,7 @@ pub struct IngestConversationResponse {
 /// Uses the gateway's configured user ID for scoping.
 pub async fn ingest_conversation_handler(
     State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
     Json(req): Json<IngestConversationRequest>,
 ) -> Result<Json<IngestConversationResponse>, (StatusCode, String)> {
     let db = state.store.as_ref().ok_or((
@@ -56,7 +58,7 @@ pub async fn ingest_conversation_handler(
     // passive ingestion from interactive chat.
     let thread_id = req.title.as_deref();
     let conversation_id = db
-        .create_conversation("ingest", &state.default_user_id, thread_id)
+        .create_conversation("ingest", &user.user_id, thread_id)
         .await
         .map_err(|e| {
             (
