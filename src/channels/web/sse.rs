@@ -397,4 +397,59 @@ mod tests {
         let e = bob.next().await.unwrap(); // safety: test-only
         assert!(matches!(e, SseEvent::Heartbeat)); // safety: test assertion
     }
+
+    /// Regression test: scoped subscribers receive user-scoped broadcasts.
+    ///
+    /// The multi-tenant send_status path uses broadcast_for_user() with the
+    /// authenticated user_id. The SSE subscriber uses subscribe(Some(user_id)).
+    /// This test verifies that user-scoped events reach the matching subscriber
+    /// and are filtered from non-matching subscribers.
+    #[tokio::test]
+    async fn test_scoped_subscriber_receives_user_scoped_broadcast() {
+        let manager = SseManager::new();
+        let mut andrew = Box::pin(
+            manager
+                .subscribe_raw(Some("andrew".to_string()))
+                .expect("subscribe"),
+        );
+        let mut grace = Box::pin(
+            manager
+                .subscribe_raw(Some("grace".to_string()))
+                .expect("subscribe"),
+        );
+
+        // Simulate send_status broadcasting a tool_started event for andrew
+        manager.broadcast_for_user(
+            "andrew",
+            SseEvent::ToolStarted {
+                name: "memory_search".to_string(),
+                thread_id: Some("tid-123".to_string()),
+            },
+        );
+
+        // Simulate respond broadcasting a response event for andrew
+        manager.broadcast_for_user(
+            "andrew",
+            SseEvent::Response {
+                content: "Here are your results".to_string(),
+                thread_id: "tid-123".to_string(),
+            },
+        );
+
+        // Send a global heartbeat so grace's stream has something to read
+        manager.broadcast(SseEvent::Heartbeat);
+
+        // Andrew gets both scoped events
+        let e = andrew.next().await.unwrap();
+        assert!(matches!(e, SseEvent::ToolStarted { .. }));
+        let e = andrew.next().await.unwrap();
+        assert!(matches!(e, SseEvent::Response { .. }));
+        // Andrew also gets the heartbeat
+        let e = andrew.next().await.unwrap();
+        assert!(matches!(e, SseEvent::Heartbeat));
+
+        // Grace only gets the heartbeat — andrew's events are filtered
+        let e = grace.next().await.unwrap();
+        assert!(matches!(e, SseEvent::Heartbeat));
+    }
 }

@@ -355,10 +355,13 @@ impl Channel for GatewayChannel {
             }
         };
 
-        self.state.sse.broadcast(SseEvent::Response {
+        let event = SseEvent::Response {
             content: response.content,
             thread_id,
-        });
+        };
+        self.state
+            .sse
+            .broadcast_for_user(&msg.user_id, event);
 
         Ok(())
     }
@@ -503,13 +506,19 @@ impl Channel for GatewayChannel {
             },
         };
 
-        self.state.sse.broadcast(event);
+        // Use user-scoped broadcast when user_id is available in metadata,
+        // so events reach only the correct subscriber in multi-tenant mode.
+        if let Some(user_id) = metadata.get("user_id").and_then(|v| v.as_str()) {
+            self.state.sse.broadcast_for_user(user_id, event);
+        } else {
+            self.state.sse.broadcast(event);
+        }
         Ok(())
     }
 
     async fn broadcast(
         &self,
-        _user_id: &str,
+        user_id: &str,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
         let thread_id = match response.thread_id {
@@ -521,10 +530,13 @@ impl Channel for GatewayChannel {
                 return Ok(());
             }
         };
-        self.state.sse.broadcast(SseEvent::Response {
-            content: response.content,
-            thread_id,
-        });
+        self.state.sse.broadcast_for_user(
+            user_id,
+            SseEvent::Response {
+                content: response.content,
+                thread_id,
+            },
+        );
         Ok(())
     }
 

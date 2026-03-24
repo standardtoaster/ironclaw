@@ -171,13 +171,16 @@ async fn handle_client_message(
             if let Some(ref tz) = timezone {
                 incoming = incoming.with_timezone(tz);
             }
+            // Always include user_id in metadata so SSE broadcasts can scope events.
+            let mut meta = serde_json::json!({"user_id": user_id});
             if let Some(ref tid) = thread_id {
                 incoming = incoming.with_thread(tid);
+                meta["thread_id"] = serde_json::json!(tid);
             }
             if suppress_response {
-                incoming =
-                    incoming.with_metadata(serde_json::json!({"suppress_response": true}));
+                meta["suppress_response"] = serde_json::json!(true);
             }
+            incoming = incoming.with_metadata(meta);
 
             // Convert uploaded images to IncomingAttachments
             if !images.is_empty() {
@@ -255,9 +258,12 @@ async fn handle_client_message(
             };
 
             let mut msg = IncomingMessage::new("gateway", user_id, content);
+            let mut meta = serde_json::json!({"user_id": user_id});
             if let Some(ref tid) = thread_id {
                 msg = msg.with_thread(tid);
+                meta["thread_id"] = serde_json::json!(tid);
             }
+            msg = msg.with_metadata(meta);
             // Clone sender to avoid holding RwLock read guard across send().await
             let tx = {
                 let tx_guard = state.msg_tx.read().await;

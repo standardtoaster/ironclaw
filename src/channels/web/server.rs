@@ -1495,10 +1495,12 @@ async fn chat_approval_handler(
     })?;
 
     let mut msg = IncomingMessage::new("gateway", &user.user_id, content);
-
+    let mut meta = serde_json::json!({"user_id": &user.user_id});
     if let Some(ref thread_id) = req.thread_id {
         msg = msg.with_thread(thread_id);
+        meta["thread_id"] = serde_json::json!(thread_id);
     }
+    msg = msg.with_metadata(meta);
 
     let msg_id = msg.id;
 
