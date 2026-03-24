@@ -105,6 +105,9 @@ pub fn register_skill_credentials(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironclaw_skills::{
+        ActivationCriteria, ActivationScript, SkillManifest, SkillScope,
+    };
 
     #[test]
     fn test_convert_bearer_location() {
@@ -256,5 +259,211 @@ mod tests {
 
         // Invalid spec should be skipped — host should NOT be registered
         assert!(!registry.has_credentials_for_host("api.test.com"));
+    }
+
+    // ── SkillScope unit tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_skill_scope_single_matches() {
+        let scope = SkillScope::Single("alice".to_string());
+        assert!(scope.matches("alice"));
+    }
+
+    #[test]
+    fn test_skill_scope_single_no_match() {
+        let scope = SkillScope::Single("alice".to_string());
+        assert!(!scope.matches("bob"));
+    }
+
+    #[test]
+    fn test_skill_scope_single_empty_user_id() {
+        let scope = SkillScope::Single("alice".to_string());
+        assert!(!scope.matches(""));
+    }
+
+    #[test]
+    fn test_skill_scope_single_case_sensitive() {
+        let scope = SkillScope::Single("Alice".to_string());
+        assert!(!scope.matches("alice"), "scope matching should be case-sensitive");
+        assert!(scope.matches("Alice"));
+    }
+
+    #[test]
+    fn test_skill_scope_multiple_matches_first() {
+        let scope = SkillScope::Multiple(vec!["alice".to_string(), "bob".to_string()]);
+        assert!(scope.matches("alice"));
+    }
+
+    #[test]
+    fn test_skill_scope_multiple_matches_last() {
+        let scope = SkillScope::Multiple(vec!["alice".to_string(), "bob".to_string()]);
+        assert!(scope.matches("bob"));
+    }
+
+    #[test]
+    fn test_skill_scope_multiple_no_match() {
+        let scope = SkillScope::Multiple(vec!["alice".to_string(), "bob".to_string()]);
+        assert!(!scope.matches("charlie"));
+    }
+
+    #[test]
+    fn test_skill_scope_multiple_empty_list() {
+        let scope = SkillScope::Multiple(vec![]);
+        assert!(!scope.matches("alice"), "empty scope list should match nobody");
+    }
+
+    #[test]
+    fn test_skill_scope_serde_single_from_yaml() {
+        let yaml = "\"user1\"";
+        let scope: SkillScope = serde_yml::from_str(yaml).expect("parse failed");
+        assert_eq!(scope, SkillScope::Single("user1".to_string()));
+        assert!(scope.matches("user1"));
+    }
+
+    #[test]
+    fn test_skill_scope_serde_multiple_from_yaml() {
+        let yaml = "[\"alice\", \"bob\"]";
+        let scope: SkillScope = serde_yml::from_str(yaml).expect("parse failed");
+        match &scope {
+            SkillScope::Multiple(v) => {
+                assert_eq!(v.len(), 2);
+                assert!(scope.matches("alice"));
+                assert!(scope.matches("bob"));
+            }
+            _ => panic!("expected Multiple variant"),
+        }
+    }
+
+    #[test]
+    fn test_skill_scope_serde_roundtrip_single() {
+        let scope = SkillScope::Single("user1".to_string());
+        let serialized = serde_json::to_string(&scope).unwrap();
+        let deserialized: SkillScope = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(scope, deserialized);
+    }
+
+    #[test]
+    fn test_skill_scope_serde_roundtrip_multiple() {
+        let scope = SkillScope::Multiple(vec!["a".to_string(), "b".to_string()]);
+        let serialized = serde_json::to_string(&scope).unwrap();
+        let deserialized: SkillScope = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(scope, deserialized);
+    }
+
+    #[test]
+    fn test_skill_manifest_with_scope_in_yaml() {
+        let yaml = r#"
+name: scoped-skill
+version: "1.0"
+description: A skill scoped to one user
+scope: "andrew"
+activation:
+  keywords: [test]
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        assert_eq!(manifest.scope, Some(SkillScope::Single("andrew".to_string())));
+    }
+
+    #[test]
+    fn test_skill_manifest_with_multi_scope_in_yaml() {
+        let yaml = r#"
+name: shared-skill
+version: "1.0"
+description: A skill scoped to multiple users
+scope:
+  - alice
+  - bob
+activation:
+  keywords: [test]
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        match &manifest.scope {
+            Some(SkillScope::Multiple(v)) => {
+                assert_eq!(v.len(), 2);
+                assert!(v.contains(&"alice".to_string()));
+                assert!(v.contains(&"bob".to_string()));
+            }
+            other => panic!("expected Some(Multiple), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_skill_manifest_without_scope_defaults_to_none() {
+        let yaml = r#"
+name: universal-skill
+version: "1.0"
+description: Available to all users
+activation:
+  keywords: [test]
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        assert_eq!(manifest.scope, None);
+    }
+
+    // ── ActivationScript unit tests ────────────────────────────────────
+
+    #[test]
+    fn test_activation_script_default_timeout() {
+        let script = ActivationScript {
+            language: "bash".to_string(),
+            source: Some("echo hi".to_string()),
+            source_file: None,
+            timeout_ms: 5000,
+            max_output_bytes: 4096,
+        };
+        assert_eq!(script.timeout_ms, 5000);
+        assert_eq!(script.max_output_bytes, 4096);
+    }
+
+    #[test]
+    fn test_activation_script_serde_roundtrip() {
+        let script = ActivationScript {
+            language: "python".to_string(),
+            source: Some("print('hello')".to_string()),
+            source_file: None,
+            timeout_ms: 3000,
+            max_output_bytes: 2048,
+        };
+        let json = serde_json::to_string(&script).unwrap();
+        let deserialized: ActivationScript = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.language, "python");
+        assert_eq!(deserialized.source, Some("print('hello')".to_string()));
+        assert_eq!(deserialized.timeout_ms, 3000);
+    }
+
+    #[test]
+    fn test_activation_criteria_with_script_in_yaml() {
+        let yaml = r#"
+keywords: [deploy]
+script:
+  language: bash
+  source: "echo $IRONCLAW_USER_ID"
+  timeout_ms: 2000
+  max_output_bytes: 1024
+"#;
+        let criteria: ActivationCriteria = serde_yml::from_str(yaml).expect("parse failed");
+        assert!(criteria.script.is_some());
+        let script = criteria.script.unwrap();
+        assert_eq!(script.language, "bash");
+        assert_eq!(script.timeout_ms, 2000);
+    }
+
+    #[test]
+    fn test_activation_criteria_with_tools_prefix_in_yaml() {
+        let yaml = r#"
+keywords: [collection]
+tools_prefix: "collection_"
+"#;
+        let criteria: ActivationCriteria = serde_yml::from_str(yaml).expect("parse failed");
+        assert_eq!(criteria.tools_prefix, Some("collection_".to_string()));
+    }
+
+    #[test]
+    fn test_activation_criteria_tools_prefix_defaults_to_none() {
+        let yaml = r#"
+keywords: [test]
+"#;
+        let criteria: ActivationCriteria = serde_yml::from_str(yaml).expect("parse failed");
+        assert_eq!(criteria.tools_prefix, None);
     }
 }
