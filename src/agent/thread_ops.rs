@@ -685,12 +685,12 @@ impl Agent {
             Ok(AgenticLoopResult::Escalate { reason, tier }) => {
                 let previous_tier = self
                     .tier_map()
-                    .map(|tm| tm.current_tier())
+                    .map(|tm| tm.current_tier(&message.user_id))
                     .unwrap_or_else(|| "default".to_string());
 
                 // Perform the actual provider swap via TierMap.
                 let new_tier = if let Some(ref tier_map) = self.deps.tier_map {
-                    match tier_map.escalate_to(tier.as_deref()) {
+                    match tier_map.escalate_to(&message.user_id, tier.as_deref()) {
                         Ok(name) => name,
                         Err(e) => {
                             tracing::warn!(
@@ -801,12 +801,12 @@ impl Agent {
             Ok(AgenticLoopResult::DeEscalate { reason }) => {
                 let previous_tier = self
                     .tier_map()
-                    .map(|tm| tm.current_tier())
+                    .map(|tm| tm.current_tier(&message.user_id))
                     .unwrap_or_else(|| "default".to_string());
 
                 // Perform the actual de-escalation.
                 let new_tier = if let Some(ref tier_map) = self.deps.tier_map {
-                    tier_map.de_escalate()
+                    tier_map.de_escalate(&message.user_id)
                 } else {
                     "default".to_string()
                 };
@@ -1802,7 +1802,7 @@ impl Agent {
                 Ok(AgenticLoopResult::Escalate { reason, tier }) => {
                     // Perform actual provider swap during approval-resume path.
                     if let Some(ref tier_map) = self.deps.tier_map
-                        && let Err(e) = tier_map.escalate_to(tier.as_deref())
+                        && let Err(e) = tier_map.escalate_to(&message.user_id, tier.as_deref())
                     {
                         let msg = format!("Escalation failed: {e}");
                         thread.complete_turn(&msg);
@@ -1815,7 +1815,7 @@ impl Agent {
                 }
                 Ok(AgenticLoopResult::DeEscalate { reason }) => {
                     if let Some(ref tier_map) = self.deps.tier_map {
-                        tier_map.de_escalate();
+                        tier_map.de_escalate(&message.user_id);
                     }
                     let msg = reason;
                     thread.complete_turn(&msg);

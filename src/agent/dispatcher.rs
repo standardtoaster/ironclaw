@@ -2902,18 +2902,18 @@ mod tests {
         );
 
         // active_llm() should return the default tier's provider
-        assert_eq!(agent.active_llm().model_name(), "static-mock");
+        assert_eq!(agent.active_llm("test-user").model_name(), "static-mock");
 
         // Escalate to premium
         let tier_map = agent.tier_map().unwrap();
-        tier_map.escalate_to(Some("premium")).unwrap();
+        tier_map.escalate_to("test-user", Some("premium")).unwrap();
 
         // active_llm() should now return the premium provider
-        assert_eq!(agent.active_llm().model_name(), "premium-model");
+        assert_eq!(agent.active_llm("test-user").model_name(), "premium-model");
 
         // De-escalate
-        tier_map.de_escalate();
-        assert_eq!(agent.active_llm().model_name(), "static-mock");
+        tier_map.de_escalate("test-user");
+        assert_eq!(agent.active_llm("test-user").model_name(), "static-mock");
     }
 
     /// Verify that active_llm() falls back to deps.llm when no tier map.
@@ -2921,7 +2921,7 @@ mod tests {
     fn test_active_llm_without_tier_map() {
         let agent = make_test_agent();
         // No tier map, active_llm() should return deps.llm
-        assert_eq!(agent.active_llm().model_name(), "static-mock");
+        assert_eq!(agent.active_llm("test-user").model_name(), "static-mock");
         assert!(agent.tier_map().is_none());
     }
 }
