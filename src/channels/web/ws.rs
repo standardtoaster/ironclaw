@@ -509,6 +509,126 @@ mod tests {
         }
     }
 
+    // ---- suppress_response metadata propagation tests ----
+
+    #[tokio::test]
+    async fn test_handle_client_message_suppress_response_sets_metadata() {
+        let (agent_tx, mut agent_rx) = mpsc::channel(16);
+        let state = make_test_state(Some(agent_tx)).await;
+        let (direct_tx, _direct_rx) = mpsc::channel(16);
+
+        handle_client_message(
+            WsClientMessage::Message {
+                content: "ingest this".to_string(),
+                thread_id: None,
+                timezone: None,
+                images: Vec::new(),
+                suppress_response: true,
+            },
+            &state,
+            "user1",
+            &direct_tx,
+        )
+        .await;
+
+        let incoming = agent_rx.recv().await.unwrap();
+        assert_eq!(incoming.content, "ingest this");
+        // Verify the metadata has suppress_response=true, matching how
+        // agent_loop.rs extracts it.
+        let suppress = incoming
+            .metadata
+            .get("suppress_response")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(suppress, "suppress_response should be true in metadata");
+    }
+
+    #[tokio::test]
+    async fn test_handle_client_message_suppress_false_no_metadata() {
+        let (agent_tx, mut agent_rx) = mpsc::channel(16);
+        let state = make_test_state(Some(agent_tx)).await;
+        let (direct_tx, _direct_rx) = mpsc::channel(16);
+
+        handle_client_message(
+            WsClientMessage::Message {
+                content: "normal message".to_string(),
+                thread_id: None,
+                timezone: None,
+                images: Vec::new(),
+                suppress_response: false,
+            },
+            &state,
+            "user1",
+            &direct_tx,
+        )
+        .await;
+
+        let incoming = agent_rx.recv().await.unwrap();
+        // When suppress_response=false, metadata should not contain the key.
+        let suppress = incoming
+            .metadata
+            .get("suppress_response")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(!suppress, "suppress_response should default to false");
+    }
+
+    #[tokio::test]
+    async fn test_handle_client_message_suppress_with_thread() {
+        // Verify suppress_response metadata coexists with thread_id.
+        let (agent_tx, mut agent_rx) = mpsc::channel(16);
+        let state = make_test_state(Some(agent_tx)).await;
+        let (direct_tx, _direct_rx) = mpsc::channel(16);
+
+        handle_client_message(
+            WsClientMessage::Message {
+                content: "threaded ingest".to_string(),
+                thread_id: Some("t1".to_string()),
+                timezone: None,
+                images: Vec::new(),
+                suppress_response: true,
+            },
+            &state,
+            "user1",
+            &direct_tx,
+        )
+        .await;
+
+        let incoming = agent_rx.recv().await.unwrap();
+        assert_eq!(incoming.thread_id.as_deref(), Some("t1"));
+        let suppress = incoming
+            .metadata
+            .get("suppress_response")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(suppress, "suppress_response should be set even with thread_id");
+    }
+
+    #[tokio::test]
+    async fn test_handle_client_message_suppress_preserves_user_id() {
+        // Verify the message is correctly scoped to the authenticated user.
+        let (agent_tx, mut agent_rx) = mpsc::channel(16);
+        let state = make_test_state(Some(agent_tx)).await;
+        let (direct_tx, _direct_rx) = mpsc::channel(16);
+
+        handle_client_message(
+            WsClientMessage::Message {
+                content: "test".to_string(),
+                thread_id: None,
+                timezone: None,
+                images: Vec::new(),
+                suppress_response: true,
+            },
+            &state,
+            "alice",
+            &direct_tx,
+        )
+        .await;
+
+        let incoming = agent_rx.recv().await.unwrap();
+        assert_eq!(incoming.user_id, "alice");
+    }
+
     /// Helper to create a GatewayState for testing.
     async fn make_test_state(msg_tx: Option<mpsc::Sender<IncomingMessage>>) -> GatewayState {
         use crate::channels::web::sse::SseManager;

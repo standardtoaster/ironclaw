@@ -1061,3 +1061,204 @@ async fn full_server_nonexistent_job_returns_404() {
 
     assert_eq!(resp.status(), 404);
 }
+
+// ---------------------------------------------------------------------------
+// suppress_response behavioral tests
+// ---------------------------------------------------------------------------
+//
+// These test the full HTTP request path: reqwest → axum → chat_send_handler →
+// IncomingMessage on the agent channel. They verify that suppress_response
+// metadata is correctly propagated so the agent loop can read it.
+
+#[tokio::test]
+async fn http_suppress_response_true_sets_metadata() {
+    let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel(64);
+    let auth = two_user_auth();
+    let (addr, _state) = TestGatewayBuilder::new()
+        .msg_tx(agent_tx)
+        .start_multi(auth)
+        .await
+        .expect("Failed to start server");
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/api/chat/send", addr))
+        .header("Authorization", format!("Bearer {}", ALICE_TOKEN))
+        .header("Content-Type", "application/json")
+        .body(r#"{"content":"ingest this","suppress_response":true}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 202);
+
+    let msg = tokio::time::timeout(Duration::from_secs(2), agent_rx.recv())
+        .await
+        .expect("Timed out waiting for agent message")
+        .expect("Agent channel closed");
+
+    assert_eq!(msg.content, "ingest this");
+    assert_eq!(msg.user_id, ALICE_USER_ID);
+
+    // Verify suppress_response is set in metadata — this is exactly how the
+    // agent_loop extracts it (agent_loop.rs:783-787).
+    let suppress = msg
+        .metadata
+        .get("suppress_response")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    assert!(suppress, "suppress_response metadata should be true");
+}
+
+#[tokio::test]
+async fn http_suppress_response_false_no_metadata_key() {
+    let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel(64);
+    let auth = two_user_auth();
+    let (addr, _state) = TestGatewayBuilder::new()
+        .msg_tx(agent_tx)
+        .start_multi(auth)
+        .await
+        .expect("Failed to start server");
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/api/chat/send", addr))
+        .header("Authorization", format!("Bearer {}", ALICE_TOKEN))
+        .header("Content-Type", "application/json")
+        .body(r#"{"content":"normal message"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 202);
+
+    let msg = tokio::time::timeout(Duration::from_secs(2), agent_rx.recv())
+        .await
+        .expect("Timed out waiting for agent message")
+        .expect("Agent channel closed");
+
+    assert_eq!(msg.content, "normal message");
+
+    // Without suppress_response in the request, the agent_loop extraction
+    // should default to false.
+    let suppress = msg
+        .metadata
+        .get("suppress_response")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    assert!(!suppress, "suppress_response should default to false");
+}
+
+#[tokio::test]
+async fn http_suppress_response_with_thread_id_both_in_metadata() {
+    let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel(64);
+    let auth = two_user_auth();
+    let (addr, _state) = TestGatewayBuilder::new()
+        .msg_tx(agent_tx)
+        .start_multi(auth)
+        .await
+        .expect("Failed to start server");
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/api/chat/send", addr))
+        .header("Authorization", format!("Bearer {}", ALICE_TOKEN))
+        .header("Content-Type", "application/json")
+        .body(r#"{"content":"threaded ingest","thread_id":"t99","suppress_response":true}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 202);
+
+    let msg = tokio::time::timeout(Duration::from_secs(2), agent_rx.recv())
+        .await
+        .expect("Timed out waiting for agent message")
+        .expect("Agent channel closed");
+
+    assert_eq!(msg.content, "threaded ingest");
+    assert_eq!(msg.thread_id.as_deref(), Some("t99"));
+
+    // Both thread_id and suppress_response should be in metadata without
+    // one overwriting the other (regression: with_metadata replaces, not merges).
+    let suppress = msg
+        .metadata
+        .get("suppress_response")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    assert!(suppress, "suppress_response should be true");
+
+    let tid = msg
+        .metadata
+        .get("thread_id")
+        .and_then(|v| v.as_str());
+    assert_eq!(tid, Some("t99"), "thread_id should also be in metadata");
+}
+
+#[tokio::test]
+async fn http_suppress_response_scoped_to_correct_user() {
+    // Verify that suppress_response doesn't leak across users.
+    let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel(64);
+    let auth = two_user_auth();
+    let (addr, _state) = TestGatewayBuilder::new()
+        .msg_tx(agent_tx)
+        .start_multi(auth)
+        .await
+        .expect("Failed to start server");
+
+    let client = reqwest::Client::new();
+
+    // Alice sends with suppress
+    client
+        .post(format!("http://{}/api/chat/send", addr))
+        .header("Authorization", format!("Bearer {}", ALICE_TOKEN))
+        .header("Content-Type", "application/json")
+        .body(r#"{"content":"alice suppressed","suppress_response":true}"#)
+        .send()
+        .await
+        .unwrap();
+
+    // Bob sends without suppress
+    client
+        .post(format!("http://{}/api/chat/send", addr))
+        .header("Authorization", format!("Bearer {}", BOB_TOKEN))
+        .header("Content-Type", "application/json")
+        .body(r#"{"content":"bob normal"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    // Collect both messages (order not guaranteed due to async)
+    let msg1 = tokio::time::timeout(Duration::from_secs(2), agent_rx.recv())
+        .await
+        .expect("Timed out")
+        .expect("Channel closed");
+    let msg2 = tokio::time::timeout(Duration::from_secs(2), agent_rx.recv())
+        .await
+        .expect("Timed out")
+        .expect("Channel closed");
+
+    let (alice_msg, bob_msg) = if msg1.user_id == ALICE_USER_ID {
+        (msg1, msg2)
+    } else {
+        (msg2, msg1)
+    };
+
+    // Alice's message should have suppress metadata
+    let alice_suppress = alice_msg
+        .metadata
+        .get("suppress_response")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    assert!(alice_suppress, "Alice's message should have suppress=true");
+    assert_eq!(alice_msg.user_id, ALICE_USER_ID);
+
+    // Bob's message should NOT have suppress metadata
+    let bob_suppress = bob_msg
+        .metadata
+        .get("suppress_response")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    assert!(!bob_suppress, "Bob's message should not have suppress");
+    assert_eq!(bob_msg.user_id, BOB_USER_ID);
+}

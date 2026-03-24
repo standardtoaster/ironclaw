@@ -1392,4 +1392,94 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.get("channel").is_none());
     }
+
+    // ---- suppress_response: edge cases and combination tests ----
+
+    #[test]
+    fn test_send_message_suppress_response_false_explicit() {
+        let json = r#"{"content":"hello","suppress_response":false}"#;
+        let req: SendMessageRequest = serde_json::from_str(json).unwrap();
+        assert!(!req.suppress_response);
+    }
+
+    #[test]
+    fn test_send_message_suppress_with_thread_id() {
+        // Both suppress_response and thread_id should coexist in the request.
+        let json = r#"{"content":"hello","thread_id":"t1","suppress_response":true}"#;
+        let req: SendMessageRequest = serde_json::from_str(json).unwrap();
+        assert!(req.suppress_response);
+        assert_eq!(req.thread_id.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn test_send_message_suppress_with_all_optional_fields() {
+        let json = r#"{
+            "content": "hello",
+            "thread_id": "t1",
+            "timezone": "America/New_York",
+            "images": [],
+            "suppress_response": true
+        }"#;
+        let req: SendMessageRequest = serde_json::from_str(json).unwrap();
+        assert!(req.suppress_response);
+        assert_eq!(req.thread_id.as_deref(), Some("t1"));
+        assert_eq!(req.timezone.as_deref(), Some("America/New_York"));
+        assert!(req.images.is_empty());
+    }
+
+    #[test]
+    fn test_send_message_suppress_ignores_non_bool() {
+        // serde should reject non-bool values for suppress_response.
+        let json = r#"{"content":"hello","suppress_response":"yes"}"#;
+        let result: Result<SendMessageRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_send_message_suppress_ignores_numeric() {
+        // serde should reject numeric values (1 is not bool in strict mode).
+        let json = r#"{"content":"hello","suppress_response":1}"#;
+        let result: Result<SendMessageRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ws_message_suppress_with_all_fields() {
+        let json = r#"{
+            "type": "message",
+            "content": "test",
+            "thread_id": "t2",
+            "timezone": "UTC",
+            "images": [],
+            "suppress_response": true
+        }"#;
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WsClientMessage::Message {
+                content,
+                thread_id,
+                timezone,
+                suppress_response,
+                ..
+            } => {
+                assert_eq!(content, "test");
+                assert_eq!(thread_id.as_deref(), Some("t2"));
+                assert_eq!(timezone.as_deref(), Some("UTC"));
+                assert!(suppress_response);
+            }
+            _ => panic!("Expected Message variant"),
+        }
+    }
+
+    #[test]
+    fn test_ws_message_suppress_false_explicit() {
+        let json = r#"{"type":"message","content":"test","suppress_response":false}"#;
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WsClientMessage::Message {
+                suppress_response, ..
+            } => assert!(!suppress_response),
+            _ => panic!("Expected Message variant"),
+        }
+    }
 }
