@@ -259,4 +259,60 @@ mod tests {
             _ => panic!("Expected DeEscalate signal"),
         }
     }
+
+    #[tokio::test]
+    async fn test_escalate_output_text_contains_reason() {
+        let tool = EscalateTool;
+        let ctx = JobContext::default();
+        let params = serde_json::json!({"reason": "needs vision capabilities"});
+
+        let output = tool.execute(params, &ctx).await.unwrap();
+        assert!(
+            output.result.as_str().unwrap_or("").contains("needs vision capabilities"),
+            "Output text should contain the escalation reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deescalate_output_text_with_reason() {
+        let tool = DeescalateTool;
+        let ctx = JobContext::default();
+        let params = serde_json::json!({"reason": "complex part done"});
+
+        let output = tool.execute(params, &ctx).await.unwrap();
+        assert!(
+            output.result.as_str().unwrap_or("").contains("complex part done"),
+            "Output text should contain the de-escalation reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deescalate_output_text_default_message() {
+        let tool = DeescalateTool;
+        let ctx = JobContext::default();
+        let params = serde_json::json!({});
+
+        let output = tool.execute(params, &ctx).await.unwrap();
+        assert!(
+            output.result.as_str().unwrap_or("").contains("De-escalating to default model"),
+            "Should use default message when no reason given"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_escalate_empty_reason_string_still_fails() {
+        let tool = EscalateTool;
+        let ctx = JobContext::default();
+        // reason is present but is not a string (number)
+        let params = serde_json::json!({"reason": 42});
+
+        let result = tool.execute(params, &ctx).await;
+        assert!(result.is_err(), "Non-string reason should fail");
+    }
+
+    #[test]
+    fn test_escalate_does_not_require_sanitization() {
+        assert!(!EscalateTool.requires_sanitization());
+        assert!(!DeescalateTool.requires_sanitization());
+    }
 }
