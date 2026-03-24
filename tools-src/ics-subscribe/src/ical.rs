@@ -615,4 +615,258 @@ END:VCALENDAR";
         assert_eq!(events[0].summary, "First");
         assert_eq!(events[1].summary, "Second");
     }
+
+    // --- Additional tests for ics-subscribe audit ---
+
+    #[test]
+    fn test_parse_empty_input() {
+        let events = parse_vevents("");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_parse_no_vevents() {
+        let ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR";
+        let events = parse_vevents(ical);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_skip_event_with_empty_uid_and_summary() {
+        let ical = "\
+BEGIN:VEVENT\r
+DTSTART:20260315T090000Z\r
+DTEND:20260315T100000Z\r
+END:VEVENT";
+        let events = parse_vevents(ical);
+        assert!(events.is_empty(), "Event with empty UID and SUMMARY should be skipped");
+    }
+
+    #[test]
+    fn test_keep_event_with_uid_only() {
+        let ical = "\
+BEGIN:VEVENT\r
+UID:has-uid@test\r
+DTSTART:20260315T090000Z\r
+END:VEVENT";
+        let events = parse_vevents(ical);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].uid, "has-uid@test");
+        assert!(events[0].summary.is_empty());
+    }
+
+    #[test]
+    fn test_keep_event_with_summary_only() {
+        let ical = "\
+BEGIN:VEVENT\r
+SUMMARY:Has summary\r
+DTSTART:20260315T090000Z\r
+END:VEVENT";
+        let events = parse_vevents(ical);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].summary, "Has summary");
+        assert!(events[0].uid.is_empty());
+    }
+
+    #[test]
+    fn test_description_unescaping_in_parsed_event() {
+        let ical = "\
+BEGIN:VEVENT\r
+UID:desc@test\r
+SUMMARY:Meeting\r
+DTSTART:20260315T090000Z\r
+DESCRIPTION:Line 1\\nLine 2\\, with commas\\; and semicolons\r
+END:VEVENT";
+        let events = parse_vevents(ical);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].description.as_deref(),
+            Some("Line 1\nLine 2, with commas; and semicolons")
+        );
+    }
+
+    #[test]
+    fn test_parse_cancelled_event() {
+        let ical = "\
+BEGIN:VEVENT\r
+UID:cancelled@test\r
+SUMMARY:Cancelled meeting\r
+DTSTART:20260315T090000Z\r
+STATUS:CANCELLED\r
+END:VEVENT";
+        let events = parse_vevents(ical);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status.as_deref(), Some("CANCELLED"));
+    }
+
+    #[test]
+    fn test_parse_event_without_dtend() {
+        let ical = "\
+BEGIN:VEVENT\r
+UID:no-end@test\r
+SUMMARY:Open ended\r
+DTSTART:20260315T090000Z\r
+END:VEVENT";
+        let events = parse_vevents(ical);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].dtend.is_none());
+    }
+
+    #[test]
+    fn test_parse_event_without_optional_fields() {
+        let ical = "\
+BEGIN:VEVENT\r
+UID:minimal@test\r
+SUMMARY:Minimal\r
+DTSTART:20260315T090000Z\r
+END:VEVENT";
+        let events = parse_vevents(ical);
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert!(e.dtend.is_none());
+        assert!(e.location.is_none());
+        assert!(e.description.is_none());
+        assert!(e.status.is_none());
+    }
+
+    #[test]
+    fn test_normalize_datetime_short_string() {
+        // Unrecognized format passes through
+        assert_eq!(normalize_datetime("bad"), "bad");
+        assert_eq!(normalize_datetime(""), "");
+    }
+
+    #[test]
+    fn test_normalize_datetime_with_whitespace() {
+        assert_eq!(normalize_datetime("  20260315T090000Z  "), "2026-03-15T09:00:00Z");
+    }
+
+    #[test]
+    fn test_parse_property_with_multiple_params() {
+        // DTSTART;TZID=US/Eastern;VALUE=DATE-TIME:20260315T090000
+        let result = parse_property("DTSTART;TZID=US/Eastern;VALUE=DATE-TIME:20260315T090000");
+        assert!(result.is_some());
+        let (name, value) = result.unwrap();
+        assert_eq!(name, "DTSTART");
+        assert_eq!(value, "20260315T090000");
+    }
+
+    #[test]
+    fn test_parse_property_value_with_colon() {
+        // Description containing a URL with colon
+        let result = parse_property("DESCRIPTION:See https://example.com for details");
+        assert!(result.is_some());
+        let (name, value) = result.unwrap();
+        assert_eq!(name, "DESCRIPTION");
+        assert_eq!(value, "See https://example.com for details");
+    }
+
+    #[test]
+    fn test_parse_property_no_colon() {
+        assert!(parse_property("NOSEPARATOR").is_none());
+    }
+
+    #[test]
+    fn test_unfold_lines_no_continuations() {
+        let input = "LINE1\r\nLINE2\r\nLINE3";
+        let result = unfold_lines(input);
+        assert_eq!(result, "LINE1\nLINE2\nLINE3");
+    }
+
+    #[test]
+    fn test_unfold_lines_tab_continuation() {
+        let input = "DESCRIPTION:Start\r\n\tcontinued";
+        let result = unfold_lines(input);
+        assert_eq!(result, "DESCRIPTION:Startcontinued");
+    }
+
+    #[test]
+    fn test_unfold_lines_empty_input() {
+        assert_eq!(unfold_lines(""), "");
+    }
+
+    #[test]
+    fn test_unescape_trailing_backslash() {
+        assert_eq!(unescape_ical("trailing\\"), "trailing\\");
+    }
+
+    #[test]
+    fn test_unescape_uppercase_n() {
+        // iCal allows \N as well as \n for newlines
+        assert_eq!(unescape_ical("hello\\Nworld"), "hello\nworld");
+    }
+
+    #[test]
+    fn test_unescape_unknown_escape() {
+        // Unknown escape sequences preserved with backslash
+        assert_eq!(unescape_ical("hello\\xworld"), "hello\\xworld");
+    }
+
+    #[test]
+    fn test_parse_incomplete_vevent() {
+        // BEGIN:VEVENT without END:VEVENT — event should be lost
+        let ical = "\
+BEGIN:VCALENDAR\r
+BEGIN:VEVENT\r
+UID:incomplete@test\r
+SUMMARY:Never closed\r
+DTSTART:20260315T090000Z\r
+END:VCALENDAR";
+        let events = parse_vevents(ical);
+        assert!(events.is_empty(), "Incomplete VEVENT should not produce an event");
+    }
+
+    #[test]
+    fn test_parse_interleaved_non_vevent() {
+        // VTODO and VEVENT mixed — only VEVENT parsed
+        let ical = "\
+BEGIN:VCALENDAR\r
+BEGIN:VTODO\r
+UID:todo@test\r
+SUMMARY:A todo\r
+END:VTODO\r
+BEGIN:VEVENT\r
+UID:event@test\r
+SUMMARY:An event\r
+DTSTART:20260315T090000Z\r
+END:VEVENT\r
+END:VCALENDAR";
+        let events = parse_vevents(ical);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].uid, "event@test");
+    }
+
+    #[test]
+    fn test_parse_real_world_office365_format() {
+        // Office 365 ICS feeds include extra properties we ignore
+        let ical = "\
+BEGIN:VCALENDAR\r
+PRODID:-//Microsoft Corporation//Outlook 16.0 MIMEDIR//EN\r
+VERSION:2.0\r
+METHOD:PUBLISH\r
+X-WR-CALNAME:Calendar\r
+BEGIN:VEVENT\r
+DTSTART;TZID=Eastern Standard Time:20260316T140000\r
+DTEND;TZID=Eastern Standard Time:20260316T150000\r
+DTSTAMP:20260315T120000Z\r
+UID:040000008200E00074C5B7101A82E00800000000@exchange.microsoft.com\r
+SUMMARY:Team Sync\r
+LOCATION:Teams Meeting\r
+DESCRIPTION:Click here to join: https://teams.microsoft.com/l/meetup-join/...\r
+STATUS:CONFIRMED\r
+TRANSP:OPAQUE\r
+CATEGORIES:Meeting\r
+PRIORITY:5\r
+END:VEVENT\r
+END:VCALENDAR";
+        let events = parse_vevents(ical);
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.summary, "Team Sync");
+        assert_eq!(e.dtstart, "2026-03-16T14:00:00");
+        assert_eq!(e.location.as_deref(), Some("Teams Meeting"));
+        assert_eq!(e.status.as_deref(), Some("CONFIRMED"));
+        // Description should contain the URL (colon in value preserved)
+        assert!(e.description.as_deref().unwrap().contains("https://teams.microsoft.com"));
+    }
 }
