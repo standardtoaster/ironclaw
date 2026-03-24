@@ -1139,9 +1139,9 @@ impl Agent {
             && let Submission::UserInput { ref content } = submission
             && let Some(engine) = self.routine_engine().await
         {
-            let fired = engine
-                .check_event_triggers(&message.user_id, &message.channel, content)
-                .await;
+            // Use post-hook content so that BeforeInbound hooks that rewrite
+            // input are respected by event trigger matching.
+            let fired = engine.check_event_triggers(message, content).await;
             if fired > 0 {
                 tracing::debug!(
                     channel = %message.channel,
