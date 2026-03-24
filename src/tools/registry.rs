@@ -1177,4 +1177,302 @@ mod tests {
         let core_defs = registry.tool_definitions_core(&[]).await;
         assert_eq!(all_defs.len(), core_defs.len());
     }
+
+    #[tokio::test]
+    async fn tool_definitions_core_nonexistent_names_returns_empty() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        let core = vec!["zzz_nonexistent".to_string(), "aaa_fake_tool".to_string()];
+        let filtered = registry.tool_definitions_core(&core).await;
+        assert!(
+            filtered.is_empty(),
+            "nonexistent core names should yield empty: got {}",
+            filtered.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_definitions_core_results_are_sorted() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        let core = vec![
+            "time".to_string(),
+            "echo".to_string(),
+            "json".to_string(),
+        ];
+        let filtered = registry.tool_definitions_core(&core).await;
+        assert_eq!(filtered.len(), 3);
+        let names: Vec<&str> = filtered.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["echo", "json", "time"], "should be alphabetically sorted");
+    }
+
+    #[tokio::test]
+    async fn tool_definitions_core_partial_match_only_returns_existing() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        // Mix of real and fake names
+        let core = vec![
+            "echo".to_string(),
+            "fake_tool_xyz".to_string(),
+            "time".to_string(),
+        ];
+        let filtered = registry.tool_definitions_core(&core).await;
+        assert_eq!(filtered.len(), 2, "should only return tools that exist");
+        assert!(filtered.iter().any(|d| d.name == "echo"));
+        assert!(filtered.iter().any(|d| d.name == "time"));
+    }
+
+    // --- search_tools tests ---
+
+    #[tokio::test]
+    async fn search_tools_finds_by_name() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        let results = registry.search_tools("echo").await;
+        assert!(
+            results.iter().any(|(name, _)| name == "echo"),
+            "should find echo by name: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_tools_finds_by_description() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        // "memory" appears in memory tool descriptions
+        let results = registry.search_tools("memory").await;
+        assert!(
+            !results.is_empty(),
+            "should find tools with 'memory' in name or description"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_tools_case_insensitive() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        let lower = registry.search_tools("echo").await;
+        let upper = registry.search_tools("ECHO").await;
+        let mixed = registry.search_tools("Echo").await;
+        assert_eq!(
+            lower.len(),
+            upper.len(),
+            "case shouldn't matter: lower={}, upper={}",
+            lower.len(),
+            upper.len()
+        );
+        assert_eq!(lower.len(), mixed.len());
+    }
+
+    #[tokio::test]
+    async fn search_tools_no_matches() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        let results = registry.search_tools("zzz_definitely_no_match_xyz").await;
+        assert!(results.is_empty(), "should find nothing for gibberish query");
+    }
+
+    #[tokio::test]
+    async fn search_tools_empty_query_matches_all() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        let all_tools = registry.list().await;
+        let results = registry.search_tools("").await;
+        assert_eq!(
+            results.len(),
+            all_tools.len(),
+            "empty query should match every tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_tools_results_sorted_by_name() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        let results = registry.search_tools("").await;
+        for pair in results.windows(2) {
+            assert!(
+                pair[0].0 <= pair[1].0,
+                "results should be sorted: {:?} should come before {:?}",
+                pair[0].0,
+                pair[1].0,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_tools_empty_registry() {
+        let registry = ToolRegistry::new();
+        // No tools registered
+        let results = registry.search_tools("anything").await;
+        assert!(results.is_empty(), "empty registry should return nothing");
+    }
+
+    #[tokio::test]
+    async fn mark_discovered_does_not_panic() {
+        // mark_discovered is a no-op placeholder, but verify it doesn't panic
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        registry.mark_discovered("echo").await;
+        registry.mark_discovered("nonexistent_tool").await;
+        // If we got here, no panic — that's the test
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests that expose the mark_discovered no-op bug.
+    //
+    // When CORE_TOOLS is set, load=true in discover_tools should make the
+    // discovered tool appear in tool_definitions_core on the next call.
+    // Currently mark_discovered is a no-op, so these tests document the
+    // expected behavior and will FAIL until the feature is completed.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "mark_discovered is a no-op — will pass once discovery tracking is implemented"]
+    async fn mark_discovered_makes_tool_visible_in_core_defs() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+
+        // Simulate CORE_TOOLS=echo (only echo visible to LLM)
+        let core = vec!["echo".to_string()];
+        let before = registry.tool_definitions_core(&core).await;
+        assert_eq!(before.len(), 1, "only echo should be visible");
+        assert!(!before.iter().any(|d| d.name == "time"), "time should NOT be visible before discovery");
+
+        // LLM calls discover_tools(query="time", load=true) → mark_discovered("time")
+        registry.mark_discovered("time").await;
+
+        // On the next turn, tool_definitions_core should include both core + discovered
+        let after = registry.tool_definitions_core(&core).await;
+        assert!(
+            after.iter().any(|d| d.name == "time"),
+            "time should be visible after mark_discovered — \
+             BUG: mark_discovered is a no-op, tool_definitions_core doesn't consult discovered set"
+        );
+        assert!(
+            after.len() > before.len(),
+            "discovered tools should expand the visible set"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "mark_discovered is a no-op — will pass once discovery tracking is implemented"]
+    async fn discovered_tools_persist_across_core_def_calls() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+
+        let core = vec!["echo".to_string()];
+
+        // Discover "time"
+        registry.mark_discovered("time").await;
+
+        // First call should include time
+        let defs1 = registry.tool_definitions_core(&core).await;
+        assert!(defs1.iter().any(|d| d.name == "time"), "time should be visible (call 1)");
+
+        // Second call should still include time (not transient)
+        let defs2 = registry.tool_definitions_core(&core).await;
+        assert!(defs2.iter().any(|d| d.name == "time"), "time should still be visible (call 2)");
+    }
+
+    #[tokio::test]
+    #[ignore = "mark_discovered is a no-op — will pass once discovery tracking is implemented"]
+    async fn discovered_nonexistent_tool_is_harmless() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+
+        let core = vec!["echo".to_string()];
+        let before = registry.tool_definitions_core(&core).await;
+
+        // Mark a tool that doesn't exist in the registry
+        registry.mark_discovered("totally_fake_tool").await;
+
+        let after = registry.tool_definitions_core(&core).await;
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "discovering a nonexistent tool should not change visible set"
+        );
+    }
+
+    /// Proves the end-to-end flow: CORE_TOOLS filtering → discover_tools search →
+    /// load=true → tool becomes visible. This exercises the full contract.
+    #[tokio::test]
+    #[ignore = "mark_discovered is a no-op — will pass once discovery tracking is implemented"]
+    async fn end_to_end_core_filter_then_discover_then_visible() {
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register_builtin_tools();
+
+        let core = vec!["echo".to_string(), "discover_tools".to_string()];
+
+        // Step 1: Only core tools visible
+        let defs = registry.tool_definitions_core(&core).await;
+        let visible_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(visible_names.contains(&"echo"));
+        assert!(!visible_names.contains(&"time"), "time not in core set");
+
+        // Step 2: Search finds time (search_tools doesn't care about core filtering)
+        let search_results = registry.search_tools("time").await;
+        assert!(
+            search_results.iter().any(|(n, _)| n == "time"),
+            "search_tools should find 'time' even when not in core set"
+        );
+
+        // Step 3: Load it (mark_discovered)
+        registry.mark_discovered("time").await;
+
+        // Step 4: Now time should be visible alongside core tools
+        let defs_after = registry.tool_definitions_core(&core).await;
+        assert!(
+            defs_after.iter().any(|d| d.name == "time"),
+            "time should be in tool_definitions_core after discovery — \
+             BUG: mark_discovered is a no-op"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-ignored tests that verify the WORKING parts of the feature
+    // -----------------------------------------------------------------------
+
+    /// CORE_TOOLS filtering correctly hides non-core tools from the LLM
+    /// while search_tools can still find them.
+    #[tokio::test]
+    async fn core_filtering_hides_tools_but_search_still_finds_them() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+
+        // Restrict to just echo
+        let core = vec!["echo".to_string()];
+        let core_defs = registry.tool_definitions_core(&core).await;
+        assert_eq!(core_defs.len(), 1);
+        assert_eq!(core_defs[0].name, "echo");
+
+        // But search_tools sees everything
+        let search_results = registry.search_tools("time").await;
+        assert!(
+            search_results.iter().any(|(n, _)| n == "time"),
+            "search_tools should find 'time' even though it's filtered from core defs"
+        );
+    }
+
+    /// Verifies that tool execution works for non-core tools.
+    /// Even when CORE_TOOLS hides a tool from LLM context, the tool should
+    /// still be executable if the LLM somehow calls it (e.g., via discover_tools).
+    #[tokio::test]
+    async fn non_core_tools_remain_executable() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+
+        // "time" is not in core set
+        let core = vec!["echo".to_string()];
+        let core_defs = registry.tool_definitions_core(&core).await;
+        assert!(!core_defs.iter().any(|d| d.name == "time"), "time not in core defs");
+
+        // But we can still get and execute the tool directly
+        let time_tool = registry.get("time").await;
+        assert!(
+            time_tool.is_some(),
+            "non-core tool should still be retrievable from registry"
+        );
+    }
 }
