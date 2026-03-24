@@ -476,7 +476,7 @@ pub async fn chat_completions_handler(
     }
 
     let llm = state
-        .llm_provider_for_user(&state.user_id)
+        .llm_provider_for_user(&user.user_id)
         .await
         .ok_or_else(|| {
             openai_error(
@@ -806,9 +806,10 @@ async fn send_finish_chunk(
 
 pub async fn models_handler(
     State(state): State<Arc<GatewayState>>,
+    super::auth::AuthenticatedUser(user): super::auth::AuthenticatedUser,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<OpenAiErrorResponse>)> {
     let llm = state
-        .llm_provider_for_user(&state.user_id)
+        .llm_provider_for_user(&user.user_id)
         .await
         .ok_or_else(|| {
             openai_error(

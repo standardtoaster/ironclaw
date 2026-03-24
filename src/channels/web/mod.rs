@@ -309,6 +309,15 @@ impl GatewayChannel {
         self
     }
 
+    /// Inject the per-user token configuration for multi-tenant LLM provider selection.
+    pub fn with_user_tokens(
+        mut self,
+        tokens: std::collections::HashMap<String, crate::config::UserTokenConfig>,
+    ) -> Self {
+        self.rebuild_state(|s| s.user_tokens = Some(tokens));
+        self
+    }
+
     /// Inject registry catalog entries for the available extensions API.
     pub fn with_registry_entries(mut self, entries: Vec<crate::extensions::RegistryEntry>) -> Self {
         self.rebuild_state(|s| s.registry_entries = entries);

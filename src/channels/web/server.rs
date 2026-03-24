@@ -3538,6 +3538,8 @@ mod tests {
             cost_guard: None,
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
+            user_llm_providers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            user_tokens: None,
             active_config: ActiveConfigSnapshot::default(),
             secrets_store: None,
             db_auth: None,
