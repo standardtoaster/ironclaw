@@ -589,6 +589,217 @@ END:VEVENT";
         assert_eq!(rfc3339_to_ical("20260315T090000Z"), "20260315T090000Z");
     }
 
+    // ---- Edge case tests ----
+
+    #[test]
+    fn test_parse_empty_ical() {
+        let ical = "BEGIN:VCALENDAR\r\nEND:VCALENDAR";
+        let events = parse_vevents(ical);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_parse_vevent_without_uid_but_with_summary() {
+        // Events with only a summary and no UID should still be included
+        let ical = "\
+BEGIN:VEVENT\r
+SUMMARY:No UID event\r
+DTSTART:20260315T090000Z\r
+END:VEVENT";
+        let events = parse_vevents(ical);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].uid.is_empty());
+        assert_eq!(events[0].summary, "No UID event");
+    }
+
+    #[test]
+    fn test_parse_vevent_without_uid_or_summary_is_dropped() {
+        // Events with neither UID nor summary are dropped
+        let ical = "\
+BEGIN:VEVENT\r
+DTSTART:20260315T090000Z\r
+END:VEVENT";
+        let events = parse_vevents(ical);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_parse_vevent_with_rrule_ignored() {
+        // RRULE lines should be ignored gracefully — no crash, no data corruption
+        let ical = "\
+BEGIN:VEVENT\r
+UID:recur@test\r
+SUMMARY:Weekly meeting\r
+DTSTART:20260315T090000Z\r
+DTEND:20260315T100000Z\r
+RRULE:FREQ=WEEKLY;BYDAY=MO\r
+END:VEVENT";
+        let events = parse_vevents(ical);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].uid, "recur@test");
+        assert_eq!(events[0].summary, "Weekly meeting");
+        // RRULE is silently ignored — only the single occurrence is returned
+    }
+
+    #[test]
+    fn test_parse_vevent_description_with_escaped_chars() {
+        let ical = "\
+BEGIN:VEVENT\r
+UID:esc@test\r
+SUMMARY:Test\r
+DTSTART:20260315T090000Z\r
+DESCRIPTION:Line 1\\nLine 2\\, with comma\\; and semicolon\r
+END:VEVENT";
+        let events = parse_vevents(ical);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].description.as_deref(),
+            Some("Line 1\nLine 2, with comma; and semicolon")
+        );
+    }
+
+    #[test]
+    fn test_parse_cancelled_event() {
+        let ical = "\
+BEGIN:VEVENT\r
+UID:cancelled@test\r
+SUMMARY:Cancelled meeting\r
+DTSTART:20260315T090000Z\r
+STATUS:CANCELLED\r
+END:VEVENT";
+        let events = parse_vevents(ical);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status.as_deref(), Some("CANCELLED"));
+    }
+
+    #[test]
+    fn test_normalize_datetime_empty_string() {
+        assert_eq!(normalize_datetime(""), "");
+    }
+
+    #[test]
+    fn test_normalize_datetime_short_garbage() {
+        // Short non-date string should pass through unchanged
+        assert_eq!(normalize_datetime("abc"), "abc");
+    }
+
+    #[test]
+    fn test_build_vcalendar_start_date_overrides_start_datetime() {
+        // When both start_date and start_datetime are provided,
+        // start_date wins (it's checked first in the if-chain)
+        let fields = EventFields {
+            uid: "both@test".to_string(),
+            summary: "Both dates".to_string(),
+            start_datetime: Some("2026-03-15T09:00:00Z".to_string()),
+            end_datetime: None,
+            start_date: Some("2026-03-20".to_string()),
+            end_date: None,
+            location: None,
+            description: None,
+            timezone: None,
+        };
+        let result = build_vcalendar(&fields, 1773619200000).unwrap();
+        // All-day takes precedence
+        assert!(result.contains("DTSTART;VALUE=DATE:20260320"));
+        assert!(!result.contains("DTSTART:20260315"));
+    }
+
+    #[test]
+    fn test_build_vcalendar_uses_crlf_line_endings() {
+        // iCal spec requires CRLF line endings
+        let fields = EventFields {
+            uid: "crlf@test".to_string(),
+            summary: "Test".to_string(),
+            start_datetime: Some("2026-03-15T09:00:00Z".to_string()),
+            end_datetime: None,
+            start_date: None,
+            end_date: None,
+            location: None,
+            description: None,
+            timezone: None,
+        };
+        let result = build_vcalendar(&fields, 1773619200000).unwrap();
+        assert!(result.contains("\r\n"), "iCal output must use CRLF line endings");
+    }
+
+    #[test]
+    fn test_date_to_ical_rejects_short_date() {
+        // "2026-3-5" strips to "20265" which is only 5 chars
+        assert!(date_to_ical("2026-3-5").is_err());
+    }
+
+    #[test]
+    fn test_date_to_ical_rejects_non_numeric() {
+        assert!(date_to_ical("abcd-ef-gh").is_err());
+    }
+
+    #[test]
+    fn test_rfc3339_to_ical_non_utc() {
+        // Non-UTC datetime without Z should strip dashes/colons
+        assert_eq!(rfc3339_to_ical("2026-03-15T09:00:00"), "20260315T090000");
+    }
+
+    #[test]
+    fn test_unescape_trailing_backslash() {
+        // Trailing backslash with no following char
+        assert_eq!(unescape_ical("trailing\\"), "trailing\\");
+    }
+
+    #[test]
+    fn test_unescape_unknown_escape() {
+        // Unknown escape sequence like \x should preserve both chars
+        assert_eq!(unescape_ical("test\\xvalue"), "test\\xvalue");
+    }
+
+    #[test]
+    fn test_unfold_lines_no_continuations() {
+        let input = "LINE1\r\nLINE2\r\nLINE3";
+        let result = unfold_lines(input);
+        assert_eq!(result, "LINE1\nLINE2\nLINE3");
+    }
+
+    #[test]
+    fn test_parse_property_no_params() {
+        let result = parse_property("SUMMARY:Team meeting");
+        assert_eq!(result, Some(("SUMMARY".to_string(), "Team meeting".to_string())));
+    }
+
+    #[test]
+    fn test_parse_property_with_params() {
+        let result = parse_property("DTSTART;TZID=America/New_York:20260315T090000");
+        assert_eq!(result, Some(("DTSTART".to_string(), "20260315T090000".to_string())));
+    }
+
+    #[test]
+    fn test_parse_property_no_colon() {
+        let result = parse_property("INVALID LINE");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_property_value_with_colon() {
+        // URL values contain colons
+        let result = parse_property("URL:https://example.com/event");
+        assert_eq!(result, Some(("URL".to_string(), "https://example.com/event".to_string())));
+    }
+
+    #[test]
+    fn test_millis_to_ical_utc_epoch() {
+        // Unix epoch: 1970-01-01T00:00:00Z
+        assert_eq!(millis_to_ical_utc(0), "19700101T000000Z");
+    }
+
+    #[test]
+    fn test_millis_to_ical_utc_leap_year() {
+        // 2024-02-29T12:00:00Z (leap year)
+        // 2024-02-29 is day 60 of 2024 (leap year)
+        // 1706572800 = 2024-01-30T00:00:00Z? Let's use a known value
+        // 2024-02-29T00:00:00Z = 1709164800 seconds
+        let millis = 1709164800000u64;
+        let result = millis_to_ical_utc(millis);
+        assert_eq!(result, "20240229T000000Z");
+    }
+
     #[test]
     fn test_multiple_events() {
         let ical = "\

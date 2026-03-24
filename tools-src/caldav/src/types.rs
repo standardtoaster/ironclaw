@@ -221,3 +221,183 @@ pub struct DeleteEventResult {
     pub uid: String,
     pub deleted: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deserialize_list_calendars_action() {
+        let json = r#"{"action": "list_calendars"}"#;
+        let action: CalDavAction = serde_json::from_str(json).unwrap();
+        assert!(matches!(action, CalDavAction::ListCalendars { base_url: None }));
+    }
+
+    #[test]
+    fn test_deserialize_list_calendars_with_base_url() {
+        let json = r#"{"action": "list_calendars", "base_url": "https://caldav.icloud.com"}"#;
+        let action: CalDavAction = serde_json::from_str(json).unwrap();
+        match action {
+            CalDavAction::ListCalendars { base_url } => {
+                assert_eq!(base_url.as_deref(), Some("https://caldav.icloud.com"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_list_events_action() {
+        let json = r#"{"action": "list_events", "calendar_url": "https://cal.example.com/user/cal/", "time_min": "2026-03-01T00:00:00Z", "time_max": "2026-03-31T23:59:59Z"}"#;
+        let action: CalDavAction = serde_json::from_str(json).unwrap();
+        match action {
+            CalDavAction::ListEvents { calendar_url, time_min, time_max } => {
+                assert_eq!(calendar_url.as_deref(), Some("https://cal.example.com/user/cal/"));
+                assert_eq!(time_min, "2026-03-01T00:00:00Z");
+                assert_eq!(time_max, "2026-03-31T23:59:59Z");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_list_events_without_calendar_url() {
+        let json = r#"{"action": "list_events", "time_min": "2026-03-01T00:00:00Z", "time_max": "2026-03-31T23:59:59Z"}"#;
+        let action: CalDavAction = serde_json::from_str(json).unwrap();
+        match action {
+            CalDavAction::ListEvents { calendar_url, .. } => {
+                assert!(calendar_url.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_create_event_minimal() {
+        let json = r#"{"action": "create_event", "calendar_url": "https://cal.example.com/user/cal/", "summary": "Test Event", "start_datetime": "2026-03-15T09:00:00Z"}"#;
+        let action: CalDavAction = serde_json::from_str(json).unwrap();
+        match action {
+            CalDavAction::CreateEvent { calendar_url, summary, start_datetime, end_datetime, location, description, timezone, .. } => {
+                assert_eq!(calendar_url, "https://cal.example.com/user/cal/");
+                assert_eq!(summary, "Test Event");
+                assert_eq!(start_datetime.as_deref(), Some("2026-03-15T09:00:00Z"));
+                assert!(end_datetime.is_none());
+                assert!(location.is_none());
+                assert!(description.is_none());
+                assert!(timezone.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_create_event_allday() {
+        let json = r#"{"action": "create_event", "calendar_url": "https://cal.example.com/user/cal/", "summary": "Day Off", "start_date": "2026-03-20", "end_date": "2026-03-21"}"#;
+        let action: CalDavAction = serde_json::from_str(json).unwrap();
+        match action {
+            CalDavAction::CreateEvent { start_date, end_date, start_datetime, .. } => {
+                assert_eq!(start_date.as_deref(), Some("2026-03-20"));
+                assert_eq!(end_date.as_deref(), Some("2026-03-21"));
+                assert!(start_datetime.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_update_event() {
+        let json = r#"{"action": "update_event", "calendar_url": "https://cal.example.com/cal/", "uid": "abc123", "summary": "Updated Title"}"#;
+        let action: CalDavAction = serde_json::from_str(json).unwrap();
+        match action {
+            CalDavAction::UpdateEvent { uid, summary, .. } => {
+                assert_eq!(uid, "abc123");
+                assert_eq!(summary.as_deref(), Some("Updated Title"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_delete_event() {
+        let json = r#"{"action": "delete_event", "calendar_url": "https://cal.example.com/cal/", "uid": "abc123"}"#;
+        let action: CalDavAction = serde_json::from_str(json).unwrap();
+        match action {
+            CalDavAction::DeleteEvent { uid, .. } => {
+                assert_eq!(uid, "abc123");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_unknown_action_fails() {
+        let json = r#"{"action": "unknown_action"}"#;
+        let result = serde_json::from_str::<CalDavAction>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_missing_action_fails() {
+        let json = r#"{"calendar_url": "https://cal.example.com/cal/"}"#;
+        let result = serde_json::from_str::<CalDavAction>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_caldav_config_deserialization() {
+        let json = r#"{"base_url": "https://caldav.icloud.com", "username": "user@example.com"}"#;
+        let config: CalDavConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.base_url, "https://caldav.icloud.com");
+        assert_eq!(config.username, "user@example.com");
+        assert!(config.default_calendar_url.is_none());
+    }
+
+    #[test]
+    fn test_caldav_config_with_default_calendar() {
+        let json = r#"{"base_url": "https://caldav.icloud.com", "username": "user@example.com", "default_calendar_url": "https://caldav.icloud.com/123/cal/"}"#;
+        let config: CalDavConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.default_calendar_url.as_deref(), Some("https://caldav.icloud.com/123/cal/"));
+    }
+
+    #[test]
+    fn test_event_serialization_skips_none_fields() {
+        let event = Event {
+            uid: "test@uid".to_string(),
+            summary: "Test".to_string(),
+            start: "2026-03-15T09:00:00Z".to_string(),
+            end: None,
+            location: None,
+            description: None,
+            status: None,
+            href: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("location"));
+        assert!(!json.contains("description"));
+        assert!(!json.contains("status"));
+        assert!(!json.contains("href"));
+        assert!(json.contains("uid"));
+        assert!(json.contains("summary"));
+        assert!(json.contains("start"));
+    }
+
+    #[test]
+    fn test_busy_interval_serialization() {
+        let busy = BusyInterval {
+            start: "2026-03-15T09:00:00Z".to_string(),
+            end: "2026-03-15T10:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&busy).unwrap();
+        assert!(json.contains("2026-03-15T09:00:00Z"));
+        assert!(json.contains("2026-03-15T10:00:00Z"));
+    }
+
+    #[test]
+    fn test_delete_event_result_serialization() {
+        let result = DeleteEventResult {
+            uid: "abc123".to_string(),
+            deleted: true,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"deleted\":true"));
+    }
+}

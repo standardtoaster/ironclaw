@@ -724,4 +724,124 @@ mod tests {
     fn test_xml_unescape() {
         assert_eq!(xml_unescape("a&amp;b&lt;c"), "a&b<c");
     }
+
+    // ---- Edge case tests ----
+
+    #[test]
+    fn test_to_ical_datetime_non_utc_gets_z_appended() {
+        // Non-UTC datetime without Z should get Z appended for CalDAV time-range
+        assert_eq!(to_ical_datetime("2026-03-15T09:00:00"), "20260315T090000Z");
+    }
+
+    #[test]
+    fn test_to_ical_datetime_already_compact_passthrough() {
+        assert_eq!(to_ical_datetime("20260315T090000Z"), "20260315T090000Z");
+    }
+
+    #[test]
+    fn test_xml_escape_all_special_chars() {
+        assert_eq!(
+            xml_escape("<tag attr=\"val\" & 'quoted'>"),
+            "&lt;tag attr=&quot;val&quot; &amp; &apos;quoted&apos;&gt;"
+        );
+    }
+
+    #[test]
+    fn test_xml_escape_empty() {
+        assert_eq!(xml_escape(""), "");
+    }
+
+    #[test]
+    fn test_resolve_href_relative_without_leading_slash() {
+        assert_eq!(
+            resolve_href("https://caldav.icloud.com/user", "calendars/work/"),
+            "https://caldav.icloud.com/user/calendars/work/"
+        );
+    }
+
+    #[test]
+    fn test_resolve_href_no_scheme() {
+        // If base_url has no scheme, just return href
+        assert_eq!(resolve_href("bare-host/path", "/cal/"), "/cal/");
+    }
+
+    #[test]
+    fn test_href_to_name_no_slashes() {
+        assert_eq!(href_to_name("simple-name"), "simple-name");
+    }
+
+    #[test]
+    fn test_href_to_name_empty_string() {
+        assert_eq!(href_to_name(""), "calendar");
+    }
+
+    #[test]
+    fn test_xml_extract_text_missing_tag() {
+        let xml = "<d:response><d:href>/cal/</d:href></d:response>";
+        assert_eq!(xml_extract_text(xml, "displayname"), None);
+    }
+
+    #[test]
+    fn test_xml_extract_text_empty_tag() {
+        let xml = "<d:response><d:displayname></d:displayname></d:response>";
+        assert_eq!(xml_extract_text(xml, "displayname"), None);
+    }
+
+    #[test]
+    fn test_xml_split_responses_empty() {
+        let xml = "<d:multistatus></d:multistatus>";
+        let responses = xml_split_responses(xml);
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn test_xml_split_responses_single() {
+        let xml = "<d:multistatus><d:response><d:href>/a</d:href></d:response></d:multistatus>";
+        let responses = xml_split_responses(xml);
+        assert_eq!(responses.len(), 1);
+    }
+
+    #[test]
+    fn test_xml_contains_tag_self_closing() {
+        assert!(xml_contains_tag("<d:resourcetype><cal:calendar/></d:resourcetype>", "calendar"));
+    }
+
+    #[test]
+    fn test_xml_contains_tag_open_close() {
+        assert!(xml_contains_tag("<d:resourcetype><cal:calendar></cal:calendar></d:resourcetype>", "calendar"));
+    }
+
+    #[test]
+    fn test_xml_contains_tag_no_namespace() {
+        assert!(xml_contains_tag("<resourcetype><calendar/></resourcetype>", "calendar"));
+    }
+
+    #[test]
+    fn test_xml_unescape_all_entities() {
+        assert_eq!(
+            xml_unescape("&amp; &lt; &gt; &quot; &apos;"),
+            "& < > \" '"
+        );
+    }
+
+    #[test]
+    fn test_xml_unescape_no_entities() {
+        assert_eq!(xml_unescape("plain text"), "plain text");
+    }
+
+    #[test]
+    fn test_tag_name_matches_with_trailing_space() {
+        // Tags can have attributes after the name
+        assert!(tag_name_matches("response attr=\"val\">", "response"));
+    }
+
+    #[test]
+    fn test_tag_name_matches_self_closing() {
+        assert!(tag_name_matches("calendar/>", "calendar"));
+    }
+
+    #[test]
+    fn test_tag_name_matches_exact() {
+        assert!(!tag_name_matches("calendar-data>", "calendar"));
+    }
 }
