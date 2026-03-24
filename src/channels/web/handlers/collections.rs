@@ -17,6 +17,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
 use crate::db::structured::{
     CollectionSchema, Filter, FilterOp, StructuredStore, append_history, init_history,
@@ -117,7 +118,7 @@ async fn resolve_collection_owner(
 /// List all collection schemas visible to the authenticated user (own + scopes).
 pub async fn collections_list_handler(
     State(state): State<Arc<GatewayState>>,
-
+    AuthenticatedUser(user): AuthenticatedUser,
 ) -> impl IntoResponse {
     let db = match &state.store {
         Some(db) => Arc::clone(db),
@@ -133,7 +134,7 @@ pub async fn collections_list_handler(
     let mut all_collections = Vec::new();
 
     // Collect user IDs to query: own + scopes.
-    let mut user_ids = vec![state.user_id.clone()];
+    let mut user_ids = vec![user.user_id.clone()];
     user_ids.extend(Vec::<String>::new().iter().cloned());
 
     for uid in &user_ids {
@@ -171,7 +172,7 @@ pub async fn collections_list_handler(
 /// Query records from a collection. Supports equality filtering via query params.
 pub async fn collections_query_handler(
     State(state): State<Arc<GatewayState>>,
-
+    AuthenticatedUser(user): AuthenticatedUser,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
@@ -188,7 +189,7 @@ pub async fn collections_query_handler(
 
     let owner = match resolve_collection_owner(
         db.as_ref(),
-        &state.user_id,
+        &user.user_id,
         &Vec::<String>::new(),
         &name,
     )
@@ -259,7 +260,7 @@ pub async fn collections_query_handler(
 /// Insert a new record. Injects `_lineage` for provenance. Fires `CollectionWriteEvent`.
 pub async fn collections_insert_handler(
     State(state): State<Arc<GatewayState>>,
-
+    AuthenticatedUser(user): AuthenticatedUser,
     Path(name): Path<String>,
     Json(req): Json<CollectionInsertRequest>,
 ) -> impl IntoResponse {
@@ -276,7 +277,7 @@ pub async fn collections_insert_handler(
 
     let owner = match resolve_collection_owner(
         db.as_ref(),
-        &state.user_id,
+        &user.user_id,
         &Vec::<String>::new(),
         &name,
     )
@@ -351,7 +352,7 @@ pub async fn collections_insert_handler(
 /// Update fields on an existing record by ID.
 pub async fn collections_update_handler(
     State(state): State<Arc<GatewayState>>,
-
+    AuthenticatedUser(user): AuthenticatedUser,
     Path((name, id)): Path<(String, Uuid)>,
     Json(req): Json<CollectionUpdateRequest>,
 ) -> impl IntoResponse {
@@ -368,7 +369,7 @@ pub async fn collections_update_handler(
 
     let owner = match resolve_collection_owner(
         db.as_ref(),
-        &state.user_id,
+        &user.user_id,
         &Vec::<String>::new(),
         &name,
     )
@@ -436,7 +437,7 @@ pub async fn collections_update_handler(
 /// Delete a record by ID.
 pub async fn collections_delete_handler(
     State(state): State<Arc<GatewayState>>,
-
+    AuthenticatedUser(user): AuthenticatedUser,
     Path((name, id)): Path<(String, Uuid)>,
 ) -> impl IntoResponse {
     let db = match &state.store {
@@ -452,7 +453,7 @@ pub async fn collections_delete_handler(
 
     let owner = match resolve_collection_owner(
         db.as_ref(),
-        &state.user_id,
+        &user.user_id,
         &Vec::<String>::new(),
         &name,
     )
@@ -494,7 +495,7 @@ pub async fn collections_delete_handler(
 /// Register (or update) a collection schema.
 pub async fn collections_register_handler(
     State(state): State<Arc<GatewayState>>,
-
+    AuthenticatedUser(user): AuthenticatedUser,
     Json(schema): Json<CollectionSchema>,
 ) -> impl IntoResponse {
     let db = match &state.store {
@@ -508,7 +509,7 @@ pub async fn collections_register_handler(
         }
     };
 
-    match db.register_collection(&state.user_id, &schema).await {
+    match db.register_collection(&user.user_id, &schema).await {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({
