@@ -164,7 +164,9 @@ fn score_skill(skill: &LoadedSkill, message_lower: &str, message_original: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::{ActivationCriteria, LoadedSkill, SkillManifest, SkillSource, SkillTrust};
+    use crate::skills::{
+        ActivationCriteria, LoadedSkill, SkillManifest, SkillScope, SkillSource, SkillTrust,
+    };
     use std::path::PathBuf;
 
     fn make_skill(name: &str, keywords: &[&str], tags: &[&str], patterns: &[&str]) -> LoadedSkill {
@@ -514,6 +516,194 @@ mod tests {
         assert!(
             result.is_empty(),
             "exclude_keyword veto should be case-insensitive"
+        );
+    }
+
+    // ── Per-user scope filtering tests ─────────────────────────────────
+
+    fn make_scoped_skill(
+        name: &str,
+        keywords: &[&str],
+        scope: Option<SkillScope>,
+    ) -> LoadedSkill {
+        let mut skill = make_skill(name, keywords, &[], &[]);
+        skill.manifest.scope = scope;
+        skill
+    }
+
+    #[test]
+    fn test_prefilter_scope_single_matching_user() {
+        let skills = vec![make_scoped_skill(
+            "andrew-only",
+            &["deploy"],
+            Some(SkillScope::Single("andrew".to_string())),
+        )];
+        let result = prefilter_skills(
+            "deploy the app",
+            &skills,
+            3,
+            MAX_SKILL_CONTEXT_TOKENS,
+            Some("andrew"),
+        );
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_prefilter_scope_single_non_matching_user() {
+        let skills = vec![make_scoped_skill(
+            "andrew-only",
+            &["deploy"],
+            Some(SkillScope::Single("andrew".to_string())),
+        )];
+        let result = prefilter_skills(
+            "deploy the app",
+            &skills,
+            3,
+            MAX_SKILL_CONTEXT_TOKENS,
+            Some("grace"),
+        );
+        assert!(
+            result.is_empty(),
+            "grace should not see andrew-scoped skill"
+        );
+    }
+
+    #[test]
+    fn test_prefilter_scope_multiple_matching_users() {
+        let skills = vec![make_scoped_skill(
+            "family-skill",
+            &["grocery"],
+            Some(SkillScope::Multiple(vec![
+                "andrew".to_string(),
+                "grace".to_string(),
+            ])),
+        )];
+        let result = prefilter_skills(
+            "grocery list",
+            &skills,
+            3,
+            MAX_SKILL_CONTEXT_TOKENS,
+            Some("grace"),
+        );
+        assert_eq!(result.len(), 1, "grace is in the Multiple scope list");
+    }
+
+    #[test]
+    fn test_prefilter_no_scope_available_to_all_users() {
+        let skills = vec![make_scoped_skill("universal", &["help"], None)];
+        let result = prefilter_skills(
+            "help me",
+            &skills,
+            3,
+            MAX_SKILL_CONTEXT_TOKENS,
+            Some("anyone"),
+        );
+        assert_eq!(result.len(), 1, "unscoped skill available to all");
+    }
+
+    #[test]
+    fn test_prefilter_none_user_id_bypasses_scope() {
+        let skills = vec![make_scoped_skill(
+            "andrew-only",
+            &["deploy"],
+            Some(SkillScope::Single("andrew".to_string())),
+        )];
+        let result = prefilter_skills(
+            "deploy the app",
+            &skills,
+            3,
+            MAX_SKILL_CONTEXT_TOKENS,
+            None,
+        );
+        assert_eq!(
+            result.len(),
+            1,
+            "None user_id should bypass scope filtering"
+        );
+    }
+
+    #[test]
+    fn test_prefilter_scope_filtering_blocks_despite_keyword_match() {
+        let skills = vec![make_scoped_skill(
+            "andrew-deploy",
+            &["deploy", "release", "ship"],
+            Some(SkillScope::Single("andrew".to_string())),
+        )];
+        let result = prefilter_skills(
+            "deploy release ship everything",
+            &skills,
+            3,
+            MAX_SKILL_CONTEXT_TOKENS,
+            Some("grace"),
+        );
+        assert!(
+            result.is_empty(),
+            "scope filter should block even with perfect keyword match"
+        );
+    }
+
+    #[test]
+    fn test_prefilter_mixed_scoped_and_unscoped() {
+        let skills = vec![
+            make_scoped_skill(
+                "andrew-deploy",
+                &["deploy"],
+                Some(SkillScope::Single("andrew".to_string())),
+            ),
+            make_scoped_skill("universal-deploy", &["deploy"], None),
+        ];
+        let result = prefilter_skills(
+            "deploy the app",
+            &skills,
+            3,
+            MAX_SKILL_CONTEXT_TOKENS,
+            Some("grace"),
+        );
+        assert_eq!(result.len(), 1, "only the unscoped skill should pass");
+        assert_eq!(result[0].manifest.name, "universal-deploy");
+    }
+
+    #[test]
+    fn test_prefilter_scope_empty_multiple_matches_nobody() {
+        let skills = vec![make_scoped_skill(
+            "empty-scope",
+            &["test"],
+            Some(SkillScope::Multiple(vec![])),
+        )];
+        let result = prefilter_skills(
+            "test something",
+            &skills,
+            3,
+            MAX_SKILL_CONTEXT_TOKENS,
+            Some("andrew"),
+        );
+        assert!(
+            result.is_empty(),
+            "empty Multiple scope should match nobody"
+        );
+    }
+
+    #[test]
+    fn test_prefilter_scope_with_exclude_keywords_both_filters_apply() {
+        let mut skill = make_scoped_skill(
+            "andrew-cooking",
+            &["recipe"],
+            Some(SkillScope::Single("andrew".to_string())),
+        );
+        let excl = vec!["restaurant".to_string()];
+        skill.lowercased_exclude_keywords = excl.iter().map(|k| k.to_lowercase()).collect();
+        skill.manifest.activation.exclude_keywords = excl;
+        let skills = vec![skill];
+        let result = prefilter_skills(
+            "recipe from that restaurant",
+            &skills,
+            3,
+            MAX_SKILL_CONTEXT_TOKENS,
+            Some("andrew"),
+        );
+        assert!(
+            result.is_empty(),
+            "exclude_keyword should block even for matching scope"
         );
     }
 }
