@@ -942,30 +942,48 @@ fn schema_with_no_fields_allows_system_fields() {
 
 #[test]
 fn number_coercion_integer_string() {
-    let schema = time_entry_schema();
-    let data = serde_json::json!({
-        "date": "2025-01-01",
-        "hours": "8",
-        "category": "development",
-        "description": "coding"
-    });
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "count".to_string(),
+        FieldDef {
+            field_type: FieldType::Number,
+            required: true,
+            default: None,
+        },
+    );
+    let schema = CollectionSchema {
+        collection: "nums".to_string(),
+        description: None,
+        fields,
+        source_scope: None,
+    };
+    let data = serde_json::json!({"count": "8"});
     let result = schema.validate_record(&data).unwrap();
     // "8" should be coerced to 8
-    assert_eq!(result["hours"], serde_json::json!(8));
-    assert!(result["hours"].is_number());
+    assert_eq!(result["count"], serde_json::json!(8));
+    assert!(result["count"].is_number());
 }
 
 #[test]
 fn number_coercion_float_string() {
-    let schema = time_entry_schema();
-    let data = serde_json::json!({
-        "date": "2025-01-01",
-        "hours": "7.5",
-        "category": "development",
-        "description": "coding"
-    });
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "amount".to_string(),
+        FieldDef {
+            field_type: FieldType::Number,
+            required: true,
+            default: None,
+        },
+    );
+    let schema = CollectionSchema {
+        collection: "nums".to_string(),
+        description: None,
+        fields,
+        source_scope: None,
+    };
+    let data = serde_json::json!({"amount": "7.5"});
     let result = schema.validate_record(&data).unwrap();
-    assert_eq!(result["hours"], serde_json::json!(7.5));
+    assert_eq!(result["amount"], serde_json::json!(7.5));
 }
 
 #[test]
@@ -1134,7 +1152,7 @@ fn alter_remove_enum_value_from_non_enum_field() {
     let schema = time_entry_schema();
     let alt = Alteration {
         operation: AlterOperation::RemoveEnumValue,
-        field: "hours".to_string(), // Number field, not enum
+        field: "notes".to_string(), // Text field, not enum
         field_type: None,
         required: None,
         default: None,
