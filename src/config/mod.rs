@@ -48,7 +48,7 @@ use crate::error::ConfigError;
 use crate::settings::Settings;
 
 // Re-export all public types so `crate::config::FooConfig` continues to work.
-pub use self::agent::AgentConfig;
+pub use self::agent::{AgentConfig, ToolDescriptionMode};
 pub use self::builder::BuilderModeConfig;
 pub use self::channels::{
     ChannelsConfig, CliConfig, DEFAULT_GATEWAY_PORT, GatewayConfig, GatewayOidcConfig, HttpConfig,

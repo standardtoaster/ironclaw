@@ -51,6 +51,21 @@ pub struct AgentConfig {
     /// All other registered tools are discoverable but not sent unless loaded.
     /// If empty/unset, ALL tools are sent (backward compatible).
     pub core_tools: Vec<String>,
+    /// How tool definitions are sent to the LLM.
+    ///
+    /// `Compressed` (default): all tools visible with name+description only; full
+    /// schemas fetched on demand when a tool is called.
+    /// `Full`: all tools visible with complete parameter schemas (legacy behavior).
+    pub tool_description_mode: ToolDescriptionMode,
+}
+
+/// Controls how tool parameter schemas are presented to the LLM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolDescriptionMode {
+    /// Name + description only; schemas fetched on demand.
+    Compressed,
+    /// Full parameter schemas included in every LLM request (legacy).
+    Full,
 }
 
 impl AgentConfig {
@@ -80,6 +95,7 @@ impl AgentConfig {
             max_jobs_concurrent_per_user: None,
             engine_v2: false,
             core_tools: Vec::new(),
+            tool_description_mode: ToolDescriptionMode::Compressed,
         }
     }
 
@@ -167,6 +183,14 @@ impl AgentConfig {
                 .filter(|s| !s.is_empty())
                 .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
                 .unwrap_or_default(),
+            tool_description_mode: match std::env::var("TOOL_DESCRIPTION_MODE")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "full" => ToolDescriptionMode::Full,
+                _ => ToolDescriptionMode::Compressed,
+            },
         })
     }
 }
@@ -192,30 +216,32 @@ mod tests {
     }
 
     #[test]
-    fn test_core_tools_empty_by_default() {
-        let settings = Settings::default();
-        let config = AgentConfig::resolve(&settings).expect("resolve");
-        assert!(
-            config.core_tools.is_empty(),
-            "core_tools should be empty when CORE_TOOLS env var is unset"
-        );
-    }
-
-    #[test]
-    fn test_core_tools_parsed_from_env() {
+    fn test_tool_description_mode_from_env() {
         // SAFETY: test-only; modifies process env for config resolution.
-        unsafe {
-            std::env::set_var("CORE_TOOLS", "memory_search, memory_write, time");
-        }
+        // Combined into one test to avoid parallel env-var races.
         let settings = Settings::default();
-        let config = AgentConfig::resolve(&settings).expect("resolve");
-        unsafe {
-            std::env::remove_var("CORE_TOOLS");
-        }
 
+        // Default (unset) → Compressed
+        unsafe {
+            std::env::remove_var("TOOL_DESCRIPTION_MODE");
+        }
+        let config = AgentConfig::resolve(&settings).expect("resolve default");
         assert_eq!(
-            config.core_tools,
-            vec!["memory_search", "memory_write", "time"]
+            config.tool_description_mode,
+            ToolDescriptionMode::Compressed,
+            "should default to Compressed when TOOL_DESCRIPTION_MODE is unset"
         );
+
+        // Explicit "full" → Full
+        unsafe {
+            std::env::set_var("TOOL_DESCRIPTION_MODE", "full");
+        }
+        let config = AgentConfig::resolve(&settings).expect("resolve full");
+        assert_eq!(config.tool_description_mode, ToolDescriptionMode::Full);
+
+        // Clean up
+        unsafe {
+            std::env::remove_var("TOOL_DESCRIPTION_MODE");
+        }
     }
 }

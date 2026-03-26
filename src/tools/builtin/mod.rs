@@ -2,7 +2,6 @@
 
 pub mod collections;
 mod conversation;
-mod discover_tools;
 pub mod generic_collections;
 mod echo;
 pub mod extension_tools;
@@ -23,7 +22,6 @@ mod time;
 mod tool_info;
 
 pub use conversation::ConversationLoadTool;
-pub use discover_tools::DiscoverToolsTool;
 pub use echo::EchoTool;
 pub use extension_tools::{
     ExtensionInfoTool, ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool,

@@ -319,15 +319,6 @@ impl AppBuilder {
         tools.register_builtin_tools();
         tools.register_tool_info();
 
-        // Register discover_tools for on-demand tool loading when CORE_TOOLS filtering is active.
-        // This lets the LLM find and invoke tools that aren't in the core set.
-        {
-            use crate::tools::builtin::DiscoverToolsTool;
-            let discover = DiscoverToolsTool::new(Arc::clone(&tools));
-            tools.register_sync(Arc::new(discover));
-            tracing::debug!("Registered discover_tools meta-tool");
-        }
-
         if let Some(ref ss) = self.secrets_store {
             tools.register_secrets_tools(Arc::clone(ss));
         }

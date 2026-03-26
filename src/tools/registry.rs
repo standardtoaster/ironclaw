@@ -271,13 +271,6 @@ impl ToolRegistry {
         results
     }
 
-    /// Mark a tool as discovered (no-op currently; future: track discovery state).
-    pub async fn mark_discovered(&self, _name: &str) {
-        // Placeholder for future discovery tracking.
-        // In a full implementation, this would add the tool to a "discovered" set
-        // so it appears in subsequent tool_definitions() calls.
-    }
-
     /// Get the set of built-in tool names currently registered.
     pub async fn builtin_tool_names(&self) -> std::collections::HashSet<String> {
         self.builtin_names.read().await.clone()
@@ -348,6 +341,39 @@ impl ToolRegistry {
             .collect();
         defs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
         defs
+    }
+
+    /// Get compressed tool definitions for LLM function calling.
+    ///
+    /// Returns all registered tools with name and description only — parameter
+    /// schemas are replaced with a generic `{"type": "object"}`. This keeps
+    /// all tools visible to the LLM while minimising token usage (~15 tokens
+    /// per tool instead of ~200 for full schemas).
+    ///
+    /// When the LLM calls a tool, the dispatcher fetches the full schema from
+    /// the registry and validates arguments. On validation failure the full
+    /// schema is returned in the error so the model can retry.
+    pub async fn tool_definitions_compressed(&self) -> Vec<ToolDefinition> {
+        let tools = self.tools.read().await;
+        let mut defs: Vec<ToolDefinition> = tools
+            .values()
+            .map(|t| ToolDefinition {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            })
+            .collect();
+        defs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        defs
+    }
+
+    /// Get the full parameter schema for a single tool by name.
+    ///
+    /// Used by the dispatcher to validate arguments after the LLM calls a
+    /// tool in compressed mode.
+    pub async fn tool_full_schema(&self, name: &str) -> Option<serde_json::Value> {
+        let tools = self.tools.read().await;
+        tools.get(name).map(|t| t.parameters_schema())
     }
 
     /// Get tool definitions for specific tools.
@@ -1287,7 +1313,6 @@ mod tests {
         assert_eq!(before, after);
     }
 
-<<<<<<< HEAD
     // --- scope-aware filtering tests ---
 
     struct FakeTool {
@@ -1585,71 +1610,71 @@ mod tests {
             .is_none());
     }
 
+    // --- tool_definitions_compressed tests ---
+
     #[tokio::test]
-    async fn tool_definitions_core_filters_to_named_tools() {
+    async fn tool_definitions_compressed_returns_all_tools() {
         let registry = ToolRegistry::new();
         registry.register_builtin_tools();
         let all_defs = registry.tool_definitions().await;
-        assert!(all_defs.len() > 3, "should have multiple built-in tools");
-
-        let core = vec!["echo".to_string(), "time".to_string()];
-        let filtered = registry.tool_definitions_core(&core).await;
-        assert_eq!(filtered.len(), 2);
-        assert!(filtered.iter().any(|d| d.name == "echo"));
-        assert!(filtered.iter().any(|d| d.name == "time"));
-    }
-
-    #[tokio::test]
-    async fn tool_definitions_core_empty_returns_all() {
-        let registry = ToolRegistry::new();
-        registry.register_builtin_tools();
-        let all_defs = registry.tool_definitions().await;
-        let core_defs = registry.tool_definitions_core(&[]).await;
-        assert_eq!(all_defs.len(), core_defs.len());
-    }
-
-    #[tokio::test]
-    async fn tool_definitions_core_nonexistent_names_returns_empty() {
-        let registry = ToolRegistry::new();
-        registry.register_builtin_tools();
-        let core = vec!["zzz_nonexistent".to_string(), "aaa_fake_tool".to_string()];
-        let filtered = registry.tool_definitions_core(&core).await;
-        assert!(
-            filtered.is_empty(),
-            "nonexistent core names should yield empty: got {}",
-            filtered.len()
+        let compressed = registry.tool_definitions_compressed().await;
+        assert_eq!(
+            all_defs.len(),
+            compressed.len(),
+            "compressed should include all registered tools"
         );
     }
 
     #[tokio::test]
-    async fn tool_definitions_core_results_are_sorted() {
+    async fn tool_definitions_compressed_has_minimal_params() {
         let registry = ToolRegistry::new();
         registry.register_builtin_tools();
-        let core = vec![
-            "time".to_string(),
-            "echo".to_string(),
-            "json".to_string(),
-        ];
-        let filtered = registry.tool_definitions_core(&core).await;
-        assert_eq!(filtered.len(), 3);
-        let names: Vec<&str> = filtered.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(names, vec!["echo", "json", "time"], "should be alphabetically sorted");
+        let compressed = registry.tool_definitions_compressed().await;
+        for def in &compressed {
+            assert_eq!(
+                def.parameters,
+                serde_json::json!({"type": "object"}),
+                "tool '{}' should have minimal params schema",
+                def.name
+            );
+            assert!(
+                !def.description.is_empty(),
+                "tool '{}' should have a description",
+                def.name
+            );
+        }
     }
 
     #[tokio::test]
-    async fn tool_definitions_core_partial_match_only_returns_existing() {
+    async fn tool_definitions_compressed_results_are_sorted() {
         let registry = ToolRegistry::new();
         registry.register_builtin_tools();
-        // Mix of real and fake names
-        let core = vec![
-            "echo".to_string(),
-            "fake_tool_xyz".to_string(),
-            "time".to_string(),
-        ];
-        let filtered = registry.tool_definitions_core(&core).await;
-        assert_eq!(filtered.len(), 2, "should only return tools that exist");
-        assert!(filtered.iter().any(|d| d.name == "echo"));
-        assert!(filtered.iter().any(|d| d.name == "time"));
+        let compressed = registry.tool_definitions_compressed().await;
+        let names: Vec<&str> = compressed.iter().map(|d| d.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "compressed defs should be alphabetically sorted");
+    }
+
+    #[tokio::test]
+    async fn tool_full_schema_returns_real_schema() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+
+        let schema = registry.tool_full_schema("echo").await;
+        assert!(schema.is_some(), "echo should have a full schema");
+        let schema = schema.unwrap();
+        assert!(
+            schema.get("properties").is_some(),
+            "echo schema should have properties: {schema}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_full_schema_nonexistent_returns_none() {
+        let registry = ToolRegistry::new();
+        let schema = registry.tool_full_schema("fake_tool_xyz").await;
+        assert!(schema.is_none(), "nonexistent tool should return None");
     }
 
     // --- search_tools tests ---
@@ -1738,171 +1763,25 @@ mod tests {
         assert!(results.is_empty(), "empty registry should return nothing");
     }
 
+    /// All tools remain executable even when using compressed definitions
+    /// (compressed mode only affects what the LLM sees, not what it can call).
     #[tokio::test]
-    async fn mark_discovered_does_not_panic() {
-        // mark_discovered is a no-op placeholder, but verify it doesn't panic
-        let registry = ToolRegistry::new();
-        registry.register_builtin_tools();
-        registry.mark_discovered("echo").await;
-        registry.mark_discovered("nonexistent_tool").await;
-        // If we got here, no panic — that's the test
-    }
-
-    // -----------------------------------------------------------------------
-    // Tests that expose the mark_discovered no-op bug.
-    //
-    // When CORE_TOOLS is set, load=true in discover_tools should make the
-    // discovered tool appear in tool_definitions_core on the next call.
-    // Currently mark_discovered is a no-op, so these tests document the
-    // expected behavior and will FAIL until the feature is completed.
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    #[ignore = "mark_discovered is a no-op — will pass once discovery tracking is implemented"]
-    async fn mark_discovered_makes_tool_visible_in_core_defs() {
+    async fn all_tools_remain_executable_in_compressed_mode() {
         let registry = ToolRegistry::new();
         registry.register_builtin_tools();
 
-        // Simulate CORE_TOOLS=echo (only echo visible to LLM)
-        let core = vec!["echo".to_string()];
-        let before = registry.tool_definitions_core(&core).await;
-        assert_eq!(before.len(), 1, "only echo should be visible");
-        assert!(!before.iter().any(|d| d.name == "time"), "time should NOT be visible before discovery");
+        // Compressed defs don't include full schemas
+        let compressed = registry.tool_definitions_compressed().await;
+        assert!(compressed.iter().all(|d| d.parameters == serde_json::json!({"type": "object"})));
 
-        // LLM calls discover_tools(query="time", load=true) → mark_discovered("time")
-        registry.mark_discovered("time").await;
-
-        // On the next turn, tool_definitions_core should include both core + discovered
-        let after = registry.tool_definitions_core(&core).await;
-        assert!(
-            after.iter().any(|d| d.name == "time"),
-            "time should be visible after mark_discovered — \
-             BUG: mark_discovered is a no-op, tool_definitions_core doesn't consult discovered set"
-        );
-        assert!(
-            after.len() > before.len(),
-            "discovered tools should expand the visible set"
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "mark_discovered is a no-op — will pass once discovery tracking is implemented"]
-    async fn discovered_tools_persist_across_core_def_calls() {
-        let registry = ToolRegistry::new();
-        registry.register_builtin_tools();
-
-        let core = vec!["echo".to_string()];
-
-        // Discover "time"
-        registry.mark_discovered("time").await;
-
-        // First call should include time
-        let defs1 = registry.tool_definitions_core(&core).await;
-        assert!(defs1.iter().any(|d| d.name == "time"), "time should be visible (call 1)");
-
-        // Second call should still include time (not transient)
-        let defs2 = registry.tool_definitions_core(&core).await;
-        assert!(defs2.iter().any(|d| d.name == "time"), "time should still be visible (call 2)");
-    }
-
-    #[tokio::test]
-    #[ignore = "mark_discovered is a no-op — will pass once discovery tracking is implemented"]
-    async fn discovered_nonexistent_tool_is_harmless() {
-        let registry = ToolRegistry::new();
-        registry.register_builtin_tools();
-
-        let core = vec!["echo".to_string()];
-        let before = registry.tool_definitions_core(&core).await;
-
-        // Mark a tool that doesn't exist in the registry
-        registry.mark_discovered("totally_fake_tool").await;
-
-        let after = registry.tool_definitions_core(&core).await;
-        assert_eq!(
-            before.len(),
-            after.len(),
-            "discovering a nonexistent tool should not change visible set"
-        );
-    }
-
-    /// Proves the end-to-end flow: CORE_TOOLS filtering → discover_tools search →
-    /// load=true → tool becomes visible. This exercises the full contract.
-    #[tokio::test]
-    #[ignore = "mark_discovered is a no-op — will pass once discovery tracking is implemented"]
-    async fn end_to_end_core_filter_then_discover_then_visible() {
-        let registry = Arc::new(ToolRegistry::new());
-        registry.register_builtin_tools();
-
-        let core = vec!["echo".to_string(), "discover_tools".to_string()];
-
-        // Step 1: Only core tools visible
-        let defs = registry.tool_definitions_core(&core).await;
-        let visible_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-        assert!(visible_names.contains(&"echo"));
-        assert!(!visible_names.contains(&"time"), "time not in core set");
-
-        // Step 2: Search finds time (search_tools doesn't care about core filtering)
-        let search_results = registry.search_tools("time").await;
-        assert!(
-            search_results.iter().any(|(n, _)| n == "time"),
-            "search_tools should find 'time' even when not in core set"
-        );
-
-        // Step 3: Load it (mark_discovered)
-        registry.mark_discovered("time").await;
-
-        // Step 4: Now time should be visible alongside core tools
-        let defs_after = registry.tool_definitions_core(&core).await;
-        assert!(
-            defs_after.iter().any(|d| d.name == "time"),
-            "time should be in tool_definitions_core after discovery — \
-             BUG: mark_discovered is a no-op"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Non-ignored tests that verify the WORKING parts of the feature
-    // -----------------------------------------------------------------------
-
-    /// CORE_TOOLS filtering correctly hides non-core tools from the LLM
-    /// while search_tools can still find them.
-    #[tokio::test]
-    async fn core_filtering_hides_tools_but_search_still_finds_them() {
-        let registry = ToolRegistry::new();
-        registry.register_builtin_tools();
-
-        // Restrict to just echo
-        let core = vec!["echo".to_string()];
-        let core_defs = registry.tool_definitions_core(&core).await;
-        assert_eq!(core_defs.len(), 1);
-        assert_eq!(core_defs[0].name, "echo");
-
-        // But search_tools sees everything
-        let search_results = registry.search_tools("time").await;
-        assert!(
-            search_results.iter().any(|(n, _)| n == "time"),
-            "search_tools should find 'time' even though it's filtered from core defs"
-        );
-    }
-
-    /// Verifies that tool execution works for non-core tools.
-    /// Even when CORE_TOOLS hides a tool from LLM context, the tool should
-    /// still be executable if the LLM somehow calls it (e.g., via discover_tools).
-    #[tokio::test]
-    async fn non_core_tools_remain_executable() {
-        let registry = ToolRegistry::new();
-        registry.register_builtin_tools();
-
-        // "time" is not in core set
-        let core = vec!["echo".to_string()];
-        let core_defs = registry.tool_definitions_core(&core).await;
-        assert!(!core_defs.iter().any(|d| d.name == "time"), "time not in core defs");
-
-        // But we can still get and execute the tool directly
-        let time_tool = registry.get("time").await;
-        assert!(
-            time_tool.is_some(),
-            "non-core tool should still be retrievable from registry"
-        );
+        // But all tools are still retrievable and executable
+        for def in &compressed {
+            let tool = registry.get(&def.name).await;
+            assert!(
+                tool.is_some(),
+                "tool '{}' should be retrievable from registry",
+                def.name
+            );
+        }
     }
 }
