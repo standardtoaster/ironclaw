@@ -1,7 +1,6 @@
 //! Built-in tools that come with the agent.
 
 mod conversation;
-mod discover_tools;
 mod echo;
 pub mod extension_tools;
 mod file;
@@ -20,7 +19,6 @@ mod time;
 mod tool_info;
 
 pub use conversation::ConversationLoadTool;
-pub use discover_tools::DiscoverToolsTool;
 pub use echo::EchoTool;
 pub use extension_tools::{
     ExtensionInfoTool, ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool,

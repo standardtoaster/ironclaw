@@ -46,9 +46,10 @@ pub async fn execute_tool_with_safety(
             .map(|e| format!("{}: {}", e.field, e.message))
             .collect::<Vec<_>>()
             .join("; ");
+        let schema_hint = format_schema_hint(tool.as_ref());
         return Err(crate::error::ToolError::InvalidParameters {
             name: tool_name.to_string(),
-            reason: format!("Invalid tool parameters: {}", details),
+            reason: format!("Invalid tool parameters: {}{}", details, schema_hint),
         }
         .into());
     }
@@ -101,9 +102,17 @@ pub async fn execute_tool_with_safety(
             name: tool_name.to_string(),
             timeout,
         })?
-        .map_err(|e| crate::error::ToolError::ExecutionFailed {
-            name: tool_name.to_string(),
-            reason: e.to_string(),
+        .map_err(|e| {
+            // Enrich parameter errors with the full schema so the LLM can retry.
+            let reason = if matches!(e, crate::tools::tool::ToolError::InvalidParameters(_)) {
+                format!("{}{}", e, format_schema_hint(tool.as_ref()))
+            } else {
+                e.to_string()
+            };
+            crate::error::ToolError::ExecutionFailed {
+                name: tool_name.to_string(),
+                reason,
+            }
         })?;
 
     serde_json::to_string_pretty(&result.result).map_err(|e| {
@@ -136,6 +145,19 @@ pub fn process_tool_result(
     };
     let message = ChatMessage::tool_result(tool_call_id, tool_name, content.clone());
     (content, message)
+}
+
+/// Format a schema hint for parameter error messages.
+///
+/// When the LLM calls a tool with wrong parameters (common in compressed
+/// mode where full schemas aren't sent), this appends the full parameter
+/// schema to the error so the model can retry with correct arguments.
+fn format_schema_hint(tool: &dyn crate::tools::tool::Tool) -> String {
+    let schema = tool.parameters_schema();
+    match serde_json::to_string(&schema) {
+        Ok(s) => format!("\n\nFull parameter schema for '{}':\n{}", tool.name(), s),
+        Err(_) => String::new(),
+    }
 }
 
 /// Execute a tool with safety checks, returning a string error (for container runtime).
