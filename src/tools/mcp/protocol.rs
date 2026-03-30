@@ -36,7 +36,10 @@ pub struct McpTool {
     )]
     pub input_schema: serde_json::Value,
     /// Optional annotations from the MCP server.
-    #[serde(default)]
+    /// skip_serializing_if avoids sending `"annotations": null` which
+    /// triggers a Claude Code bug (anthropics/claude-code#25081) that
+    /// silently drops all tools from the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<McpToolAnnotations>,
 }
 
