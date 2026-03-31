@@ -1694,11 +1694,16 @@ mod tests {
     async fn search_tools_finds_by_description() {
         let registry = ToolRegistry::new();
         registry.register_builtin_tools();
-        // "memory" appears in memory tool descriptions
-        let results = registry.search_tools("memory").await;
+        // "testing" appears in echo's description ("Useful for testing tool execution")
+        // but not in any builtin tool name, so matches must come from description search
+        let results = registry.search_tools("testing").await;
         assert!(
             !results.is_empty(),
-            "should find tools with 'memory' in name or description"
+            "should find tools with 'testing' in description"
+        );
+        assert!(
+            results.iter().any(|(name, _)| name == "echo"),
+            "echo tool should match via its description containing 'testing'"
         );
     }
 

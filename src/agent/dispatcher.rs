@@ -118,13 +118,6 @@ impl Agent {
             message.content.clone()
         };
 
-        // Apply skill-based tool attenuation
-        let initial_tool_defs = if !active_skills.is_empty() {
-            crate::skills::attenuate_tools(&initial_tool_defs, &active_skills).tools
-        } else {
-            initial_tool_defs
-        };
-
         // Build skill context block
         let skill_context = if !active_skills.is_empty() {
             let mut context_parts = Vec::new();
