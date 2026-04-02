@@ -254,6 +254,12 @@ impl GatewayWorkflowHarness {
             oauth_sweep_shutdown: None,
             collection_write_tx: None,
             skills_dir: None,
+            pending_claude_replies: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            pending_claude_approvals: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         });
 
         let mut agent = Agent::new(
@@ -287,6 +293,7 @@ impl GatewayWorkflowHarness {
                 thread_resolver: None,
                 core_tools: Vec::new(),
                 organize_rx: None,
+                user_llm_providers: None,
             },
             channels,
             None,

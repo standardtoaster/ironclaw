@@ -838,6 +838,7 @@ impl TestRigBuilder {
             thread_resolver: None,
             core_tools: Vec::new(),
             organize_rx: None,
+            user_llm_providers: None,
         };
 
         // 7. Create TestChannel and ChannelManager.

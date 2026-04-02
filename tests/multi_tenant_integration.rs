@@ -576,6 +576,12 @@ fn gateway_state_has_multi_tenant_fields() {
         oauth_sweep_shutdown: None,
         collection_write_tx: None,
         skills_dir: None,
+            pending_claude_replies: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            pending_claude_approvals: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
     };
 
     assert_eq!(state.owner_id, "fallback");
@@ -1064,6 +1070,12 @@ async fn start_multi_user_server_with_db() -> (
         oauth_sweep_shutdown: None,
         collection_write_tx: None,
         skills_dir: None,
+            pending_claude_replies: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            pending_claude_approvals: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

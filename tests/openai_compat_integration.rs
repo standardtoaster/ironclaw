@@ -232,6 +232,12 @@ async fn start_test_server_with_provider(
         oauth_sweep_shutdown: None,
         collection_write_tx: None,
         skills_dir: None,
+            pending_claude_replies: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            pending_claude_approvals: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
     });
 
     let auth = ironclaw::channels::web::auth::MultiAuthState::single(
@@ -744,6 +750,12 @@ async fn test_no_llm_provider_returns_503() {
         oauth_sweep_shutdown: None,
         collection_write_tx: None,
         skills_dir: None,
+            pending_claude_replies: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            pending_claude_approvals: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
     });
 
     let auth = ironclaw::channels::web::auth::MultiAuthState::single(

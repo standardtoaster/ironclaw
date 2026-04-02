@@ -208,6 +208,7 @@ mod tests {
             thread_resolver: None,
             core_tools: Vec::new(),
             organize_rx: None,
+            user_llm_providers: None,
         };
 
         let gateway = Arc::new(TestChannel::new());
