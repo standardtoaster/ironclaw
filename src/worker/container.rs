@@ -228,7 +228,13 @@ Work independently to complete this job. Report when done."#,
                     })
                     .await?;
             }
-            Ok(Ok(LoopOutcome::Stopped | LoopOutcome::NeedApproval(_))) => {
+            Ok(Ok(
+                LoopOutcome::Stopped
+                | LoopOutcome::NeedApproval(_)
+                | LoopOutcome::Escalate { .. }
+                | LoopOutcome::DeEscalate { .. }
+                | LoopOutcome::NeedUserInput { .. },
+            )) => {
                 tracing::info!("Worker for job {} stopped", self.config.job_id);
                 self.client
                     .report_complete(&CompletionReport {

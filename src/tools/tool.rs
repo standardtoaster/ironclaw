@@ -256,6 +256,15 @@ impl ToolOutput {
         self.raw = Some(raw.into());
         self
     }
+
+    /// Serialize the `.result` field to a pretty-printed JSON string.
+    ///
+    /// Callers that need the string representation (e.g., for chat messages,
+    /// sanitization, or stashing) use this instead of accessing `.result`
+    /// directly, ensuring consistent serialization.
+    pub fn result_string(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(&self.result)
+    }
 }
 
 /// Definition of a tool's parameters using JSON Schema.
