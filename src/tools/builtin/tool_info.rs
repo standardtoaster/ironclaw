@@ -97,7 +97,7 @@ impl Tool for ToolInfoTool {
     }
 
     fn description(&self) -> &str {
-        "Get info about any tool: description, parameter names, curated summary guidance, or full discovery schema."
+        "Get the parameter schema for a tool before calling it. You MUST call this with detail='schema' before using any tool whose parameters you don't know. Returns parameter names, types, and descriptions."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
