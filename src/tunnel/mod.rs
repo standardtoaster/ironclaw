@@ -429,8 +429,9 @@ mod tests {
             port: 3000,
             auth_token: None,
             workspace_read_scopes: Vec::new(),
-            oidc: None,
             memory_layers: Vec::new(),
+            oidc: None,
+            user_tokens: None,
         });
         c
     }
@@ -444,6 +445,7 @@ mod tests {
             workspace_read_scopes: Vec::new(),
             memory_layers: Vec::new(),
             oidc: None,
+            user_tokens: None,
         });
         c
     }
