@@ -44,6 +44,7 @@ pub use self::embeddings::{DEFAULT_EMBEDDING_CACHE_SIZE, EmbeddingsConfig};
 pub use self::heartbeat::HeartbeatConfig;
 pub use self::hygiene::HygieneConfig;
 pub use self::llm::default_session_path;
+pub use self::llm::TierConfig;
 pub use self::relay::RelayConfig;
 pub use self::routines::RoutineConfig;
 pub use self::safety::SafetyConfig;

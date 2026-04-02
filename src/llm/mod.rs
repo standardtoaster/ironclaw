@@ -728,16 +728,21 @@ pub async fn create_escalation_tier_map(
     for (i, tier) in config.escalation_tiers.iter().enumerate() {
         // Build a minimal LlmConfig for this tier.
         let tier_config = LlmConfig {
-            backend: format!("{}", tier.backend),
+            backend: tier.backend.clone(),
             session: config.session.clone(),
             nearai: config.nearai.clone(),
             provider: Some(config::RegistryProviderConfig {
-                backend_id: format!("{}", tier.backend),
-                protocol: crate::llm::registry::ProviderProtocol::OpenAiChat,
+                provider_id: tier.backend.clone(),
+                protocol: crate::llm::registry::ProviderProtocol::OpenAiCompletions,
                 model: tier.model.clone(),
                 base_url: tier.base_url.clone().unwrap_or_default(),
                 api_key: tier.api_key.clone(),
                 extra_headers: Vec::new(),
+                oauth_token: None,
+                is_codex_chatgpt: false,
+                refresh_token: None,
+                auth_path: None,
+                cache_retention: config::CacheRetention::default(),
                 unsupported_params: Vec::new(),
             }),
             bedrock: None,
@@ -992,6 +997,7 @@ mod tests {
             cheap_model: None,
             smart_routing_cascade: true,
             openai_codex: None,
+            escalation_tiers: vec![],
         }
     }
 

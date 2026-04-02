@@ -1266,6 +1266,7 @@ mod tests {
             sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
             builder: None,
             llm_backend: "nearai".to_string(),
+            tier_map: None,
         };
 
         Agent::new(
@@ -2135,6 +2136,7 @@ mod tests {
             sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
             builder: None,
             llm_backend: "nearai".to_string(),
+            tier_map: None,
         };
 
         Agent::new(
@@ -2257,6 +2259,7 @@ mod tests {
                 sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
                 builder: None,
                 llm_backend: "nearai".to_string(),
+                tier_map: None,
             };
 
             Agent::new(
@@ -2324,8 +2327,8 @@ mod tests {
             super::AgenticLoopResult::Response(text) => {
                 assert!(!text.is_empty(), "Expected non-empty forced text response");
             }
-            super::AgenticLoopResult::NeedApproval { .. } => {
-                panic!("Expected text response, got NeedApproval");
+            _ => {
+                panic!("Expected text response, got non-Response variant");
             }
         }
     }
@@ -2534,6 +2537,7 @@ mod tests {
         use crate::llm::tier::{TierEntry, TierMap};
 
         let deps = AgentDeps {
+            owner_id: "default".to_string(),
             store: None,
             llm: Arc::new(StaticLlmProvider),
             cheap_llm: None,
@@ -2553,11 +2557,8 @@ mod tests {
             http_interceptor: None,
             transcription: None,
             document_extraction: None,
-            workspace_router: None,
-            thread_resolver: None,
-            core_tools: Vec::new(),
-            organize_rx: None,
-            workspace_pool: None,
+            sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            builder: None,
             tier_map: Some(Arc::new(
                 TierMap::new(vec![
                     TierEntry {
@@ -2617,6 +2618,8 @@ mod tests {
                 max_tool_iterations: 50,
                 auto_approve_tools: false,
                 default_timezone: "UTC".to_string(),
+                max_tokens_per_job: 0,
+                core_tools: Vec::new(),
             },
             deps,
             Arc::new(ChannelManager::new()),
@@ -2624,7 +2627,6 @@ mod tests {
             None,
             None,
             Some(Arc::new(ContextManager::new(1))),
-            None,
             None,
         );
 

@@ -18,8 +18,8 @@ use crate::settings::Settings;
 pub struct TierConfig {
     /// Tier name (e.g., "local", "standard", "premium").
     pub name: String,
-    /// Which backend to use for this tier.
-    pub backend: LlmBackend,
+    /// Which backend to use for this tier (e.g., "openai_compatible", "anthropic").
+    pub backend: String,
     /// Model identifier.
     pub model: String,
     /// Optional base URL override.
@@ -533,10 +533,7 @@ fn parse_escalation_tiers() -> Result<Vec<TierConfig>, ConfigError> {
                 key: backend_key.clone(),
                 hint: format!("Each tier in LLM_ESCALATION_TIERS needs {prefix}_BACKEND"),
             })?;
-        let backend: LlmBackend = backend_str.parse().map_err(|e| ConfigError::InvalidValue {
-            key: backend_key,
-            message: e,
-        })?;
+        let backend = backend_str;
 
         let model_key = format!("{prefix}_MODEL");
         let model = optional_env(&model_key)?.ok_or_else(|| ConfigError::MissingRequired {
@@ -623,7 +620,7 @@ pub fn default_session_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::helpers::lock_env;
+    use crate::config::helpers::{lock_env, ENV_MUTEX};
     use crate::settings::Settings;
     use crate::testing::credentials::*;
 
@@ -1543,9 +1540,9 @@ mod tests {
         let tiers = parse_escalation_tiers().expect("should succeed");
         assert_eq!(tiers.len(), 2);
         assert_eq!(tiers[0].name, "local");
-        assert_eq!(tiers[0].backend, LlmBackend::OpenAiCompatible);
+        assert_eq!(tiers[0].backend, "openai_compatible");
         assert_eq!(tiers[1].name, "claude");
-        assert_eq!(tiers[1].backend, LlmBackend::Anthropic);
+        assert_eq!(tiers[1].backend, "anthropic");
         assert!(tiers[1].api_key.is_some());
 
         clear_escalation_tier_env();

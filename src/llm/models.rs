@@ -349,5 +349,6 @@ pub(crate) fn build_nearai_model_fetch_config() -> crate::config::LlmConfig {
         cheap_model: None,
         smart_routing_cascade: false,
         openai_codex: None,
+        escalation_tiers: vec![],
     }
 }

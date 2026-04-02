@@ -267,6 +267,7 @@ impl GatewayWorkflowHarness {
                 sandbox_readiness: ironclaw::agent::SandboxReadiness::DisabledByConfig,
                 builder: None,
                 llm_backend: "nearai".to_string(),
+                tier_map: None,
             },
             channels,
             None,
