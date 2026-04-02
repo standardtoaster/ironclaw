@@ -408,7 +408,7 @@ impl GatewayState {
             if let Some(cfg) = user_config {
                 match cfg.llm_config() {
                     Ok(Some(llm_cfg)) => {
-                        match crate::llm::create_provider_from_user_config_with_lens(&llm_cfg, user_id) {
+                        match crate::llm::create_provider_from_user_config(&llm_cfg) {
                             Ok(provider) => {
                                 let mut cache = self.user_llm_providers.write().await;
                                 // Double-check after acquiring write lock
@@ -3948,7 +3948,6 @@ mod tests {
             "tok-andrew".to_string(),
             UserTokenConfig {
                 user_id: "andrew".to_string(),
-                workspace_read_scopes: vec![],
                 llm_backend: Some("openai_compatible".to_string()),
                 llm_model: Some("test-model".to_string()),
                 llm_api_key: None,
@@ -3979,14 +3978,17 @@ mod tests {
             skill_registry: None,
             skill_catalog: None,
             chat_rate_limiter: PerUserRateLimiter::new(30, 60),
+            oauth_rate_limiter: RateLimiter::new(10, 60),
+            webhook_rate_limiter: RateLimiter::new(10, 60),
             registry_entries: vec![],
             cost_guard: None,
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
-            restart_requested: std::sync::atomic::AtomicBool::new(false),
-            collection_write_tx: None,
-            default_timezone: "UTC".to_string(),
-            mcp_sessions: Arc::new(crate::channels::mcp::McpSessionStore::new()),
+            active_config: ActiveConfigSnapshot {
+                llm_backend: "test".to_string(),
+                llm_model: "test-model".to_string(),
+                enabled_channels: vec![],
+            },
         });
 
         // Should resolve a per-user provider for "andrew"
