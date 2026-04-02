@@ -1294,9 +1294,22 @@ impl Agent {
                 )
                 .await;
 
-            let tool_result = self
+            let tool_output = self
                 .execute_chat_tool(&pending.tool_name, &pending.parameters, &job_ctx)
                 .await;
+
+            // Convert ToolOutput → Result<String, Error> for downstream
+            // string-based operations (status updates, auth check, sanitization).
+            let tool_result: Result<String, Error> = match tool_output {
+                Ok(output) => output.result_string().map_err(|e| {
+                    crate::error::ToolError::ExecutionFailed {
+                        name: pending.tool_name.clone(),
+                        reason: format!("Failed to serialize result: {}", e),
+                    }
+                    .into()
+                }),
+                Err(e) => Err(e),
+            };
 
             let tool_ref = self.tools().get(&pending.tool_name).await;
             let _ = self
@@ -1458,9 +1471,19 @@ impl Agent {
                         )
                         .await;
 
-                    let result = self
+                    let result: Result<String, Error> = match self
                         .execute_chat_tool(&tc.name, &tc.arguments, &job_ctx)
-                        .await;
+                        .await
+                    {
+                        Ok(output) => output.result_string().map_err(|e| {
+                            crate::error::ToolError::ExecutionFailed {
+                                name: tc.name.clone(),
+                                reason: format!("Failed to serialize result: {}", e),
+                            }
+                            .into()
+                        }),
+                        Err(e) => Err(e),
+                    };
 
                     let deferred_tool = self.tools().get(&tc.name).await;
                     let _ = self
@@ -1505,14 +1528,25 @@ impl Agent {
                             )
                             .await;
 
-                        let result = execute_chat_tool_standalone(
-                            &tools,
-                            &safety,
-                            &tc.name,
-                            &tc.arguments,
-                            &job_ctx,
-                        )
-                        .await;
+                        let result: Result<String, Error> =
+                            match execute_chat_tool_standalone(
+                                &tools,
+                                &safety,
+                                &tc.name,
+                                &tc.arguments,
+                                &job_ctx,
+                            )
+                            .await
+                            {
+                                Ok(output) => output.result_string().map_err(|e| {
+                                    crate::error::ToolError::ExecutionFailed {
+                                        name: tc.name.clone(),
+                                        reason: format!("Failed to serialize result: {}", e),
+                                    }
+                                    .into()
+                                }),
+                                Err(e) => Err(e),
+                            };
 
                         let par_tool = tools.get(&tc.name).await;
                         let _ = channels

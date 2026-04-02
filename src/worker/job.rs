@@ -428,6 +428,17 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 // Stop signal handled — nothing more to do
             }
             LoopOutcome::NeedApproval(_) => {}
+            // Escalation signals are only meaningful in the chat dispatcher.
+            // For background jobs, log and continue.
+            LoopOutcome::Escalate { reason, .. } => {
+                tracing::info!(reason = %reason, "Job received escalation signal (ignored in job context)");
+            }
+            LoopOutcome::DeEscalate { reason } => {
+                tracing::info!(reason = %reason, "Job received de-escalation signal (ignored in job context)");
+            }
+            LoopOutcome::NeedUserInput { .. } => {
+                tracing::info!("Job received user-input-needed signal (ignored in job context)");
+            }
         }
 
         Ok(())

@@ -9,6 +9,7 @@ use std::borrow::Cow;
 use crate::context::JobContext;
 use crate::error::Error;
 use crate::llm::ChatMessage;
+use crate::tools::tool::ToolOutput;
 use crate::tools::{ToolRegistry, prepare_tool_params, redact_params};
 use ironclaw_safety::SafetyLayer;
 
@@ -17,13 +18,17 @@ use ironclaw_safety::SafetyLayer;
 /// This is the single canonical implementation of tool execution. All consumers
 /// (chat dispatcher, job worker, container runtime, scheduler subtasks) use this
 /// function instead of maintaining their own copies.
+///
+/// Returns the full `ToolOutput`, preserving the `.signal` field so callers
+/// (e.g., the dispatcher) can act on `ToolSignal::Escalate` / `DeEscalate` /
+/// `UserInputNeeded`.
 pub async fn execute_tool_with_safety(
     tools: &ToolRegistry,
     safety: &SafetyLayer,
     tool_name: &str,
     params: serde_json::Value,
     job_ctx: &JobContext,
-) -> Result<String, Error> {
+) -> Result<ToolOutput, Error> {
     if tool_name.is_empty() {
         return Err(crate::error::ToolError::NotFound {
             name: tool_name.to_string(),
@@ -117,13 +122,7 @@ pub async fn execute_tool_with_safety(
             }
         })?;
 
-    serde_json::to_string_pretty(&result.result).map_err(|e| {
-        crate::error::ToolError::ExecutionFailed {
-            name: tool_name.to_string(),
-            reason: format!("Failed to serialize result: {}", e),
-        }
-        .into()
-    })
+    Ok(result)
 }
 
 /// Process a tool result into a `ChatMessage::tool_result` with safety sanitization.
@@ -161,10 +160,14 @@ fn format_schema_hint(tool: &dyn crate::tools::tool::Tool) -> String {
     }
 }
 
-/// Execute a tool with safety checks, returning a string error (for container runtime).
+/// Execute a tool with safety checks, returning a serialized result string (for container runtime).
 ///
-/// This is a thin wrapper around `execute_tool_with_safety` that converts
-/// `Error` to `String` for the container runtime's simpler error model.
+/// This is a thin wrapper around `execute_tool_with_safety` that serializes
+/// `ToolOutput.result` to a JSON string and converts `Error` to `String`
+/// for the container runtime's simpler error model.
+///
+/// **Note:** This discards the `ToolSignal`. Use `execute_tool_with_safety`
+/// directly if you need signal propagation.
 pub async fn execute_tool_simple(
     tools: &ToolRegistry,
     safety: &SafetyLayer,
@@ -172,9 +175,10 @@ pub async fn execute_tool_simple(
     params: serde_json::Value,
     job_ctx: &JobContext,
 ) -> Result<String, String> {
-    execute_tool_with_safety(tools, safety, tool_name, params, job_ctx)
+    let output = execute_tool_with_safety(tools, safety, tool_name, params, job_ctx)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    output.result_string().map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -355,8 +359,11 @@ mod tests {
 
         assert!(result.is_ok(), "Echo tool should succeed");
         let output = result.unwrap();
+        let output_str = output
+            .result_string()
+            .expect("result should serialize"); // safety: test-only assertion
         assert!(
-            output.contains("hello"),
+            output_str.contains("hello"),
             "Output should contain the echoed input"
         );
     }
@@ -441,7 +448,7 @@ mod tests {
         let registry = registry_with(vec![Arc::new(ArrayEchoTool)]).await;
         let safety = test_safety();
 
-        let result = execute_tool_with_safety(
+        let tool_output = execute_tool_with_safety(
             &registry,
             &safety,
             "array_echo",
@@ -451,9 +458,68 @@ mod tests {
         .await
         .expect("array_echo should succeed"); // safety: test-only assertion
 
-        let output: serde_json::Value =
-            serde_json::from_str(&result).expect("tool result should be valid JSON"); // safety: test-only assertion
-        assert_eq!(output["values"], serde_json::json!([1, 2, 3])); // safety: test-only assertion
+        assert_eq!(tool_output.result["values"], serde_json::json!([1, 2, 3])); // safety: test-only assertion
+    }
+
+    /// A tool that emits a ToolSignal::Escalate on execution.
+    struct EscalateTool;
+
+    #[async_trait::async_trait]
+    impl Tool for EscalateTool {
+        fn name(&self) -> &str {
+            "escalate_test"
+        }
+        fn description(&self) -> &str {
+            "Emits an escalation signal"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("escalating", Duration::default()).with_signal(
+                crate::tools::ToolSignal::Escalate {
+                    reason: "complex query".to_string(),
+                    tier: Some("premium".to_string()),
+                },
+            ))
+        }
+        fn requires_sanitization(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_preserves_tool_signal() {
+        // Regression: execute_tool_with_safety must preserve ToolOutput.signal
+        // so that escalation/de-escalation signals reach the dispatcher.
+        let registry = registry_with(vec![Arc::new(EscalateTool)]).await;
+        let safety = test_safety();
+
+        let output = execute_tool_with_safety(
+            &registry,
+            &safety,
+            "escalate_test",
+            serde_json::json!({}),
+            &test_job_ctx(),
+        )
+        .await
+        .expect("EscalateTool should succeed"); // safety: test-only assertion
+
+        assert!(
+            output.signal.is_some(),
+            "ToolOutput.signal must be preserved through execute_tool_with_safety"
+        );
+        match output.signal {
+            Some(crate::tools::ToolSignal::Escalate { ref reason, ref tier }) => {
+                assert_eq!(reason, "complex query");
+                assert_eq!(tier.as_deref(), Some("premium"));
+            }
+            other => panic!("Expected ToolSignal::Escalate, got: {:?}", other),
+        }
     }
 
     #[test]

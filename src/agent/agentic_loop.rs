@@ -44,6 +44,14 @@ pub enum LoopOutcome {
     Failure(String),
     /// A tool requires user approval before continuing (chat delegate only).
     NeedApproval(Box<PendingApproval>),
+    /// A tool emitted a `ToolSignal::Escalate` — switch to a higher-tier provider.
+    Escalate { reason: String, tier: Option<String> },
+    /// A tool emitted a `ToolSignal::DeEscalate` — return to the default provider.
+    DeEscalate { reason: String },
+    /// A tool emitted a `ToolSignal::UserInputNeeded` — pause for user input.
+    NeedUserInput {
+        pending: crate::agent::session::PendingUserInput,
+    },
 }
 
 /// Configuration for the agentic loop.

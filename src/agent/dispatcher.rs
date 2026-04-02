@@ -295,16 +295,25 @@ impl Agent {
             }
             .into()),
             LoopOutcome::NeedApproval(pending) => Ok(AgenticLoopResult::NeedApproval { pending }),
+            LoopOutcome::Escalate { reason, tier } => {
+                Ok(AgenticLoopResult::Escalate { reason, tier })
+            }
+            LoopOutcome::DeEscalate { reason } => Ok(AgenticLoopResult::DeEscalate { reason }),
+            LoopOutcome::NeedUserInput { pending } => {
+                Ok(AgenticLoopResult::NeedUserInput { pending })
+            }
         }
     }
 
     /// Execute a tool for chat (without full job context).
+    ///
+    /// Returns the full `ToolOutput` so the caller can inspect `.signal`.
     pub(super) async fn execute_chat_tool(
         &self,
         tool_name: &str,
         params: &serde_json::Value,
         job_ctx: &JobContext,
-    ) -> Result<String, Error> {
+    ) -> Result<crate::tools::ToolOutput, Error> {
         execute_chat_tool_standalone(self.tools(), self.safety(), tool_name, params, job_ctx).await
     }
 }
@@ -797,7 +806,8 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
         }
 
         // === Phase 2: Parallel execution ===
-        let mut exec_results: Vec<Option<Result<String, Error>>> =
+        // Results carry the full ToolOutput so post-flight can inspect `.signal`.
+        let mut exec_results: Vec<Option<Result<crate::tools::ToolOutput, Error>>> =
             (0..preflight.len()).map(|_| None).collect();
 
         if runnable.len() <= 1 {
@@ -819,6 +829,24 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                     .execute_chat_tool(&tc.name, &tc.arguments, &self.job_ctx)
                     .await;
 
+                // Convert to Result<String, Error> for the status update only.
+                let str_result = match &result {
+                    Ok(output) => output
+                        .result_string()
+                        .map_err(|e| -> Error {
+                            crate::error::ToolError::ExecutionFailed {
+                                name: tc.name.clone(),
+                                reason: format!("Failed to serialize result: {}", e),
+                            }
+                            .into()
+                        }),
+                    Err(e) => Err(crate::error::ToolError::ExecutionFailed {
+                        name: tc.name.clone(),
+                        reason: e.to_string(),
+                    }
+                    .into()),
+                };
+
                 let disp_tool = self.agent.tools().get(&tc.name).await;
                 let _ = self
                     .agent
@@ -827,7 +855,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                         &self.message.channel,
                         StatusUpdate::tool_completed(
                             tc.name.clone(),
-                            &result,
+                            &str_result,
                             &tc.arguments,
                             disp_tool.as_deref(),
                         ),
@@ -870,13 +898,31 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                     )
                     .await;
 
+                    // Convert to Result<String, Error> for the status update only.
+                    let str_result = match &result {
+                        Ok(output) => output
+                            .result_string()
+                            .map_err(|e| -> Error {
+                                crate::error::ToolError::ExecutionFailed {
+                                    name: tc.name.clone(),
+                                    reason: format!("Failed to serialize result: {}", e),
+                                }
+                                .into()
+                            }),
+                        Err(e) => Err(crate::error::ToolError::ExecutionFailed {
+                            name: tc.name.clone(),
+                            reason: e.to_string(),
+                        }
+                        .into()),
+                    };
+
                     let par_tool = tools.get(&tc.name).await;
                     let _ = channels
                         .send_status(
                             &channel,
                             StatusUpdate::tool_completed(
                                 tc.name.clone(),
-                                &result,
+                                &str_result,
                                 &tc.arguments,
                                 par_tool.as_deref(),
                             ),
@@ -921,6 +967,9 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
 
         // === Phase 3: Post-flight (sequential, in original order) ===
         let mut deferred_auth: Option<String> = None;
+        // Collect the first tool signal encountered so we can return the
+        // appropriate LoopOutcome after all results are recorded in context.
+        let mut deferred_signal: Option<(crate::tools::ToolSignal, String)> = None;
 
         for (pf_idx, (tc, outcome)) in preflight.into_iter().enumerate() {
             match outcome {
@@ -950,8 +999,31 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                         .into())
                     });
 
+                    // Extract signal before converting to string.
+                    // Only capture the first signal (escalation takes priority).
+                    if deferred_signal.is_none()
+                        && let Ok(ref output) = tool_result
+                        && let Some(ref signal) = output.signal
+                    {
+                        deferred_signal = Some((signal.clone(), tc.id.clone()));
+                    }
+
+                    // Convert ToolOutput → Result<String, Error> for downstream
+                    // string-based operations (image sentinel, preview, auth,
+                    // stash, sanitization).
+                    let str_result: Result<String, Error> = match tool_result {
+                        Ok(output) => output.result_string().map_err(|e| {
+                            crate::error::ToolError::ExecutionFailed {
+                                name: tc.name.clone(),
+                                reason: format!("Failed to serialize result: {}", e),
+                            }
+                            .into()
+                        }),
+                        Err(e) => Err(e),
+                    };
+
                     // Detect image generation sentinel
-                    let is_image_sentinel = if let Ok(ref output) = tool_result
+                    let is_image_sentinel = if let Ok(ref output) = str_result
                         && matches!(tc.name.as_str(), "image_generate" | "image_edit")
                     {
                         if let Ok(sentinel) = serde_json::from_str::<serde_json::Value>(output)
@@ -992,7 +1064,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
 
                     // Send ToolResult preview
                     if !is_image_sentinel
-                        && let Ok(ref output) = tool_result
+                        && let Ok(ref output) = str_result
                         && !output.is_empty()
                     {
                         let _ = self
@@ -1012,9 +1084,9 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                     // Check for auth awaiting
                     if deferred_auth.is_none()
                         && let Some((ext_name, instructions)) =
-                            check_auth_required(&tc.name, &tool_result)
+                            check_auth_required(&tc.name, &str_result)
                     {
-                        let auth_data = parse_auth_result(&tool_result);
+                        let auth_data = parse_auth_result(&str_result);
                         {
                             let mut sess = self.session.lock().await;
                             if let Some(thread) = sess.threads.get_mut(&self.thread_id) {
@@ -1039,7 +1111,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                     }
 
                     // Stash full output so subsequent tools can reference it
-                    if let Ok(ref output) = tool_result {
+                    if let Ok(ref output) = str_result {
                         self.job_ctx
                             .tool_output_stash
                             .write()
@@ -1047,12 +1119,12 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                             .insert(tc.id.clone(), output.clone());
                     }
 
-                    let is_tool_error = tool_result.is_err();
+                    let is_tool_error = str_result.is_err();
                     let (result_content, tool_message) = crate::tools::execute::process_tool_result(
                         self.agent.safety(),
                         &tc.name,
                         &tc.id,
-                        &tool_result,
+                        &str_result,
                     );
 
                     // Record sanitized result in thread (identity-based matching).
@@ -1080,6 +1152,46 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
         // Return auth response after all results are recorded
         if let Some(instructions) = deferred_auth {
             return Ok(Some(LoopOutcome::Response(instructions)));
+        }
+
+        // Handle tool signals (escalate / de-escalate / user-input-needed).
+        // Signals are checked after all tool results are recorded in context
+        // so the LLM has full visibility when it resumes.
+        if let Some((signal, tool_call_id)) = deferred_signal {
+            use crate::tools::ToolSignal;
+            match signal {
+                ToolSignal::Escalate { reason, tier } => {
+                    tracing::info!(
+                        reason = %reason,
+                        tier = ?tier,
+                        "Tool signal: escalate"
+                    );
+                    return Ok(Some(LoopOutcome::Escalate { reason, tier }));
+                }
+                ToolSignal::DeEscalate { reason } => {
+                    let reason = reason.unwrap_or_else(|| "task complete".to_string());
+                    tracing::info!(reason = %reason, "Tool signal: de-escalate");
+                    return Ok(Some(LoopOutcome::DeEscalate { reason }));
+                }
+                ToolSignal::UserInputNeeded {
+                    question,
+                    options,
+                    metadata,
+                } => {
+                    tracing::info!(question = %question, "Tool signal: user input needed");
+                    let pending = crate::agent::session::PendingUserInput {
+                        request_id: Uuid::new_v4(),
+                        question,
+                        options,
+                        metadata,
+                        tool_call_id,
+                        context_messages: reason_ctx.messages.clone(),
+                        deferred_tool_calls: vec![],
+                        user_timezone: Some(self.user_tz.name().to_string()),
+                    };
+                    return Ok(Some(LoopOutcome::NeedUserInput { pending }));
+                }
+            }
         }
 
         // Handle approval if a tool needed it
@@ -1110,13 +1222,16 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
 /// This standalone function enables parallel invocation from spawned JoinSet
 /// tasks, which cannot borrow `&self`. Delegates to the shared
 /// `execute_tool_with_safety` pipeline.
+///
+/// Returns the full `ToolOutput` so callers can inspect `.signal` for
+/// escalation/de-escalation/user-input signals.
 pub(super) async fn execute_chat_tool_standalone(
     tools: &crate::tools::ToolRegistry,
     safety: &ironclaw_safety::SafetyLayer,
     tool_name: &str,
     params: &serde_json::Value,
     job_ctx: &crate::context::JobContext,
-) -> Result<String, Error> {
+) -> Result<crate::tools::ToolOutput, Error> {
     crate::tools::execute::execute_tool_with_safety(
         tools,
         safety,
@@ -1841,7 +1956,10 @@ mod tests {
 
         assert!(result.is_ok());
         let output = result.unwrap();
-        assert!(output.contains("hello"));
+        let output_str = output
+            .result_string()
+            .expect("result should serialize"); // safety: test-only assertion
+        assert!(output_str.contains("hello"));
     }
 
     #[tokio::test]
