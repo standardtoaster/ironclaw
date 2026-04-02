@@ -218,21 +218,26 @@ pub(crate) fn validate_base_url(url: &str, field_name: &str) -> Result<(), Confi
 
     let host_lower = host.to_lowercase();
 
-    // For HTTP (non-TLS), only allow localhost — remote HTTP endpoints
-    // risk credential leakage (e.g. NEAR AI bearer tokens sent over plaintext).
+    // For HTTP (non-TLS), only allow localhost and explicitly whitelisted hosts.
+    // Remote HTTP endpoints risk credential leakage over plaintext.
+    // Use ALLOW_HTTP_HOSTS=host1,host2 to whitelist trusted LAN hosts.
     if scheme == "http" {
         let is_localhost = host_lower == "localhost"
             || host_lower == "127.0.0.1"
             || host_lower == "::1"
             || host_lower == "[::1]"
             || host_lower.ends_with(".localhost");
-        if !is_localhost {
+        let is_whitelisted = std::env::var("ALLOW_HTTP_HOSTS")
+            .unwrap_or_default()
+            .split(',')
+            .any(|h| h.trim().to_lowercase() == host_lower);
+        if !is_localhost && !is_whitelisted {
             return Err(ConfigError::InvalidValue {
                 key: field_name.to_string(),
                 message: format!(
                     "HTTP (non-TLS) is only allowed for localhost, got '{}'. \
-                     Use HTTPS for remote endpoints.",
-                    host
+                     Use HTTPS for remote endpoints, or set ALLOW_HTTP_HOSTS={} to allow.",
+                    host, host
                 ),
             });
         }
