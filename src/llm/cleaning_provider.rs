@@ -45,8 +45,14 @@ impl LlmProvider for CleaningProvider {
         request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
         let mut resp = self.inner.complete_with_tools(request).await?;
-        if let Some(ref content) = resp.content {
-            resp.content = Some(clean_response(content));
+        // Only clean content when there are no structured tool calls.
+        // When tool_calls are present, content is auxiliary (thinking/reasoning)
+        // and cleaning it can destroy embedded tool call XML that
+        // recover_tool_calls_from_content needs later.
+        if resp.tool_calls.is_empty() {
+            if let Some(ref content) = resp.content {
+                resp.content = Some(clean_response(content));
+            }
         }
         Ok(resp)
     }
@@ -81,6 +87,10 @@ impl LlmProvider for CleaningProvider {
 
     fn cache_read_discount(&self) -> Decimal {
         self.inner.cache_read_discount()
+    }
+
+    async fn end_session(&self, thread_id: uuid::Uuid) {
+        self.inner.end_session(thread_id).await;
     }
 }
 
