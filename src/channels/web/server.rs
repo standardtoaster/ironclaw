@@ -60,7 +60,7 @@ use crate::channels::web::handlers::memory::{
     memory_write_handler,
 };
 use crate::channels::web::handlers::routines::{
-    routines_create_handler, routines_delete_handler, routines_detail_handler,
+    routines_delete_handler, routines_detail_handler,
     routines_list_handler, routines_summary_handler, routines_toggle_handler,
     routines_trigger_handler,
 };
@@ -695,7 +695,7 @@ pub async fn start_server(
             post(pairing_approve_handler),
         )
         // Routines
-        .route("/api/routines", get(routines_list_handler).post(routines_create_handler))
+        .route("/api/routines", get(routines_list_handler))
         .route("/api/routines/summary", get(routines_summary_handler))
         .route("/api/routines/{id}", get(routines_detail_handler))
         .route("/api/routines/{id}/trigger", post(routines_trigger_handler))
@@ -993,7 +993,7 @@ pub async fn start_server(
                         let sse_event = crate::channels::web::types::SseEvent::CollectionWrite {
                             collection: event.collection.clone(),
                             record_id: event.record_id.to_string(),
-                            operation: event.operation.clone(),
+                            operation: "insert".to_string(),
                             thread_id: None,
                         };
                         sse.broadcast_for_user(&event.user_id, sse_event);

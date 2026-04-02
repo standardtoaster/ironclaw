@@ -293,6 +293,18 @@ impl Agent {
             }
             .into()),
             LoopOutcome::NeedApproval(pending) => Ok(AgenticLoopResult::NeedApproval { pending }),
+            LoopOutcome::Escalate { reason, tier } => {
+                tracing::info!(%reason, ?tier, "Escalation requested");
+                Ok(AgenticLoopResult::Response(format!("Escalation requested: {reason}")))
+            }
+            LoopOutcome::DeEscalate { reason } => {
+                tracing::info!(%reason, "De-escalation requested");
+                Ok(AgenticLoopResult::Response(format!("De-escalation requested: {reason}")))
+            }
+            LoopOutcome::NeedUserInput { pending } => {
+                tracing::info!("User input requested");
+                Ok(AgenticLoopResult::Response(format!("User input needed: {}", pending.question)))
+            }
         }
     }
 
@@ -1115,14 +1127,21 @@ pub(super) async fn execute_chat_tool_standalone(
     params: &serde_json::Value,
     job_ctx: &crate::context::JobContext,
 ) -> Result<String, Error> {
-    crate::tools::execute::execute_tool_with_safety(
+    let output = crate::tools::execute::execute_tool_with_safety(
         tools,
         safety,
         tool_name,
         params.clone(),
         job_ctx,
     )
-    .await
+    .await?;
+    output.result_string().map_err(|e| {
+        crate::error::ToolError::ExecutionFailed {
+            name: tool_name.to_string(),
+            reason: e.to_string(),
+        }
+        .into()
+    })
 }
 
 /// Parsed auth result fields for emitting StatusUpdate::AuthRequired.

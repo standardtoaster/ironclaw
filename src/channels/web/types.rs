@@ -748,7 +748,6 @@ impl RoutineInfo {
         let action_type = match &r.action {
             crate::agent::routine::RoutineAction::Lightweight { .. } => "lightweight",
             crate::agent::routine::RoutineAction::FullJob { .. } => "full_job",
-            crate::agent::routine::RoutineAction::Script { .. } => "script",
         };
 
         let verification_status = crate::agent::routine::routine_verification_status(r);
