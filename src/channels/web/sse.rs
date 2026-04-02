@@ -186,6 +186,7 @@ impl SseManager {
                         return None;
                     }
                 };
+
                 let event_type = event.event_type();
                 Some(Ok(Event::default().event(event_type).data(data)))
             });

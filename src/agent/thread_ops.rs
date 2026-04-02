@@ -770,6 +770,7 @@ impl Agent {
                             .unwrap_or_default();
                         self.persist_tool_calls(
                             thread_id,
+                            &message.channel,
                             &message.user_id,
                             turn_number,
                             &tool_calls,
@@ -777,6 +778,7 @@ impl Agent {
                         .await;
                         self.persist_assistant_response(
                             thread_id,
+                            &message.channel,
                             &message.user_id,
                             &response,
                         )
@@ -822,16 +824,14 @@ impl Agent {
                         &message.channel,
                         StatusUpdate::DeEscalated {
                             tier: new_tier.clone(),
-                            reason: reason.clone(),
+                            reason: Some(reason.clone()),
                             previous_tier: previous_tier.clone(),
                         },
                         &message.metadata,
                     )
                     .await;
 
-                let msg = reason.unwrap_or_else(|| {
-                    format!("De-escalated to {} model", new_tier)
-                });
+                let msg = reason;
                 thread.complete_turn(&msg);
                 Ok(SubmissionResult::response(msg))
             }
@@ -1817,7 +1817,7 @@ impl Agent {
                     if let Some(ref tier_map) = self.deps.tier_map {
                         tier_map.de_escalate();
                     }
-                    let msg = reason.unwrap_or_else(|| "De-escalated to default model".to_string());
+                    let msg = reason;
                     thread.complete_turn(&msg);
                     Ok(SubmissionResult::response(msg))
                 }
