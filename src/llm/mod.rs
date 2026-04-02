@@ -725,8 +725,25 @@ pub async fn create_escalation_tier_map(
     }
 
     let mut entries = Vec::with_capacity(config.escalation_tiers.len());
+    let registry = crate::llm::registry::ProviderRegistry::load();
     for (i, tier) in config.escalation_tiers.iter().enumerate() {
-        // Build a minimal LlmConfig for this tier.
+        // Build a minimal LlmConfig for this tier using the registry.
+        let provider_def = registry.find(&tier.backend)
+            .or_else(|| registry.find("openai_compatible"));
+        let provider_config = provider_def.map(|def| config::RegistryProviderConfig {
+            protocol: def.protocol,
+            provider_id: def.id.clone(),
+            api_key: tier.api_key.clone(),
+            base_url: tier.base_url.clone().unwrap_or_else(|| def.default_base_url.clone().unwrap_or_default()),
+            model: tier.model.clone(),
+            extra_headers: Vec::new(),
+            oauth_token: None,
+            is_codex_chatgpt: false,
+            refresh_token: None,
+            auth_path: None,
+            cache_retention: config::CacheRetention::default(),
+            unsupported_params: Vec::new(),
+        });
         let tier_config = LlmConfig {
             backend: tier.backend.clone(),
             session: config.session.clone(),
