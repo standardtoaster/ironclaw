@@ -831,7 +831,11 @@ impl Agent {
                     )
                     .await;
 
-                let msg = reason;
+                let msg = if reason.is_empty() {
+                    format!("De-escalated to {} model", new_tier)
+                } else {
+                    reason
+                };
                 thread.complete_turn(&msg);
                 Ok(SubmissionResult::response(msg))
             }
@@ -1817,7 +1821,7 @@ impl Agent {
                     if let Some(ref tier_map) = self.deps.tier_map {
                         tier_map.de_escalate(&message.user_id);
                     }
-                    let msg = reason;
+                    let msg = if reason.is_empty() { "De-escalated to default model".to_string() } else { reason };
                     thread.complete_turn(&msg);
                     Ok(SubmissionResult::response(msg))
                 }
