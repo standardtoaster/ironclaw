@@ -235,6 +235,24 @@ async fn handle_client_message(
                 }
             };
 
+            // Check if this is a sandbox Claude approval first.
+            {
+                let sender = state
+                    .pending_claude_approvals
+                    .lock()
+                    .await
+                    .remove(&request_id);
+                if let Some(tx) = sender {
+                    let _ = tx.send(approved);
+                    tracing::info!(
+                        request_id = %request_id,
+                        approved = approved,
+                        "Resolved sandbox Claude tool approval via WebSocket"
+                    );
+                    return;
+                }
+            }
+
             let request_uuid = match Uuid::parse_str(&request_id) {
                 Ok(id) => id,
                 Err(_) => {
@@ -698,6 +716,12 @@ mod tests {
             oauth_sweep_shutdown: None,
             collection_write_tx: None,
             skills_dir: None,
+            pending_claude_replies: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            pending_claude_approvals: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 }

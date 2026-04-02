@@ -152,6 +152,12 @@ impl GatewayChannel {
             oauth_sweep_shutdown: None,
             collection_write_tx: None,
             skills_dir: None,
+            pending_claude_replies: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            pending_claude_approvals: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         });
 
         Self {
@@ -206,9 +212,20 @@ impl GatewayChannel {
             oauth_sweep_shutdown: None, // sweep tasks are managed by with_oauth
             collection_write_tx: self.state.collection_write_tx.clone(),
             skills_dir: self.state.skills_dir.clone(),
+            pending_claude_replies: Arc::clone(&self.state.pending_claude_replies),
+            pending_claude_approvals: Arc::clone(&self.state.pending_claude_approvals),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
+    }
+
+    /// Get the shared pending-replies map for Claude supervisor callbacks.
+    ///
+    /// Pass this to `create_provider_from_user_config_with_context` so per-user
+    /// `claude_container` providers share the same map as `GatewayState`.
+    /// Without sharing, `/api/claude/reply` can't resolve pending `exchange()` futures.
+    pub fn pending_claude_replies(&self) -> crate::llm::container_supervisor::PendingRepliesMap {
+        Arc::clone(&self.state.pending_claude_replies)
     }
 
     /// Inject the workspace reference for the memory API.
@@ -490,6 +507,21 @@ impl GatewayChannel {
     }
 
     /// Get the first auth token (for printing to console on startup).
+
+    /// Inject the collection write broadcast sender for SSE broadcasting of collection mutations.
+    pub fn with_collection_write_tx(
+        mut self,
+        tx: tokio::sync::broadcast::Sender<crate::agent::collection_events::CollectionWriteEvent>,
+    ) -> Self {
+        self.rebuild_state(|s| s.collection_write_tx = Some(tx));
+        self
+    }
+
+    /// Inject the skills directory for generating collection router skills on REST registration.
+    pub fn with_skills_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.rebuild_state(|s| s.skills_dir = Some(dir));
+        self
+    }
     pub fn auth_token(&self) -> &str {
         self.auth.env_auth.first_token().unwrap_or("")
     }
@@ -530,7 +562,7 @@ impl Channel for GatewayChannel {
         msg: &IncomingMessage,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
-        let thread_id = match &msg.thread_id {
+        let thread_id = match msg.thread_id.as_ref().or(response.thread_id.as_ref()) {
             Some(tid) => tid.clone(),
             None => {
                 return Err(ChannelError::MissingRoutingTarget {

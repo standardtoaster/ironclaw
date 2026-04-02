@@ -1647,10 +1647,13 @@ mod tests {
         );
     }
 
-    /// Regression test for issue #977: oversized parameters schema is dropped.
+    /// Regression test for issue #977: oversized parameters schema is silently
+    /// ignored since the `parameters` field was removed from CapabilitiesFile.
     #[test]
-    fn test_oversized_parameters_schema_dropped() {
-        // Build a parameters schema larger than MAX_PARAMETERS_SCHEMA_BYTES
+    fn test_oversized_parameters_schema_ignored() {
+        // Build a parameters schema larger than MAX_PARAMETERS_SCHEMA_BYTES.
+        // Since `parameters` was removed from CapabilitiesFile, serde silently
+        // drops unknown fields. Verify the file still parses without error.
         let mut properties = serde_json::Map::new();
         for i in 0..2000 {
             properties.insert(
@@ -1669,9 +1672,10 @@ mod tests {
             "parameters": schema,
         });
         let caps = CapabilitiesFile::from_json(&json.to_string()).unwrap();
+        // parameters field is no longer on the struct; just assert it parsed OK
         assert!(
-            caps.parameters.is_none(),
-            "oversized parameters schema should be dropped"
+            caps.description.is_none(),
+            "no description was set so it should be None"
         );
     }
 

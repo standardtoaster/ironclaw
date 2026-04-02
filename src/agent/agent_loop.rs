@@ -206,8 +206,10 @@ pub struct AgentDeps {
     /// Receiver for organizer signals (passed to the organizer runner on spawn).
     /// Created in main.rs alongside the resolver; consumed once by spawn_organizer.
     pub organize_rx: Option<tokio::sync::mpsc::Receiver<crate::agent::organizer_runner::OrganizerSignal>>,
-    // WorkspacePool comes from multi-tenant auth (a later stack row).
-    // Stubbed here so workspace-auto-org code compiles on this base.
+    /// Per-user LLM provider overrides from GATEWAY_USER_TOKENS.
+    /// When a user has a custom llm_backend configured, their provider is resolved
+    /// at startup and stored here. `active_llm()` checks this before the tier map.
+    pub user_llm_providers: Option<std::collections::HashMap<String, Arc<dyn LlmProvider>>>,
 }
 
 /// The main agent that coordinates all components.
@@ -344,11 +346,21 @@ impl Agent {
         &self.deps.llm
     }
 
-    /// Get the currently active LLM provider for a user, accounting for escalation.
+    /// Get the currently active LLM provider for a user, accounting for per-user
+    /// overrides (from GATEWAY_USER_TOKENS) and tier-based escalation.
     ///
-    /// If a tier map is configured, returns the user's current tier's provider.
-    /// Otherwise, falls back to the default provider from `deps.llm`.
+    /// Resolution order:
+    /// 1. Per-user provider override (from `user_llm_providers`)
+    /// 2. Tier map (escalation/de-escalation)
+    /// 3. Global default (`deps.llm`)
     pub(super) fn active_llm(&self, user_id: &str) -> Arc<dyn LlmProvider> {
+        // Check per-user provider overrides first
+        if let Some(ref providers) = self.deps.user_llm_providers {
+            if let Some(provider) = providers.get(user_id) {
+                return Arc::clone(provider);
+            }
+        }
+        // Then check tier map for escalation
         if let Some(ref tier_map) = self.deps.tier_map {
             tier_map.current_provider(user_id)
         } else {
@@ -968,6 +980,20 @@ impl Agent {
 
             match self.handle_message(&message).await {
                 Ok(Some(response)) if !response.is_empty() && !suppress => {
+                    // Backfill thread_id if the session manager assigned one during
+                    // handle_message but the original IncomingMessage didn't have it.
+                    // Without this, GatewayChannel::respond() drops the response.
+                    if message.thread_id.is_none() {
+                        let session = self
+                            .session_manager
+                            .get_or_create_session(&message.user_id)
+                            .await;
+                        let sess = session.lock().await;
+                        if let Some(tid) = sess.active_thread {
+                            message.thread_id = Some(tid.to_string());
+                        }
+                    }
+
                     // Hook: BeforeOutbound — allow hooks to modify or suppress outbound
                     let event = crate::hooks::HookEvent::Outbound {
                         user_id: message.user_id.clone(),

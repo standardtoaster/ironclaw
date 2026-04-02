@@ -44,14 +44,6 @@ pub enum LoopOutcome {
     Failure(String),
     /// A tool requires user approval before continuing (chat delegate only).
     NeedApproval(Box<PendingApproval>),
-    /// A tool emitted a `ToolSignal::Escalate` — switch to a higher-tier provider.
-    Escalate { reason: String, tier: Option<String> },
-    /// A tool emitted a `ToolSignal::DeEscalate` — return to the default provider.
-    DeEscalate { reason: String },
-    /// A tool emitted a `ToolSignal::UserInputNeeded` — pause for user input.
-    NeedUserInput {
-        pending: crate::agent::session::PendingUserInput,
-    },
 }
 
 /// Configuration for the agentic loop.
@@ -840,5 +832,56 @@ mod tests {
             ctx.force_text,
             "Should escalate to force_text after repeated truncations"
         );
+    }
+
+    // --- LoopOutcome construction and matching tests ---
+
+    #[test]
+    fn test_loop_outcome_response_carries_text() {
+        let outcome = LoopOutcome::Response("hello".to_string());
+        match outcome {
+            LoopOutcome::Response(text) => assert_eq!(text, "hello"),
+            _ => panic!("Expected LoopOutcome::Response"),
+        }
+    }
+
+    #[test]
+    fn test_loop_outcome_stopped_matches() {
+        let outcome = LoopOutcome::Stopped;
+        assert!(matches!(outcome, LoopOutcome::Stopped));
+    }
+
+    #[test]
+    fn test_loop_outcome_max_iterations_matches() {
+        let outcome = LoopOutcome::MaxIterations;
+        assert!(matches!(outcome, LoopOutcome::MaxIterations));
+    }
+
+    #[test]
+    fn test_loop_outcome_need_approval_carries_pending() {
+        use crate::agent::session::PendingApproval;
+
+        let pending = PendingApproval {
+            request_id: uuid::Uuid::new_v4(),
+            tool_name: "shell".to_string(),
+            parameters: serde_json::json!({"command": "rm -rf /"}),
+            display_parameters: serde_json::json!({"command": "rm -rf /"}),
+            description: "Remove everything".to_string(),
+            tool_call_id: "call_1".to_string(),
+            context_messages: Vec::new(),
+            deferred_tool_calls: Vec::new(),
+            user_timezone: None,
+            allow_always: true,
+        };
+        let req_id = pending.request_id;
+        let outcome = LoopOutcome::NeedApproval(Box::new(pending));
+
+        match outcome {
+            LoopOutcome::NeedApproval(p) => {
+                assert_eq!(p.request_id, req_id);
+                assert_eq!(p.tool_name, "shell");
+            }
+            _ => panic!("Expected LoopOutcome::NeedApproval"),
+        }
     }
 }

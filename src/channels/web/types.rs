@@ -748,6 +748,7 @@ impl RoutineInfo {
         let action_type = match &r.action {
             crate::agent::routine::RoutineAction::Lightweight { .. } => "lightweight",
             crate::agent::routine::RoutineAction::FullJob { .. } => "full_job",
+            crate::agent::routine::RoutineAction::Script { .. } => "script",
         };
 
         let verification_status = crate::agent::routine::routine_verification_status(r);
@@ -1543,5 +1544,104 @@ mod tests {
 
         assert_eq!(info.status, "disabled");
         assert_eq!(info.verification_status, "unverified");
+    }
+
+    // ---- ApprovalRequest parsing tests ----
+
+    #[test]
+    fn test_approval_request_approve_action() {
+        let json = r#"{"request_id":"req-123","action":"approve"}"#;
+        let req: ApprovalRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.request_id, "req-123");
+        assert_eq!(req.action, "approve");
+        assert!(req.thread_id.is_none());
+    }
+
+    #[test]
+    fn test_approval_request_deny_action() {
+        let json = r#"{"request_id":"req-456","action":"deny","thread_id":"t1"}"#;
+        let req: ApprovalRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.request_id, "req-456");
+        assert_eq!(req.action, "deny");
+        assert_eq!(req.thread_id.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn test_approval_request_always_action() {
+        let json = r#"{"request_id":"req-789","action":"always","thread_id":"t2"}"#;
+        let req: ApprovalRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.request_id, "req-789");
+        assert_eq!(req.action, "always");
+        assert_eq!(req.thread_id.as_deref(), Some("t2"));
+    }
+
+    #[test]
+    fn test_approval_request_missing_thread_id_is_none() {
+        let json = r#"{"request_id":"req-abc","action":"approve"}"#;
+        let req: ApprovalRequest = serde_json::from_str(json).unwrap();
+        assert!(req.thread_id.is_none());
+    }
+
+    #[test]
+    fn test_approval_request_request_id_roundtrip() {
+        let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
+        let json = format!(
+            r#"{{"request_id":"{}","action":"approve","thread_id":"t1"}}"#,
+            uuid_str
+        );
+        let req: ApprovalRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req.request_id, uuid_str);
+    }
+
+    // ---- WsClientMessage::Approval additional deserialization tests ----
+
+    #[test]
+    fn test_ws_approval_deserializes_with_all_fields() {
+        let json = r#"{"type":"approval","request_id":"req-456","action":"always","thread_id":"thread-789"}"#;
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WsClientMessage::Approval {
+                request_id,
+                action,
+                thread_id,
+            } => {
+                assert_eq!(request_id, "req-456");
+                assert_eq!(action, "always");
+                assert_eq!(thread_id.as_deref(), Some("thread-789"));
+            }
+            _ => panic!("Expected Approval variant"),
+        }
+    }
+
+    #[test]
+    fn test_ws_approval_deserializes_without_thread_id() {
+        let json = r#"{"type":"approval","request_id":"req-100","action":"deny"}"#;
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WsClientMessage::Approval {
+                request_id,
+                action,
+                thread_id,
+            } => {
+                assert_eq!(request_id, "req-100");
+                assert_eq!(action, "deny");
+                assert!(thread_id.is_none());
+            }
+            _ => panic!("Expected Approval variant"),
+        }
+    }
+
+    #[test]
+    fn test_ws_approval_unknown_action_string_still_deserializes() {
+        // The action field is a raw String, not an enum, so any value
+        // deserializes -- validation happens at the handler level.
+        let json = r#"{"type":"approval","request_id":"req-1","action":"maybe"}"#;
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WsClientMessage::Approval { action, .. } => {
+                assert_eq!(action, "maybe");
+            }
+            _ => panic!("Expected Approval variant"),
+        }
     }
 }

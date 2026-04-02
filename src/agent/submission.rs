@@ -988,10 +988,66 @@ mod tests {
         );
     }
 
+    // ---- Approval test helper tests ----
+
+    #[test]
+    fn test_approval_helper_creates_correct_struct() {
+        let req_id = Uuid::new_v4();
+        let sub = Submission::approval(req_id, true);
+        assert!(
+            matches!(sub, Submission::ExecApproval { request_id, approved, always }
+                if request_id == req_id && approved && !always),
+            "approval() helper should create ExecApproval with always=false"
+        );
+
+        let sub_deny = Submission::approval(req_id, false);
+        assert!(
+            matches!(sub_deny, Submission::ExecApproval { request_id, approved, always }
+                if request_id == req_id && !approved && !always),
+            "approval(false) should create denied ExecApproval"
+        );
+    }
+
     #[test]
     fn test_parser_expected_empty_is_user_input() {
         // "/expected " with no description should fall through to user input
         let submission = SubmissionParser::parse("/expected ");
         assert!(matches!(submission, Submission::UserInput { .. }));
+    }
+
+    #[test]
+    fn test_always_approve_helper_creates_correct_struct() {
+        let req_id = Uuid::new_v4();
+        let sub = Submission::always_approve(req_id);
+        assert!(
+            matches!(sub, Submission::ExecApproval { request_id, approved, always }
+                if request_id == req_id && approved && always),
+            "always_approve() should create ExecApproval with approved=true and always=true"
+        );
+    }
+
+    #[test]
+    fn test_exec_approval_serde_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let original = Submission::ExecApproval {
+            request_id: req_id,
+            approved: true,
+            always: true,
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: Submission = serde_json::from_str(&json).unwrap();
+
+        assert!(
+            matches!(restored, Submission::ExecApproval { request_id, approved, always }
+                if request_id == req_id && approved && always),
+            "ExecApproval should survive serde round-trip"
+        );
+    }
+
+    #[test]
+    fn test_exec_approval_is_not_control() {
+        let sub = Submission::approval(Uuid::new_v4(), true);
+        assert!(!sub.is_control(), "ExecApproval should not be a control command");
     }
 }

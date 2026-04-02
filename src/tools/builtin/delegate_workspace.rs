@@ -696,6 +696,12 @@ mod tests {
         ) -> Result<std::collections::HashMap<Uuid, i64>, DatabaseError> {
             unimplemented!()
         }
+        async fn batch_get_last_run_status(
+            &self,
+            _routine_ids: &[Uuid],
+        ) -> Result<std::collections::HashMap<Uuid, RunStatus>, DatabaseError> {
+            unimplemented!()
+        }
         async fn link_routine_run_to_job(
             &self,
             _run_id: Uuid,
@@ -710,6 +716,12 @@ mod tests {
             unimplemented!()
         }
         async fn list_dispatched_routine_runs(&self) -> Result<Vec<RoutineRun>, DatabaseError> {
+            unimplemented!()
+        }
+        async fn batch_get_last_run_status(
+            &self,
+            _routine_ids: &[Uuid],
+        ) -> Result<std::collections::HashMap<Uuid, RunStatus>, DatabaseError> {
             unimplemented!()
         }
     }

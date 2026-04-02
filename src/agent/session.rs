@@ -1786,6 +1786,179 @@ mod tests {
     }
 
     #[test]
+    fn test_pending_approval_serde_roundtrip() {
+        let original = PendingApproval {
+            request_id: Uuid::new_v4(),
+            tool_name: "shell".to_string(),
+            parameters: serde_json::json!({"command": "ls -la"}),
+            display_parameters: serde_json::json!({"command": "ls -la"}),
+            description: "list files".to_string(),
+            tool_call_id: "call_abc".to_string(),
+            context_messages: vec![ChatMessage::user("run ls")],
+            deferred_tool_calls: vec![],
+            user_timezone: Some("America/New_York".to_string()),
+            allow_always: true,
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: PendingApproval = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.request_id, original.request_id);
+        assert_eq!(deserialized.tool_name, "shell");
+        assert_eq!(deserialized.parameters, original.parameters);
+        assert_eq!(deserialized.display_parameters, original.display_parameters);
+        assert_eq!(deserialized.description, "list files");
+        assert_eq!(deserialized.tool_call_id, "call_abc");
+        assert_eq!(deserialized.context_messages.len(), 1);
+        assert_eq!(
+            deserialized.user_timezone.as_deref(),
+            Some("America/New_York")
+        );
+        assert!(deserialized.allow_always);
+    }
+
+    #[test]
+    fn test_pending_approval_allow_always_defaults_to_true() {
+        // When allow_always is missing from JSON, it should default to true
+        // via the #[serde(default = "default_true")] attribute.
+        let json = serde_json::json!({
+            "request_id": Uuid::new_v4(),
+            "tool_name": "echo",
+            "parameters": {},
+            "display_parameters": {},
+            "description": "echo test",
+            "tool_call_id": "call_1",
+            "context_messages": [],
+            "deferred_tool_calls": [],
+        });
+
+        let approval: PendingApproval = serde_json::from_value(json).unwrap();
+        assert!(
+            approval.allow_always,
+            "allow_always should default to true when absent"
+        );
+    }
+
+    #[test]
+    fn test_pending_approval_with_deferred_tool_calls() {
+        let deferred = vec![ToolCall {
+            id: generate_tool_call_id(0, 0),
+            name: "memory_search".to_string(),
+            arguments: serde_json::json!({"query": "test"}),
+        }];
+
+        let approval = PendingApproval {
+            request_id: Uuid::new_v4(),
+            tool_name: "shell".to_string(),
+            parameters: serde_json::json!({}),
+            display_parameters: serde_json::json!({}),
+            description: "test".to_string(),
+            tool_call_id: "call_def".to_string(),
+            context_messages: vec![],
+            deferred_tool_calls: deferred.clone(),
+            user_timezone: None,
+            allow_always: true,
+        };
+
+        // Serde round-trip should preserve deferred tool calls
+        let json = serde_json::to_string(&approval).unwrap();
+        let restored: PendingApproval = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.deferred_tool_calls.len(), 1);
+        assert_eq!(restored.deferred_tool_calls[0].name, "memory_search");
+        assert_eq!(
+            restored.deferred_tool_calls[0].arguments,
+            serde_json::json!({"query": "test"})
+        );
+    }
+
+    #[test]
+    fn test_thread_state_idle_to_awaiting_approval_to_idle() {
+        let mut thread = Thread::new(Uuid::new_v4());
+        assert_eq!(thread.state, ThreadState::Idle);
+        assert!(thread.pending_approval.is_none());
+
+        // Transition: Idle -> AwaitingApproval
+        let approval = PendingApproval {
+            request_id: Uuid::new_v4(),
+            tool_name: "http".to_string(),
+            parameters: serde_json::json!({}),
+            display_parameters: serde_json::json!({}),
+            description: "test".to_string(),
+            tool_call_id: "call_1".to_string(),
+            context_messages: vec![],
+            deferred_tool_calls: vec![],
+            user_timezone: None,
+            allow_always: true,
+        };
+        thread.await_approval(approval);
+        assert_eq!(thread.state, ThreadState::AwaitingApproval);
+        assert!(thread.pending_approval.is_some());
+
+        // Transition: take_pending_approval removes the pending but does NOT
+        // change state (caller is responsible for state transition).
+        let taken = thread.take_pending_approval();
+        assert!(taken.is_some());
+        assert!(thread.pending_approval.is_none());
+
+        // clear_pending_approval transitions back to Idle
+        // Re-set approval for the clear test
+        thread.await_approval(PendingApproval {
+            request_id: Uuid::new_v4(),
+            tool_name: "echo".to_string(),
+            parameters: serde_json::json!({}),
+            display_parameters: serde_json::json!({}),
+            description: "test2".to_string(),
+            tool_call_id: "call_2".to_string(),
+            context_messages: vec![],
+            deferred_tool_calls: vec![],
+            user_timezone: None,
+            allow_always: true,
+        });
+        assert_eq!(thread.state, ThreadState::AwaitingApproval);
+        thread.clear_pending_approval();
+        assert_eq!(thread.state, ThreadState::Idle);
+        assert!(thread.pending_approval.is_none());
+    }
+
+    #[test]
+    fn test_take_pending_approval_returns_none_when_empty() {
+        let mut thread = Thread::new(Uuid::new_v4());
+        assert!(thread.take_pending_approval().is_none());
+    }
+
+    #[test]
+    fn test_thread_state_enum_serde() {
+        // All ThreadState variants should round-trip through serde.
+        let states = vec![
+            ThreadState::Idle,
+            ThreadState::Processing,
+            ThreadState::AwaitingApproval,
+            ThreadState::AwaitingUserInput,
+            ThreadState::Completed,
+            ThreadState::Interrupted,
+        ];
+        for state in states {
+            let json = serde_json::to_string(&state).unwrap();
+            let restored: ThreadState = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, state, "ThreadState round-trip failed for {:?}", state);
+        }
+    }
+
+    #[test]
+    fn test_auto_approved_tools_idempotent() {
+        let mut session = Session::new("test-user");
+        assert!(!session.is_tool_auto_approved("shell"));
+
+        session.auto_approve_tool("shell");
+        assert!(session.is_tool_auto_approved("shell"));
+        assert!(!session.is_tool_auto_approved("http"));
+
+        // Adding the same tool again is idempotent
+        session.auto_approve_tool("shell");
+        assert!(session.is_tool_auto_approved("shell"));
+    }
+
+    #[test]
     fn test_requeue_drained_preserves_content_at_front() {
         let mut thread = Thread::new(Uuid::new_v4(), None);
 

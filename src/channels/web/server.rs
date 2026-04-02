@@ -60,8 +60,9 @@ use crate::channels::web::handlers::memory::{
     memory_write_handler,
 };
 use crate::channels::web::handlers::routines::{
-    routines_delete_handler, routines_detail_handler, routines_list_handler,
-    routines_summary_handler, routines_toggle_handler, routines_trigger_handler,
+    routines_create_handler, routines_delete_handler, routines_detail_handler,
+    routines_list_handler, routines_summary_handler, routines_toggle_handler,
+    routines_trigger_handler,
 };
 use crate::channels::web::handlers::settings::{
     settings_delete_handler, settings_export_handler, settings_get_handler,
@@ -78,6 +79,7 @@ use crate::db::Database;
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::tools::ToolRegistry;
+use crate::tools::tool::ApprovalRequirement;
 use crate::workspace::Workspace;
 
 /// Shared prompt queue: maps job IDs to pending follow-up prompts for Claude Code bridges.
@@ -472,6 +474,12 @@ pub struct GatewayState {
     >,
     /// Skills directory for writing per-collection SKILL.md files.
     pub skills_dir: Option<std::path::PathBuf>,
+    /// Shared pending-reply map for Claude supervisor callback route.
+    pub pending_claude_replies: crate::llm::container_supervisor::PendingRepliesMap,
+    /// Pending tool approval requests from the sandbox Claude's PreToolUse hook.
+    pub pending_claude_approvals: Arc<tokio::sync::Mutex<
+        std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>,
+    >>,
 }
 
 impl GatewayState {
@@ -499,7 +507,10 @@ impl GatewayState {
             if let Some(cfg) = user_config {
                 match cfg.llm_config() {
                     Ok(Some(llm_cfg)) => {
-                        match crate::llm::create_provider_from_user_config(&llm_cfg) {
+                        match crate::llm::create_provider_from_user_config_with_context(
+                            &llm_cfg,
+                            Some(Arc::clone(&self.pending_claude_replies)),
+                        ) {
                             Ok(provider) => {
                                 let mut cache = self.user_llm_providers.write().await;
                                 // Double-check after acquiring write lock
@@ -568,6 +579,9 @@ pub async fn start_server(
             get(slack_relay_oauth_callback_handler),
         )
         .route("/relay/events", post(relay_events_handler))
+        .route("/api/claude/reply", post(claude_reply_handler))
+        .route("/api/claude/events", post(claude_events_handler))
+        .route("/api/claude/approval", post(claude_approval_handler))
         .route(
             "/api/webhooks/{path}",
             post(crate::channels::web::handlers::webhooks::webhook_trigger_handler),
@@ -681,7 +695,7 @@ pub async fn start_server(
             post(pairing_approve_handler),
         )
         // Routines
-        .route("/api/routines", get(routines_list_handler))
+        .route("/api/routines", get(routines_list_handler).post(routines_create_handler))
         .route("/api/routines/summary", get(routines_summary_handler))
         .route("/api/routines/{id}", get(routines_detail_handler))
         .route("/api/routines/{id}/trigger", post(routines_trigger_handler))
@@ -837,6 +851,8 @@ pub async fn start_server(
         )
         // Gateway control plane
         .route("/api/gateway/status", get(gateway_status_handler))
+        // MCP server (JSON-RPC over HTTP)
+        .route("/mcp", post(crate::channels::mcp::mcp_post_handler))
         // OpenAI-compatible API
         .route(
             "/v1/chat/completions",
@@ -965,6 +981,38 @@ pub async fn start_server(
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     *state.shutdown_tx.write().await = Some(shutdown_tx);
+
+    // Spawn listener task that bridges CollectionWriteEvent → SSE.
+    if let Some(ref tx) = state.collection_write_tx {
+        let mut rx = tx.subscribe();
+        let sse = Arc::clone(&state.sse);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        let sse_event = crate::channels::web::types::SseEvent::CollectionWrite {
+                            collection: event.collection.clone(),
+                            record_id: event.record_id.to_string(),
+                            operation: event.operation.clone(),
+                            thread_id: None,
+                        };
+                        sse.broadcast_for_user(&event.user_id, sse_event);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            lagged = n,
+                            "Collection write SSE bridge dropped {} events",
+                            n
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::debug!("Collection write broadcast channel closed");
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app)
@@ -1383,6 +1431,230 @@ async fn oauth_callback_handler(
 
     let html = oauth_defaults::landing_html(&flow.display_name, success);
     axum::response::Html(html).into_response()
+}
+
+/// Callback endpoint for percy-channel to deliver Claude responses.
+///
+/// PUBLIC route — called by the local percy-channel process after it receives
+/// a response from Claude. Resolves the oneshot channel that the corresponding
+/// `SupervisorBackend::exchange()` is waiting on.
+async fn claude_reply_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<ClaudeReplyRequest>,
+) -> impl IntoResponse {
+    tracing::info!(
+        raw_thread_id = %body.thread_id,
+        content_len = body.content.as_ref().map(|c| c.len()).unwrap_or(0),
+        "Claude reply callback received"
+    );
+    let thread_id = match Uuid::parse_str(&body.thread_id) {
+        Ok(id) => id,
+        Err(_) => {
+            tracing::warn!(raw_thread_id = %body.thread_id, "Invalid thread_id UUID in callback");
+            return (StatusCode::BAD_REQUEST, "invalid thread_id UUID").into_response();
+        }
+    };
+
+    let tool_calls = body.tool_calls.unwrap_or_default();
+    let content = body.content.unwrap_or_default();
+
+    let sender = state.pending_claude_replies.lock().await.remove(&thread_id);
+    match sender {
+        Some(tx) => {
+            let reply = crate::llm::container_supervisor::CallbackReply {
+                content,
+                tool_calls,
+                input_tokens: body.input_tokens.unwrap_or(0),
+                output_tokens: body.output_tokens.unwrap_or(0),
+            };
+            if tx.send(reply).is_ok() {
+                tracing::debug!(thread_id = %thread_id, "Claude reply delivered");
+                (StatusCode::OK, "ok").into_response()
+            } else {
+                tracing::warn!(thread_id = %thread_id, "Claude reply receiver dropped");
+                (StatusCode::OK, "receiver dropped").into_response()
+            }
+        }
+        None => {
+            tracing::warn!(thread_id = %thread_id, "Claude reply received but no exchange waiting");
+            (StatusCode::NOT_FOUND, "no pending exchange for thread_id").into_response()
+        }
+    }
+}
+
+/// Handler for Claude Code hook events (PostToolUse, Stop, etc.).
+///
+/// Receives hook payloads from the sandbox Claude's settings.json hooks.
+/// Logs them and broadcasts as SSE events so the TUI can show real-time
+/// tool call progress from the sandbox.
+async fn claude_events_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let event_name = body
+        .get("hook_event_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    match event_name {
+        "PostToolUse" => {
+            let tool_name = body
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            tracing::info!(
+                tool = %tool_name,
+                "Claude sandbox tool completed"
+            );
+            // Broadcast as SSE event for TUI visibility
+            state.sse.broadcast(crate::channels::web::types::SseEvent::ToolCompleted {
+                name: tool_name.to_string(),
+                success: true,
+                error: None,
+                parameters: None,
+                thread_id: None,
+            });
+        }
+        "PostToolUseFailure" => {
+            let tool_name = body
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let error = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            tracing::warn!(
+                tool = %tool_name,
+                error = %error,
+                "Claude sandbox tool failed"
+            );
+            state.sse.broadcast(crate::channels::web::types::SseEvent::ToolCompleted {
+                name: tool_name.to_string(),
+                success: false,
+                error: Some(error.to_string()),
+                parameters: None,
+                thread_id: None,
+            });
+        }
+        "Stop" => {
+            tracing::debug!("Claude sandbox turn completed");
+        }
+        _ => {
+            tracing::debug!(event = %event_name, "Claude sandbox event");
+        }
+    }
+
+    StatusCode::OK
+}
+
+/// Handler for Claude Code PreToolUse hook — proxies tool approval decisions.
+///
+/// Looks up the tool in IronClaw's registry, checks `requires_approval()`,
+/// and returns allow/deny in the format Claude Code expects.
+async fn claude_approval_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let tool_name = body
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let tool_input = body
+        .get("tool_input")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    // Strip MCP prefix: "mcp__ironclaw__memory_search" -> "memory_search"
+    let registry_name = if let Some(stripped) = tool_name.strip_prefix("mcp__ironclaw__") {
+        stripped
+    } else {
+        tool_name
+    };
+
+    let (decision, reason) = match state.tool_registry.as_ref() {
+        Some(registry) => {
+            match registry.get(registry_name).await {
+                Some(tool) => {
+                    let requirement = tool.requires_approval(&tool_input);
+                    match requirement {
+                        ApprovalRequirement::Never => {
+                            ("allow", "Auto-approved by Percy (no approval required)".to_string())
+                        }
+                        ApprovalRequirement::UnlessAutoApproved | ApprovalRequirement::Always => {
+                            let allow_always = matches!(
+                                requirement, ApprovalRequirement::UnlessAutoApproved
+                            );
+                            let request_id = uuid::Uuid::new_v4().to_string();
+                            let params_str = serde_json::to_string(&tool_input)
+                                .unwrap_or_else(|_| "{}".to_string());
+
+                            // Emit SSE event so the TUI shows the approval prompt
+                            state.sse.broadcast(
+                                crate::channels::web::types::SseEvent::ApprovalNeeded {
+                                    request_id: request_id.clone(),
+                                    tool_name: tool_name.to_string(),
+                                    description: format!("Sandbox Claude wants to call {}", tool_name),
+                                    parameters: params_str,
+                                    thread_id: None,
+                                    allow_always,
+                                },
+                            );
+
+                            tracing::info!(
+                                tool = %tool_name,
+                                request_id = %request_id,
+                                "Blocking for user approval"
+                            );
+
+                            // Block until user resolves via POST /api/claude/approval/resolve
+                            let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+                            state.pending_claude_approvals.lock().await.insert(
+                                request_id.clone(), tx,
+                            );
+
+                            let approved = rx.await.unwrap_or(false);
+                            if approved {
+                                ("allow", format!("Approved by user ({})", request_id))
+                            } else {
+                                ("deny", format!("Denied by user ({})", request_id))
+                            }
+                        }
+                    }
+                }
+                None => {
+                    tracing::debug!(
+                        tool = %tool_name,
+                        registry_name = %registry_name,
+                        "Tool not found in registry, allowing by default"
+                    );
+                    ("allow", "Auto-approved by Percy (tool not in registry)".to_string())
+                }
+            }
+        }
+        None => {
+            tracing::debug!("Tool registry not available, allowing by default");
+            ("allow", "Auto-approved by Percy (no tool registry)".to_string())
+        }
+    };
+
+    Json(serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": reason
+        }
+    }))
+}
+
+/// Request body for `/api/claude/reply`.
+#[derive(Deserialize)]
+struct ClaudeReplyRequest {
+    thread_id: String,
+    content: Option<String>,
+    tool_calls: Option<Vec<crate::llm::ToolCall>>,
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
 }
 
 /// Webhook endpoint for receiving relay events from channel-relay.
@@ -1822,6 +2094,33 @@ async fn chat_approval_handler(
         }
     };
 
+    // Check if this is a sandbox Claude approval (pending_claude_approvals).
+    // If so, resolve directly instead of going through the agent pipeline.
+    {
+        let sender = state
+            .pending_claude_approvals
+            .lock()
+            .await
+            .remove(&req.request_id);
+        if let Some(tx) = sender {
+            let _ = tx.send(approved);
+            tracing::info!(
+                request_id = %req.request_id,
+                approved = approved,
+                user = %user.user_id,
+                "Resolved sandbox Claude tool approval via /api/chat/approval"
+            );
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(SendMessageResponse {
+                    message_id: uuid::Uuid::new_v4(),
+                    status: "accepted",
+                }),
+            ));
+        }
+    }
+
+    // Not a sandbox approval — fall through to the normal agent loop flow.
     let request_id = Uuid::parse_str(&req.request_id).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
@@ -3574,6 +3873,12 @@ mod tests {
             oauth_sweep_shutdown: None,
             collection_write_tx: None,
             skills_dir: None,
+            pending_claude_replies: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            pending_claude_approvals: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         })
     }
 
@@ -5091,9 +5396,15 @@ mod tests {
             near_rpc_url: None,
             near_network: None,
             oauth_sweep_shutdown: None,
+            workspace_pool: None,
             collection_write_tx: None,
             skills_dir: None,
-            workspace_pool: None,
+            pending_claude_replies: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            pending_claude_approvals: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         });
 
         // Should resolve a per-user provider for "andrew"
@@ -5119,5 +5430,255 @@ mod tests {
         // Should be cached on second call
         let cached = state.llm_provider_for_user("andrew").await;
         assert!(cached.is_some());
+    }
+
+    // --- MCP prefix stripping tests (claude_approval_handler logic) ---
+
+    /// Strip "mcp__ironclaw__" prefix to get the registry tool name.
+    fn strip_mcp_prefix(tool_name: &str) -> &str {
+        if let Some(stripped) = tool_name.strip_prefix("mcp__ironclaw__") {
+            stripped
+        } else {
+            tool_name
+        }
+    }
+
+    #[test]
+    fn test_mcp_prefix_stripping() {
+        assert_eq!(
+            strip_mcp_prefix("mcp__ironclaw__memory_search"),
+            "memory_search"
+        );
+        assert_eq!(
+            strip_mcp_prefix("mcp__ironclaw__caldav"),
+            "caldav"
+        );
+        assert_eq!(
+            strip_mcp_prefix("mcp__ironclaw__read_household_memory"),
+            "read_household_memory"
+        );
+    }
+
+    #[test]
+    fn test_mcp_prefix_no_match() {
+        // Tool names without the prefix should pass through unchanged.
+        assert_eq!(strip_mcp_prefix("some_other_tool"), "some_other_tool");
+        assert_eq!(strip_mcp_prefix("memory_search"), "memory_search");
+        assert_eq!(strip_mcp_prefix(""), "");
+        // Partial prefix should not match.
+        assert_eq!(strip_mcp_prefix("mcp__other__tool"), "mcp__other__tool");
+    }
+
+    #[test]
+    fn test_approval_response_format() {
+        // Verify the JSON response format matches Claude Code's PreToolUse hook contract.
+        let decision = "allow";
+        let reason = "Auto-approved by Percy (no approval required)";
+
+        let response = serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": decision,
+                "permissionDecisionReason": reason
+            }
+        });
+
+        // Verify structure matches what Claude Code expects.
+        let hook_output = &response["hookSpecificOutput"];
+        assert_eq!(hook_output["hookEventName"], "PreToolUse");
+        assert_eq!(hook_output["permissionDecision"], "allow");
+        assert!(hook_output["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("Auto-approved"));
+
+        // Verify there are no extra top-level keys.
+        let obj = response.as_object().unwrap();
+        assert_eq!(obj.len(), 1, "Response should have exactly one top-level key");
+        assert!(obj.contains_key("hookSpecificOutput"));
+    }
+
+    #[tokio::test]
+    async fn test_pending_approval_resolve_flow() {
+        // Test that inserting a sender and resolving it works.
+        let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        map.lock().await.insert("req-1".to_string(), tx);
+
+        // Simulate user approving
+        let sender = map.lock().await.remove("req-1");
+        assert!(sender.is_some());
+        sender.unwrap().send(true).unwrap();
+
+        let approved = rx.await.unwrap();
+        assert!(approved);
+    }
+
+    #[tokio::test]
+    async fn test_pending_approval_deny_flow() {
+        let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        map.lock().await.insert("req-2".to_string(), tx);
+
+        let sender = map.lock().await.remove("req-2");
+        sender.unwrap().send(false).unwrap();
+
+        let approved = rx.await.unwrap();
+        assert!(!approved);
+    }
+
+    #[tokio::test]
+    async fn test_pending_approval_dropped_defaults_to_deny() {
+        // If the sender is dropped without sending, rx returns Err, and
+        // the handler uses unwrap_or(false) → deny.
+        let (_tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        drop(_tx);
+        let result = rx.await.unwrap_or(false);
+        assert!(!result, "Dropped sender should default to deny");
+    }
+
+    #[tokio::test]
+    async fn test_pending_approval_unknown_request_id() {
+        let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+        let sender = map.lock().await.remove("nonexistent");
+        assert!(sender.is_none(), "Unknown request_id should return None");
+    }
+
+    #[tokio::test]
+    async fn test_chat_approval_routes_to_sandbox_when_pending() {
+        // When a request_id exists in pending_claude_approvals, the chat
+        // approval handler should resolve it directly instead of going
+        // through the agent message pipeline.
+        let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let req_id = "test-sandbox-uuid";
+        map.lock().await.insert(req_id.to_string(), tx);
+
+        // Simulate what chat_approval_handler does: check pending_claude_approvals first
+        let sender = map.lock().await.remove(req_id);
+        assert!(sender.is_some(), "Should find pending sandbox approval");
+        sender.unwrap().send(true).unwrap();
+
+        let result = rx.await.unwrap();
+        assert!(result, "Should be approved");
+
+        // After resolving, it should be gone from the map
+        assert!(map.lock().await.get(req_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_chat_approval_falls_through_when_not_sandbox() {
+        // When request_id is NOT in pending_claude_approvals, the handler
+        // should fall through to the normal agent pipeline.
+        let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+        let sender = map.lock().await.remove("not-a-sandbox-id");
+        assert!(sender.is_none(), "Should not find sandbox approval, fall through");
+    }
+
+    #[tokio::test]
+    async fn test_multiple_concurrent_approvals_resolve_independently() {
+        let map: Arc<
+            tokio::sync::Mutex<
+                std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>,
+            >,
+        > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+        let (tx1, rx1) = tokio::sync::oneshot::channel::<bool>();
+        let (tx2, rx2) = tokio::sync::oneshot::channel::<bool>();
+        let (tx3, rx3) = tokio::sync::oneshot::channel::<bool>();
+
+        {
+            let mut locked = map.lock().await;
+            locked.insert("req-a".to_string(), tx1);
+            locked.insert("req-b".to_string(), tx2);
+            locked.insert("req-c".to_string(), tx3);
+        }
+
+        // Resolve in non-insertion order: approve b, deny a, approve c
+        let sender_b = map.lock().await.remove("req-b");
+        sender_b.unwrap().send(true).unwrap();
+
+        let sender_a = map.lock().await.remove("req-a");
+        sender_a.unwrap().send(false).unwrap();
+
+        let sender_c = map.lock().await.remove("req-c");
+        sender_c.unwrap().send(true).unwrap();
+
+        assert!(!rx1.await.unwrap(), "req-a should be denied");
+        assert!(rx2.await.unwrap(), "req-b should be approved");
+        assert!(rx3.await.unwrap(), "req-c should be approved");
+
+        // Map should be empty after all resolved
+        assert!(map.lock().await.is_empty());
+    }
+
+    // --- GatewayState initialization tests ---
+
+    #[tokio::test]
+    async fn test_gateway_state_pending_claude_approvals_starts_empty() {
+        let state = crate::channels::web::test_helpers::TestGatewayBuilder::new().build();
+        let approvals = state.pending_claude_approvals.lock().await;
+        assert!(approvals.is_empty(), "pending_claude_approvals should start empty");
+    }
+
+    #[tokio::test]
+    async fn test_gateway_state_builder_produces_valid_state() {
+        let state = crate::channels::web::test_helpers::TestGatewayBuilder::new()
+            .user_id("alice")
+            .build();
+
+        assert_eq!(state.default_user_id, "alice");
+        assert!(state.workspace.is_none());
+        assert!(state.session_manager.is_none());
+        assert!(state.store.is_none());
+        assert!(state.ws_tracker.is_some());
+    }
+
+    #[test]
+    fn test_gateway_state_user_tokens_mapping() {
+        use crate::config::UserTokenConfig;
+
+        let mut tokens = std::collections::HashMap::new();
+        tokens.insert("tok-andrew".to_string(), UserTokenConfig {
+            user_id: "andrew".to_string(),
+            llm_backend: None,
+            llm_model: None,
+            llm_api_key: None,
+            llm_base_url: None,
+        });
+        tokens.insert("tok-grace".to_string(), UserTokenConfig {
+            user_id: "grace".to_string(),
+            llm_backend: None,
+            llm_model: None,
+            llm_api_key: None,
+            llm_base_url: None,
+        });
+
+        let config = crate::config::GatewayConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            auth_token: Some("test-token".to_string()),
+            user_id: "default".to_string(),
+            user_tokens: None,
+        };
+
+        let channel = crate::channels::web::GatewayChannel::new(config)
+            .with_user_tokens(tokens);
+
+        let state = channel.state();
+        let ut = state.user_tokens.as_ref().expect("user_tokens should be set");
+        assert_eq!(ut.len(), 2);
+        assert_eq!(ut.get("tok-andrew").unwrap().user_id, "andrew");
+        assert_eq!(ut.get("tok-grace").unwrap().user_id, "grace");
     }
 }

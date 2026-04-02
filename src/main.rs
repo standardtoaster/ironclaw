@@ -607,8 +607,30 @@ async fn async_main() -> anyhow::Result<()> {
 
     let mut gateway_url: Option<String> = None;
     let mut sse_manager: Option<std::sync::Arc<ironclaw::channels::web::sse::SseManager>> = None;
+    let mut pending_claude_replies: Option<ironclaw::llm::container_supervisor::PendingRepliesMap> = None;
     if let Some(ref gw_config) = config.channels.gateway {
-        let mut gw = GatewayChannel::new(gw_config.clone(), config.owner_id.clone());
+        // Build multi-user auth state if user_tokens is configured, else single-user.
+        let mut gw = if let Some(ref user_tokens) = gw_config.user_tokens {
+            use ironclaw::channels::web::auth::{MultiAuthState, UserIdentity};
+            let tokens = user_tokens
+                .iter()
+                .map(|(token, cfg)| {
+                    (
+                        token.clone(),
+                        UserIdentity {
+                            user_id: cfg.user_id.clone(),
+                            workspace_read_scopes: Vec::new(),
+                        },
+                    )
+                })
+                .collect();
+            let auth = MultiAuthState::multi(tokens);
+            let mut ch = GatewayChannel::new_multi_auth(gw_config.clone(), auth);
+            ch = ch.with_user_tokens(user_tokens.clone());
+            ch
+        } else {
+            GatewayChannel::new(gw_config.clone(), config.owner_id.clone())
+        };
         gw = gw.with_llm_provider(Arc::clone(&components.llm));
         if let Some(ref ws) = components.workspace {
             gw = gw.with_workspace(Arc::clone(ws));
@@ -710,6 +732,9 @@ async fn async_main() -> anyhow::Result<()> {
         if let Some(ref sc) = components.skill_catalog {
             gw = gw.with_skill_catalog(Arc::clone(sc));
         }
+        if config.skills.enabled {
+            gw = gw.with_skills_dir(config.skills.local_dir.clone());
+        }
         gw = gw.with_cost_guard(Arc::clone(&components.cost_guard));
         gw = gw.with_oauth(config.oauth.clone(), gw_config.port);
         {
@@ -791,6 +816,12 @@ async fn async_main() -> anyhow::Result<()> {
         // creates a new SseManager, which would orphan this sender.
         sse_manager = Some(Arc::clone(&gw.state().sse));
         channel_names.push("gateway".to_string());
+
+        // Grab the shared pending-replies map before gw is consumed.
+        // This will be used when resolving claude_container providers
+        // so they share the same map as GatewayState's /api/claude/reply handler.
+        pending_claude_replies = Some(gw.pending_claude_replies());
+
         channels.add(Box::new(gw)).await;
     }
 
@@ -1000,6 +1031,58 @@ async fn async_main() -> anyhow::Result<()> {
             _ => None,
         };
 
+    // Resolve per-user LLM providers from GATEWAY_USER_TOKENS config.
+    let user_llm_providers = config
+        .channels
+        .gateway
+        .as_ref()
+        .and_then(|gw| gw.user_tokens.as_ref())
+        .map(|tokens| {
+            let mut providers = std::collections::HashMap::new();
+            for (auth_token, cfg) in tokens.iter() {
+                match cfg.llm_config() {
+                    Ok(Some(mut llm_cfg)) => {
+                        // Inject the user's gateway auth token so the sandbox
+                        // Claude can access IronClaw tools via MCP.
+                        llm_cfg.gateway_token = Some(
+                            secrecy::SecretString::from(auth_token.clone()),
+                        );
+                        match ironclaw::llm::create_provider_from_user_config_with_context(
+                            &llm_cfg,
+                            pending_claude_replies.clone(),
+                        ) {
+                            Ok(provider) => {
+                                tracing::info!(
+                                    user_id = %cfg.user_id,
+                                    backend = %llm_cfg.backend,
+                                    model = %llm_cfg.model,
+                                    "Resolved per-user LLM provider"
+                                );
+                                providers.insert(cfg.user_id.clone(), provider);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    user_id = %cfg.user_id,
+                                    error = %e,
+                                    "Failed to create per-user LLM provider, user will use global default"
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {} // No per-user LLM config
+                    Err(e) => {
+                        tracing::warn!(
+                            user_id = %cfg.user_id,
+                            error = %e,
+                            "Invalid per-user LLM config"
+                        );
+                    }
+                }
+            }
+            providers
+        })
+        .filter(|m| !m.is_empty());
+
     let mut deps = AgentDeps {
         owner_id: config.owner_id.clone(),
         store: components.db,
@@ -1042,6 +1125,7 @@ async fn async_main() -> anyhow::Result<()> {
         thread_resolver: thread_resolver_for_agent,
         core_tools: config.core_tools.clone(),
         organize_rx: Some(organize_rx),
+        user_llm_providers,
     };
 
     // Initialize escalation tier map if configured.
@@ -1069,6 +1153,9 @@ async fn async_main() -> anyhow::Result<()> {
             }
         }
     }
+
+    // Keep a handle to per-user providers for graceful shutdown.
+    let user_providers_for_shutdown = deps.user_llm_providers.clone();
 
     let channels_for_warnings = Arc::clone(&channels);
     let mut agent = Agent::new(
@@ -1304,6 +1391,17 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Signal background tasks (SIGHUP handler, etc.) to gracefully shut down
     let _ = shutdown_tx.send(());
+
+    // Shut down per-user LLM providers (e.g., Claude supervisor sessions).
+    if let Some(ref providers) = user_providers_for_shutdown {
+        tracing::info!(count = providers.len(), "Shutting down per-user LLM providers");
+        for (user_id, provider) in providers {
+            tracing::info!(user_id = %user_id, "Shutting down per-user LLM provider");
+            provider.shutdown().await;
+        }
+    } else {
+        tracing::debug!("No per-user LLM providers to shut down");
+    }
 
     // Shut down all stdio MCP server child processes.
     components.mcp_process_manager.shutdown_all().await;

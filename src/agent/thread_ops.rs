@@ -805,6 +805,12 @@ impl Agent {
                     .map(|tm| tm.current_tier(&message.user_id))
                     .unwrap_or_else(|| "default".to_string());
 
+                // Clean up sidecar session for this thread before switching providers.
+                // The current (escalated) provider may hold session state that should
+                // be released when de-escalating.
+                let escalated_provider = self.active_llm(&message.user_id);
+                escalated_provider.end_session(thread_id).await;
+
                 // Perform the actual de-escalation.
                 let new_tier = if let Some(ref tier_map) = self.deps.tier_map {
                     tier_map.de_escalate(&message.user_id)
@@ -1295,22 +1301,9 @@ impl Agent {
                 )
                 .await;
 
-            let tool_output = self
+            let tool_result = self
                 .execute_chat_tool(&pending.tool_name, &pending.parameters, &job_ctx)
                 .await;
-
-            // Convert ToolOutput → Result<String, Error> for downstream
-            // string-based operations (status updates, auth check, sanitization).
-            let tool_result: Result<String, Error> = match tool_output {
-                Ok(output) => output.result_string().map_err(|e| {
-                    crate::error::ToolError::ExecutionFailed {
-                        name: pending.tool_name.clone(),
-                        reason: format!("Failed to serialize result: {}", e),
-                    }
-                    .into()
-                }),
-                Err(e) => Err(e),
-            };
 
             let tool_ref = self.tools().get(&pending.tool_name).await;
             let _ = self
@@ -1472,19 +1465,9 @@ impl Agent {
                         )
                         .await;
 
-                    let result: Result<String, Error> = match self
+                    let result = self
                         .execute_chat_tool(&tc.name, &tc.arguments, &job_ctx)
-                        .await
-                    {
-                        Ok(output) => output.result_string().map_err(|e| {
-                            crate::error::ToolError::ExecutionFailed {
-                                name: tc.name.clone(),
-                                reason: format!("Failed to serialize result: {}", e),
-                            }
-                            .into()
-                        }),
-                        Err(e) => Err(e),
-                    };
+                        .await;
 
                     let deferred_tool = self.tools().get(&tc.name).await;
                     let _ = self
@@ -1529,25 +1512,14 @@ impl Agent {
                             )
                             .await;
 
-                        let result: Result<String, Error> =
-                            match execute_chat_tool_standalone(
-                                &tools,
-                                &safety,
-                                &tc.name,
-                                &tc.arguments,
-                                &job_ctx,
-                            )
-                            .await
-                            {
-                                Ok(output) => output.result_string().map_err(|e| {
-                                    crate::error::ToolError::ExecutionFailed {
-                                        name: tc.name.clone(),
-                                        reason: format!("Failed to serialize result: {}", e),
-                                    }
-                                    .into()
-                                }),
-                                Err(e) => Err(e),
-                            };
+                        let result = execute_chat_tool_standalone(
+                            &tools,
+                            &safety,
+                            &tc.name,
+                            &tc.arguments,
+                            &job_ctx,
+                        )
+                        .await;
 
                         let par_tool = tools.get(&tc.name).await;
                         let _ = channels
@@ -1853,6 +1825,8 @@ impl Agent {
                     Ok(SubmissionResult::response(msg))
                 }
                 Ok(AgenticLoopResult::DeEscalate { reason }) => {
+                    // Clean up sidecar session before switching providers.
+                    self.active_llm(&message.user_id).end_session(thread_id).await;
                     if let Some(ref tier_map) = self.deps.tier_map {
                         tier_map.de_escalate(&message.user_id);
                     }

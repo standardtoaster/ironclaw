@@ -166,9 +166,10 @@ impl Agent {
             None
         };
 
-        let mut reasoning = Reasoning::new(self.llm().clone())
+        let user_llm = self.active_llm(&message.user_id);
+        let mut reasoning = Reasoning::new(user_llm.clone())
             .with_channel(message.channel.clone())
-            .with_model_name(self.llm().active_model_name())
+            .with_model_name(user_llm.active_model_name())
             .with_group_chat(is_group_chat)
             .with_platform_info(self.platform_info().await);
 
@@ -292,25 +293,16 @@ impl Agent {
             }
             .into()),
             LoopOutcome::NeedApproval(pending) => Ok(AgenticLoopResult::NeedApproval { pending }),
-            LoopOutcome::Escalate { reason, tier } => {
-                Ok(AgenticLoopResult::Escalate { reason, tier })
-            }
-            LoopOutcome::DeEscalate { reason } => Ok(AgenticLoopResult::DeEscalate { reason }),
-            LoopOutcome::NeedUserInput { pending } => {
-                Ok(AgenticLoopResult::NeedUserInput { pending })
-            }
         }
     }
 
     /// Execute a tool for chat (without full job context).
-    ///
-    /// Returns the full `ToolOutput` so the caller can inspect `.signal`.
     pub(super) async fn execute_chat_tool(
         &self,
         tool_name: &str,
         params: &serde_json::Value,
         job_ctx: &JobContext,
-    ) -> Result<crate::tools::ToolOutput, Error> {
+    ) -> Result<String, Error> {
         execute_chat_tool_standalone(self.tools(), self.safety(), tool_name, params, job_ctx).await
     }
 }
@@ -803,8 +795,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
         }
 
         // === Phase 2: Parallel execution ===
-        // Results carry the full ToolOutput so post-flight can inspect `.signal`.
-        let mut exec_results: Vec<Option<Result<crate::tools::ToolOutput, Error>>> =
+        let mut exec_results: Vec<Option<Result<String, Error>>> =
             (0..preflight.len()).map(|_| None).collect();
 
         if runnable.len() <= 1 {
@@ -826,24 +817,6 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                     .execute_chat_tool(&tc.name, &tc.arguments, &self.job_ctx)
                     .await;
 
-                // Convert to Result<String, Error> for the status update only.
-                let str_result = match &result {
-                    Ok(output) => output
-                        .result_string()
-                        .map_err(|e| -> Error {
-                            crate::error::ToolError::ExecutionFailed {
-                                name: tc.name.clone(),
-                                reason: format!("Failed to serialize result: {}", e),
-                            }
-                            .into()
-                        }),
-                    Err(e) => Err(crate::error::ToolError::ExecutionFailed {
-                        name: tc.name.clone(),
-                        reason: e.to_string(),
-                    }
-                    .into()),
-                };
-
                 let disp_tool = self.agent.tools().get(&tc.name).await;
                 let _ = self
                     .agent
@@ -852,7 +825,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                         &self.message.channel,
                         StatusUpdate::tool_completed(
                             tc.name.clone(),
-                            &str_result,
+                            &result,
                             &tc.arguments,
                             disp_tool.as_deref(),
                         ),
@@ -895,31 +868,13 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                     )
                     .await;
 
-                    // Convert to Result<String, Error> for the status update only.
-                    let str_result = match &result {
-                        Ok(output) => output
-                            .result_string()
-                            .map_err(|e| -> Error {
-                                crate::error::ToolError::ExecutionFailed {
-                                    name: tc.name.clone(),
-                                    reason: format!("Failed to serialize result: {}", e),
-                                }
-                                .into()
-                            }),
-                        Err(e) => Err(crate::error::ToolError::ExecutionFailed {
-                            name: tc.name.clone(),
-                            reason: e.to_string(),
-                        }
-                        .into()),
-                    };
-
                     let par_tool = tools.get(&tc.name).await;
                     let _ = channels
                         .send_status(
                             &channel,
                             StatusUpdate::tool_completed(
                                 tc.name.clone(),
-                                &str_result,
+                                &result,
                                 &tc.arguments,
                                 par_tool.as_deref(),
                             ),
@@ -964,9 +919,6 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
 
         // === Phase 3: Post-flight (sequential, in original order) ===
         let mut deferred_auth: Option<String> = None;
-        // Collect the first tool signal encountered so we can return the
-        // appropriate LoopOutcome after all results are recorded in context.
-        let mut deferred_signal: Option<(crate::tools::ToolSignal, String)> = None;
 
         for (pf_idx, (tc, outcome)) in preflight.into_iter().enumerate() {
             match outcome {
@@ -996,31 +948,8 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                         .into())
                     });
 
-                    // Extract signal before converting to string.
-                    // Only capture the first signal (escalation takes priority).
-                    if deferred_signal.is_none()
-                        && let Ok(ref output) = tool_result
-                        && let Some(ref signal) = output.signal
-                    {
-                        deferred_signal = Some((signal.clone(), tc.id.clone()));
-                    }
-
-                    // Convert ToolOutput → Result<String, Error> for downstream
-                    // string-based operations (image sentinel, preview, auth,
-                    // stash, sanitization).
-                    let str_result: Result<String, Error> = match tool_result {
-                        Ok(output) => output.result_string().map_err(|e| {
-                            crate::error::ToolError::ExecutionFailed {
-                                name: tc.name.clone(),
-                                reason: format!("Failed to serialize result: {}", e),
-                            }
-                            .into()
-                        }),
-                        Err(e) => Err(e),
-                    };
-
                     // Detect image generation sentinel
-                    let is_image_sentinel = if let Ok(ref output) = str_result
+                    let is_image_sentinel = if let Ok(ref output) = tool_result
                         && matches!(tc.name.as_str(), "image_generate" | "image_edit")
                     {
                         if let Ok(sentinel) = serde_json::from_str::<serde_json::Value>(output)
@@ -1061,7 +990,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
 
                     // Send ToolResult preview
                     if !is_image_sentinel
-                        && let Ok(ref output) = str_result
+                        && let Ok(ref output) = tool_result
                         && !output.is_empty()
                     {
                         let _ = self
@@ -1081,9 +1010,9 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                     // Check for auth awaiting
                     if deferred_auth.is_none()
                         && let Some((ext_name, instructions)) =
-                            check_auth_required(&tc.name, &str_result)
+                            check_auth_required(&tc.name, &tool_result)
                     {
-                        let auth_data = parse_auth_result(&str_result);
+                        let auth_data = parse_auth_result(&tool_result);
                         {
                             let mut sess = self.session.lock().await;
                             if let Some(thread) = sess.threads.get_mut(&self.thread_id) {
@@ -1108,7 +1037,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                     }
 
                     // Stash full output so subsequent tools can reference it
-                    if let Ok(ref output) = str_result {
+                    if let Ok(ref output) = tool_result {
                         self.job_ctx
                             .tool_output_stash
                             .write()
@@ -1151,46 +1080,6 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
             return Ok(Some(LoopOutcome::Response(instructions)));
         }
 
-        // Handle tool signals (escalate / de-escalate / user-input-needed).
-        // Signals are checked after all tool results are recorded in context
-        // so the LLM has full visibility when it resumes.
-        if let Some((signal, tool_call_id)) = deferred_signal {
-            use crate::tools::ToolSignal;
-            match signal {
-                ToolSignal::Escalate { reason, tier } => {
-                    tracing::info!(
-                        reason = %reason,
-                        tier = ?tier,
-                        "Tool signal: escalate"
-                    );
-                    return Ok(Some(LoopOutcome::Escalate { reason, tier }));
-                }
-                ToolSignal::DeEscalate { reason } => {
-                    let reason = reason.unwrap_or_else(|| "task complete".to_string());
-                    tracing::info!(reason = %reason, "Tool signal: de-escalate");
-                    return Ok(Some(LoopOutcome::DeEscalate { reason }));
-                }
-                ToolSignal::UserInputNeeded {
-                    question,
-                    options,
-                    metadata,
-                } => {
-                    tracing::info!(question = %question, "Tool signal: user input needed");
-                    let pending = crate::agent::session::PendingUserInput {
-                        request_id: Uuid::new_v4(),
-                        question,
-                        options,
-                        metadata,
-                        tool_call_id,
-                        context_messages: reason_ctx.messages.clone(),
-                        deferred_tool_calls: vec![],
-                        user_timezone: Some(self.user_tz.name().to_string()),
-                    };
-                    return Ok(Some(LoopOutcome::NeedUserInput { pending }));
-                }
-            }
-        }
-
         // Handle approval if a tool needed it
         if let Some((approval_idx, tc, tool, allow_always)) = approval_needed {
             let display_params = redact_params(&tc.arguments, tool.sensitive_params());
@@ -1219,16 +1108,13 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
 /// This standalone function enables parallel invocation from spawned JoinSet
 /// tasks, which cannot borrow `&self`. Delegates to the shared
 /// `execute_tool_with_safety` pipeline.
-///
-/// Returns the full `ToolOutput` so callers can inspect `.signal` for
-/// escalation/de-escalation/user-input signals.
 pub(super) async fn execute_chat_tool_standalone(
     tools: &crate::tools::ToolRegistry,
     safety: &ironclaw_safety::SafetyLayer,
     tool_name: &str,
     params: &serde_json::Value,
     job_ctx: &crate::context::JobContext,
-) -> Result<crate::tools::ToolOutput, Error> {
+) -> Result<String, Error> {
     crate::tools::execute::execute_tool_with_safety(
         tools,
         safety,
@@ -1578,6 +1464,7 @@ mod tests {
             thread_resolver: None,
             core_tools: Vec::new(),
             organize_rx: None,
+            user_llm_providers: None,
         };
 
         Agent::new(
@@ -1957,10 +1844,7 @@ mod tests {
 
         assert!(result.is_ok());
         let output = result.unwrap();
-        let output_str = output
-            .result_string()
-            .expect("result should serialize"); // safety: test-only assertion
-        assert!(output_str.contains("hello"));
+        assert!(output.contains("hello"));
     }
 
     #[tokio::test]
@@ -2472,6 +2356,7 @@ mod tests {
             thread_resolver: None,
             core_tools: Vec::new(),
             organize_rx: None,
+            user_llm_providers: None,
         };
 
         Agent::new(
@@ -2609,6 +2494,7 @@ mod tests {
                 thread_resolver: None,
                 core_tools: Vec::new(),
                 organize_rx: None,
+                user_llm_providers: None,
             };
 
             Agent::new(
@@ -2960,7 +2846,9 @@ mod tests {
             workspace_router: None,
             thread_resolver: None,
             core_tools: Vec::new(),
+            llm_backend: "nearai".to_string(),
             organize_rx: None,
+            user_llm_providers: None,
             tier_map: Some(Arc::new(
                 TierMap::new(vec![
                     TierEntry {
@@ -3061,5 +2949,238 @@ mod tests {
         // No tier map, active_llm() should return deps.llm
         assert_eq!(agent.active_llm("test-user").model_name(), "static-mock");
         assert!(agent.tier_map().is_none());
+    }
+
+    /// Verify that active_llm() returns a per-user provider override when configured.
+    ///
+    /// When GATEWAY_USER_TOKENS specifies a per-user LLM backend (e.g. claude_container),
+    /// active_llm() should return that provider instead of the global default.
+    #[test]
+    fn test_active_llm_uses_per_user_provider() {
+        // Create a distinct per-user provider
+        struct PerUserProvider;
+        #[async_trait]
+        impl LlmProvider for PerUserProvider {
+            fn model_name(&self) -> &str {
+                "per-user-claude"
+            }
+            fn cost_per_token(&self) -> (Decimal, Decimal) {
+                (Decimal::ZERO, Decimal::ZERO)
+            }
+            async fn complete(
+                &self,
+                _r: CompletionRequest,
+            ) -> Result<CompletionResponse, crate::error::LlmError> {
+                unimplemented!()
+            }
+            async fn complete_with_tools(
+                &self,
+                _r: ToolCompletionRequest,
+            ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
+                unimplemented!()
+            }
+        }
+
+        let mut user_providers = std::collections::HashMap::new();
+        user_providers.insert(
+            "andrew".to_string(),
+            Arc::new(PerUserProvider) as Arc<dyn LlmProvider>,
+        );
+
+        let deps = AgentDeps {
+            owner_id: "default".to_string(),
+            store: None,
+            llm: Arc::new(StaticLlmProvider),
+            cheap_llm: None,
+            safety: Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 100_000,
+                injection_check_enabled: true,
+            })),
+            tools: Arc::new(ToolRegistry::new()),
+            workspace: None,
+            extension_manager: None,
+            skill_registry: None,
+            skill_catalog: None,
+            skills_config: SkillsConfig::default(),
+            hooks: Arc::new(HookRegistry::new()),
+            cost_guard: Arc::new(CostGuard::new(CostGuardConfig::default())),
+            sse_tx: None,
+            http_interceptor: None,
+            transcription: None,
+            document_extraction: None,
+            sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            builder: None,
+            llm_backend: "nearai".to_string(),
+            tier_map: None,
+            workspace_router: None,
+            thread_resolver: None,
+            core_tools: Vec::new(),
+            organize_rx: None,
+            user_llm_providers: Some(user_providers),
+        };
+
+        let agent = Agent::new(
+            AgentConfig {
+                name: "test-agent".to_string(),
+                max_parallel_jobs: 1,
+                job_timeout: Duration::from_secs(60),
+                stuck_threshold: Duration::from_secs(60),
+                repair_check_interval: Duration::from_secs(30),
+                max_repair_attempts: 1,
+                use_planning: false,
+                session_idle_timeout: Duration::from_secs(300),
+                allow_local_tools: false,
+                max_cost_per_day_cents: None,
+                max_actions_per_hour: None,
+                max_tool_iterations: 50,
+                auto_approve_tools: false,
+                default_timezone: "UTC".to_string(),
+                max_tokens_per_job: 0,
+                tool_description_mode: crate::config::ToolDescriptionMode::Compressed,
+            },
+            deps,
+            Arc::new(ChannelManager::new()),
+            None,
+            None,
+            None,
+            Some(Arc::new(ContextManager::new(1))),
+            None,
+        );
+
+        // Per-user provider should be returned for andrew
+        assert_eq!(
+            agent.active_llm("andrew").model_name(),
+            "per-user-claude",
+            "Expected per-user provider for andrew, got global default"
+        );
+
+        // Unknown user should still get the global default
+        assert_eq!(
+            agent.active_llm("grace").model_name(),
+            "static-mock",
+            "Expected global default for unknown user grace"
+        );
+    }
+
+    /// Per-user provider overrides take priority over tier map escalation.
+    ///
+    /// When both user_llm_providers and tier_map are configured, the per-user
+    /// provider should win — it represents an explicit backend assignment (e.g.
+    /// claude_container) that should not be overridden by model escalation.
+    #[test]
+    fn test_per_user_provider_overrides_tier_map() {
+        use crate::llm::tier::{TierEntry, TierMap};
+
+        struct PerUserProvider;
+        #[async_trait]
+        impl LlmProvider for PerUserProvider {
+            fn model_name(&self) -> &str {
+                "per-user-claude"
+            }
+            fn cost_per_token(&self) -> (Decimal, Decimal) {
+                (Decimal::ZERO, Decimal::ZERO)
+            }
+            async fn complete(
+                &self,
+                _r: CompletionRequest,
+            ) -> Result<CompletionResponse, crate::error::LlmError> {
+                unimplemented!()
+            }
+            async fn complete_with_tools(
+                &self,
+                _r: ToolCompletionRequest,
+            ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
+                unimplemented!()
+            }
+        }
+
+        let mut user_providers = std::collections::HashMap::new();
+        user_providers.insert(
+            "andrew".to_string(),
+            Arc::new(PerUserProvider) as Arc<dyn LlmProvider>,
+        );
+
+        let deps = AgentDeps {
+            owner_id: "default".to_string(),
+            store: None,
+            llm: Arc::new(StaticLlmProvider),
+            cheap_llm: None,
+            safety: Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 100_000,
+                injection_check_enabled: true,
+            })),
+            tools: Arc::new(ToolRegistry::new()),
+            workspace: None,
+            extension_manager: None,
+            skill_registry: None,
+            skill_catalog: None,
+            skills_config: SkillsConfig::default(),
+            hooks: Arc::new(HookRegistry::new()),
+            cost_guard: Arc::new(CostGuard::new(CostGuardConfig::default())),
+            sse_tx: None,
+            http_interceptor: None,
+            transcription: None,
+            document_extraction: None,
+            sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            builder: None,
+            llm_backend: "nearai".to_string(),
+            tier_map: Some(Arc::new(
+                TierMap::new(vec![
+                    TierEntry {
+                        name: "local".into(),
+                        is_default: true,
+                        provider: Arc::new(StaticLlmProvider) as Arc<dyn LlmProvider>,
+                    },
+                ])
+                .unwrap(),
+            )),
+            workspace_router: None,
+            thread_resolver: None,
+            core_tools: Vec::new(),
+            organize_rx: None,
+            user_llm_providers: Some(user_providers),
+        };
+
+        let agent = Agent::new(
+            AgentConfig {
+                name: "test-agent".to_string(),
+                max_parallel_jobs: 1,
+                job_timeout: Duration::from_secs(60),
+                stuck_threshold: Duration::from_secs(60),
+                repair_check_interval: Duration::from_secs(30),
+                max_repair_attempts: 1,
+                use_planning: false,
+                session_idle_timeout: Duration::from_secs(300),
+                allow_local_tools: false,
+                max_cost_per_day_cents: None,
+                max_actions_per_hour: None,
+                max_tool_iterations: 50,
+                auto_approve_tools: false,
+                default_timezone: "UTC".to_string(),
+                max_tokens_per_job: 0,
+                tool_description_mode: crate::config::ToolDescriptionMode::Compressed,
+            },
+            deps,
+            Arc::new(ChannelManager::new()),
+            None,
+            None,
+            None,
+            Some(Arc::new(ContextManager::new(1))),
+            None,
+        );
+
+        // Per-user provider should win over tier map
+        assert_eq!(
+            agent.active_llm("andrew").model_name(),
+            "per-user-claude",
+            "Per-user provider should take priority over tier map"
+        );
+
+        // User without per-user provider should get tier map default
+        assert_eq!(
+            agent.active_llm("grace").model_name(),
+            "static-mock",
+            "User without per-user override should use tier map default"
+        );
     }
 }

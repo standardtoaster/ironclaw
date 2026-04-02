@@ -111,6 +111,10 @@ pub struct UserLlmConfig {
     pub model: String,
     pub api_key: Option<SecretString>,
     pub base_url: Option<String>,
+    /// User ID (lens name) — used for sandbox Claude identity.
+    pub user_id: Option<String>,
+    /// Gateway auth token for this user — used for IronClaw MCP access from sandbox.
+    pub gateway_token: Option<SecretString>,
 }
 
 impl UserTokenConfig {
@@ -125,6 +129,8 @@ impl UserTokenConfig {
                     model: model.clone(),
                     api_key: self.llm_api_key.clone(),
                     base_url: self.llm_base_url.clone(),
+                    user_id: Some(self.user_id.clone()),
+                    gateway_token: None, // Set by caller with the user's auth token.
                 }))
             }
             (Some(_), None) | (None, Some(_)) => Err(format!(
