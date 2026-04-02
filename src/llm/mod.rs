@@ -13,6 +13,12 @@ mod anthropic_oauth;
 mod bedrock;
 pub mod circuit_breaker;
 mod cleaning_provider;
+pub mod claude_container;
+pub mod claude_protocol;
+pub mod claude_sidecar;
+pub mod container_backend;
+pub mod container_pool;
+pub mod container_supervisor;
 pub(crate) mod codex_auth;
 mod codex_chatgpt;
 pub mod config;
@@ -811,8 +817,20 @@ pub fn create_gemini_oauth_provider(config: &LlmConfig) -> Result<Arc<dyn LlmPro
 /// This builds a minimal provider (no retry, failover, smart routing, or cache)
 /// for per-user overrides. The user config specifies the backend, model, and
 /// optional API key / base URL.
+/// Create a per-user LLM provider from token config.
+///
+/// For `claude_container` backends, pass `pending_replies` to share the callback
+/// map with `GatewayState` so `/api/claude/reply` can resolve responses.
 pub fn create_provider_from_user_config(
     user_config: &crate::config::UserLlmConfig,
+) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    create_provider_from_user_config_with_context(user_config, None)
+}
+
+/// Create a per-user LLM provider with optional shared state for supervisor backends.
+pub fn create_provider_from_user_config_with_context(
+    user_config: &crate::config::UserLlmConfig,
+    pending_replies: Option<crate::llm::container_supervisor::PendingRepliesMap>,
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
     use secrecy::ExposeSecret;
 
@@ -957,11 +975,75 @@ pub fn create_provider_from_user_config(
             );
             Ok(Arc::new(RigAdapter::new(model, &user_config.model)))
         }
+        "claude_container" => {
+            use crate::llm::claude_container::{ClaudeContainerProvider, ContainerProviderConfig};
+
+            let base_url = user_config.base_url.as_deref().unwrap_or("");
+            let is_supervisor = base_url.starts_with("http");
+
+            let config = ContainerProviderConfig {
+                backend_type: if is_supervisor {
+                    "supervisor".to_string()
+                } else {
+                    "docker".to_string()
+                },
+                model: user_config.model.clone(),
+                lens: user_config.user_id.clone().unwrap_or_default(),
+                image: std::env::var("CLAUDE_CONTAINER_IMAGE")
+                    .unwrap_or_else(|_| "percy-claude:latest".to_string()),
+                socket_path: std::env::var("CLAUDE_CONTAINER_SOCKET").unwrap_or_default(),
+                network: std::env::var("CLAUDE_CONTAINER_NETWORK")
+                    .unwrap_or_else(|_| "percy_proxy-network".to_string()),
+                auth_volume: std::env::var("CLAUDE_CONTAINER_AUTH_VOLUME")
+                    .unwrap_or_else(|_| "claude-auth".to_string()),
+                skip_permissions: true,
+                request_timeout_secs: 300,
+                extra_env: vec![],
+                lens_data_volume: None,
+                lens_config_path: None,
+                supervisor_url: if is_supervisor {
+                    Some(base_url.to_string())
+                } else {
+                    None
+                },
+                callback_url: if is_supervisor {
+                    std::env::var("CLAUDE_CONTAINER_CALLBACK_URL").ok()
+                } else {
+                    None
+                },
+                supervisor_auth_token: None,
+                gateway_url: if is_supervisor {
+                    std::env::var("CLAUDE_CONTAINER_GATEWAY_URL").ok()
+                } else {
+                    None
+                },
+                gateway_token: if is_supervisor {
+                    user_config.gateway_token.as_ref().map(|s| {
+                        use secrecy::ExposeSecret;
+                        s.expose_secret().to_string()
+                    })
+                } else {
+                    None
+                },
+            };
+
+            tracing::info!(
+                user_model = %user_config.model,
+                backend_type = %config.backend_type,
+                "Per-user Claude container provider created"
+            );
+            if let Some(pending) = pending_replies {
+                Ok(Arc::new(ClaudeContainerProvider::new_with_shared_pending(config, pending)))
+            } else {
+                Ok(Arc::new(ClaudeContainerProvider::new(config)))
+            }
+        }
         "nearai" => {
             Err(LlmError::RequestFailed {
                 provider: "nearai".to_string(),
                 reason: "NearAI backend is not supported for per-user LLM config; \
-                         use anthropic, openai, ollama, openai_compatible, or tinfoil"
+                         use anthropic, openai, ollama, openai_compatible, tinfoil, \
+                         or claude_container"
                     .to_string(),
             })
         }
@@ -970,7 +1052,7 @@ pub fn create_provider_from_user_config(
                 provider: other.to_string(),
                 reason: format!(
                     "Unknown LLM backend '{}'; supported: anthropic, openai, ollama, \
-                     openai_compatible, tinfoil",
+                     openai_compatible, tinfoil, claude_container",
                     other
                 ),
             })
@@ -1138,5 +1220,58 @@ mod tests {
         // None when nothing configured
         let config = test_llm_config();
         assert_eq!(config.cheap_model_name(), None);
+    }
+
+    #[test]
+    fn test_create_provider_from_user_config_claude_container() {
+        use crate::config::UserLlmConfig;
+        let cfg = UserLlmConfig {
+            backend: "claude_container".to_string(),
+            model: "claude-sonnet-4-20250514".to_string(),
+            api_key: None,
+            base_url: Some("http://localhost:3201".to_string()),
+            user_id: Some("test".to_string()),
+            gateway_token: None,
+        };
+        let result = create_provider_from_user_config(&cfg);
+        assert!(result.is_ok(), "claude_container provider creation failed: {:?}", result.err());
+        let provider = result.unwrap();
+        assert!(
+            provider.model_name().contains("claude-sonnet-4-20250514"),
+            "Expected model name to contain 'claude-sonnet-4-20250514', got '{}'",
+            provider.model_name()
+        );
+    }
+
+    #[test]
+    fn test_create_provider_from_user_config_unknown_backend() {
+        use crate::config::UserLlmConfig;
+        let cfg = UserLlmConfig {
+            backend: "nonexistent".to_string(),
+            model: "some-model".to_string(),
+            api_key: None,
+            base_url: None,
+            user_id: None,
+            gateway_token: None,
+        };
+        let result = create_provider_from_user_config(&cfg);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_provider_from_user_config_openai_compatible() {
+        use crate::config::UserLlmConfig;
+        let cfg = UserLlmConfig {
+            backend: "openai_compatible".to_string(),
+            model: "qwen3.5".to_string(),
+            api_key: None,
+            base_url: Some("http://localhost:8080/v1".to_string()),
+            user_id: None,
+            gateway_token: None,
+        };
+        let result = create_provider_from_user_config(&cfg);
+        assert!(result.is_ok(), "openai_compatible provider creation failed: {:?}", result.err());
+        let provider = result.unwrap();
+        assert!(provider.model_name().contains("qwen3.5"));
     }
 }

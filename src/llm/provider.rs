@@ -439,6 +439,23 @@ pub trait LlmProvider: Send + Sync {
     fn cache_read_discount(&self) -> Decimal {
         Decimal::ONE
     }
+
+    /// End a session associated with a specific thread.
+    ///
+    /// Called during de-escalation to clean up provider-specific session state.
+    /// Only providers that maintain per-thread sessions (e.g., `ClaudeSidecarProvider`)
+    /// need to override this. Default is a no-op.
+    async fn end_session(&self, _thread_id: uuid::Uuid) {
+        // No-op for providers without session tracking.
+    }
+
+    /// Shut down all sessions managed by this provider.
+    ///
+    /// Called during graceful application shutdown to clean up provider resources
+    /// (e.g., supervisor-managed Claude sessions). Default is a no-op.
+    async fn shutdown(&self) {
+        // No-op for stateless providers.
+    }
 }
 
 /// Sanitize a message list to ensure tool_use / tool_result integrity.
