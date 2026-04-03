@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
 
 #[derive(Debug, Deserialize)]
@@ -34,6 +35,7 @@ pub struct WorkspaceListResponse {
 
 pub async fn workspaces_list_handler(
     State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(identity): AuthenticatedUser,
     Query(params): Query<WorkspaceListParams>,
 ) -> Result<Json<WorkspaceListResponse>, (StatusCode, String)> {
     let db = state.store.as_ref().ok_or((
@@ -42,7 +44,7 @@ pub async fn workspaces_list_handler(
     ))?;
 
     let workspaces = db
-        .list_agent_workspaces(&state.owner_id, params.status.as_deref())
+        .list_agent_workspaces(&identity.user_id, params.status.as_deref())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
