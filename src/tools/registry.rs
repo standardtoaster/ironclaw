@@ -18,7 +18,7 @@ use crate::tools::builder::{
 };
 use crate::tools::builtin::{
     ApplyPatchTool, AskUserTool, CancelJobTool, ConversationLoadTool, CreateJobTool,
-    DeescalateTool, DiscoverToolsTool, EchoTool, EscalateTool,
+    DeescalateTool, EchoTool, EscalateTool,
     ExtensionInfoTool, HttpTool, JobEventsTool, JobPromptTool, JobStatusTool, JsonTool,
     ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool,
     PromptQueue, ReadFileTool, ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool,
@@ -542,25 +542,6 @@ impl ToolRegistry {
     /// Register discover_tools with MCP service registry awareness.
     ///
     /// This re-registers `discover_tools` (replacing any earlier registration)
-    /// with references to the service registry and cache, enabling Phase 2
-    /// MCP service search in addition to Phase 1 local tool search.
-    pub async fn register_discover_tools_with_services(
-        self: &Arc<Self>,
-        service_registry: Option<Arc<crate::tools::mcp::ServiceRegistry>>,
-        service_cache: Option<Arc<crate::tools::mcp::ServiceCache>>,
-    ) {
-        let tool = DiscoverToolsTool::with_services(
-            Arc::clone(self),
-            service_registry,
-            service_cache,
-        );
-        // register() will replace any existing discover_tools since it uses
-        // the same tool name. This is intentional — we're upgrading from
-        // the basic Phase 1 version to the full Phase 1 + Phase 2 version.
-        self.register(Arc::new(tool)).await;
-        tracing::info!("Registered discover_tools with MCP service awareness");
-    }
-
     /// Register skill management tools (list, search, install, remove).
     ///
     /// These allow the LLM to manage prompt-level skills through conversation.
