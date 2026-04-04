@@ -2599,9 +2599,7 @@ mod tests {
                 llm_backend: "nearai".to_string(),
 
                 tenant_rates: Arc::new(crate::tenant::TenantRateRegistry::new(4, 3)),
-=======
                 tier_map: None,
->>>>>>> d2216198 (fix: resolve compilation errors from model-escalation rebase)
             };
 
             Agent::new(

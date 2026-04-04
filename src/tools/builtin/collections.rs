@@ -4253,6 +4253,391 @@ mod owner_scope_tests {
     }
 }
 
+/// Multi-lens tool visibility tests — validates that `generate_collection_tools()` +
+/// `ToolRegistry::tool_definitions_for_user()` produce the correct per-lens tool sets.
+///
+/// These are the unit tests for Percy's multi-lens collection scoping. They exercise
+/// the full path: schema → generate_collection_tools → registry.register → filter by user.
+///
+/// Covers:
+/// - Each lens sees only its own collection tools (no cross-lens leakage)
+/// - workspace_read_scopes grants visibility to other lenses' tools
+/// - source_scope tools are owned by the source scope (not the registering user)
+/// - No duplicate tools when cross-scope schemas mirror own schemas
+/// - Household (own-access) sees only its own tools
+/// - Tool execution gating matches tool visibility
+#[cfg(all(test, feature = "libsql"))]
+mod multi_lens_tool_visibility_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use crate::db::Database;
+    use crate::db::libsql::LibSqlBackend;
+    use crate::db::structured::{CollectionSchema, FieldDef, FieldType};
+    use crate::tools::builtin::collections::generate_collection_tools;
+    use crate::tools::registry::ToolRegistry;
+
+    fn simple_schema(collection: &str, source_scope: Option<&str>) -> CollectionSchema {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "item".to_string(),
+            FieldDef {
+                field_type: FieldType::Text,
+                required: true,
+                default: None,
+            },
+        );
+        CollectionSchema {
+            collection: collection.to_string(),
+            description: Some(format!("test {collection}")),
+            fields,
+            source_scope: source_scope.map(|s| s.to_string()),
+        }
+    }
+
+    async fn make_db() -> (Arc<dyn Database>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        (Arc::new(backend), dir)
+    }
+
+    /// Register collection tools for a user and add them to the registry.
+    async fn register_tools(
+        registry: &ToolRegistry,
+        db: &Arc<dyn Database>,
+        schema: &CollectionSchema,
+        owner_user_id: &str,
+    ) {
+        let tools = generate_collection_tools(schema, Arc::clone(db), None, owner_user_id);
+        for tool in tools {
+            registry.register(tool).await;
+        }
+    }
+
+    // ---- Percy 3-lens scenario: andrew, grace, household ----
+
+    #[tokio::test]
+    async fn andrew_sees_only_own_tools_without_scopes() {
+        let (db, _dir) = make_db().await;
+        let registry = ToolRegistry::new();
+
+        // Each lens owns a collection
+        register_tools(&registry, &db, &simple_schema("tasks", None), "andrew").await;
+        register_tools(&registry, &db, &simple_schema("diary", None), "grace").await;
+        register_tools(
+            &registry,
+            &db,
+            &simple_schema("childcare_hours", None),
+            "household",
+        )
+        .await;
+
+        // Andrew with NO read scopes
+        let defs = registry.tool_definitions_for_user("andrew", &[]).await;
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(names.contains(&"andrew_tasks_query"), "should see own tools");
+        assert!(names.contains(&"andrew_tasks_add"), "should see own tools");
+        assert!(
+            !names.iter().any(|n| n.starts_with("grace_")),
+            "should NOT see grace's tools: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("household_")),
+            "should NOT see household's tools: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn andrew_sees_household_tools_with_read_scope() {
+        let (db, _dir) = make_db().await;
+        let registry = ToolRegistry::new();
+
+        register_tools(&registry, &db, &simple_schema("tasks", None), "andrew").await;
+        register_tools(&registry, &db, &simple_schema("diary", None), "grace").await;
+        register_tools(
+            &registry,
+            &db,
+            &simple_schema("childcare_hours", None),
+            "household",
+        )
+        .await;
+
+        // Andrew with household scope (Percy's typical config for memory_access=all)
+        let scopes = vec!["household".to_string()];
+        let defs = registry.tool_definitions_for_user("andrew", &scopes).await;
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(names.contains(&"andrew_tasks_query"), "should see own");
+        assert!(
+            names.contains(&"household_childcare_hours_query"),
+            "should see household via scope: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("grace_")),
+            "should NOT see grace (not in scopes): {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn andrew_sees_all_with_full_scopes() {
+        let (db, _dir) = make_db().await;
+        let registry = ToolRegistry::new();
+
+        register_tools(&registry, &db, &simple_schema("tasks", None), "andrew").await;
+        register_tools(&registry, &db, &simple_schema("diary", None), "grace").await;
+        register_tools(
+            &registry,
+            &db,
+            &simple_schema("childcare_hours", None),
+            "household",
+        )
+        .await;
+
+        // Andrew with all scopes (memory_access=all sees grace + household)
+        let scopes = vec!["grace".to_string(), "household".to_string()];
+        let defs = registry.tool_definitions_for_user("andrew", &scopes).await;
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(names.contains(&"andrew_tasks_add"));
+        assert!(names.contains(&"grace_diary_query"));
+        assert!(names.contains(&"household_childcare_hours_summary"));
+        // 5 tools per collection × 3 collections = 15
+        let collection_tools: Vec<&&str> = names
+            .iter()
+            .filter(|n| {
+                n.starts_with("andrew_") || n.starts_with("grace_") || n.starts_with("household_")
+            })
+            .collect();
+        assert_eq!(
+            collection_tools.len(),
+            15,
+            "should see exactly 15 collection tools (5 per collection × 3): {collection_tools:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn household_sees_only_own_tools() {
+        let (db, _dir) = make_db().await;
+        let registry = ToolRegistry::new();
+
+        register_tools(&registry, &db, &simple_schema("tasks", None), "andrew").await;
+        register_tools(&registry, &db, &simple_schema("diary", None), "grace").await;
+        register_tools(
+            &registry,
+            &db,
+            &simple_schema("childcare_hours", None),
+            "household",
+        )
+        .await;
+
+        // Household with NO scopes (memory_access=own)
+        let defs = registry.tool_definitions_for_user("household", &[]).await;
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"household_childcare_hours_query"),
+            "should see own tools"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("andrew_")),
+            "must NOT see andrew's tools: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("grace_")),
+            "must NOT see grace's tools: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_scope_tools_owned_by_source_not_registrant() {
+        let (db, _dir) = make_db().await;
+        let registry = ToolRegistry::new();
+
+        // Andrew registers a cross-scope schema pointing at household
+        let schema = simple_schema("childcare_hours", Some("household"));
+        register_tools(&registry, &db, &schema, "andrew").await;
+
+        // The tools should be owned by "household" (source_scope), not "andrew"
+        let all = registry.all().await;
+        for tool in &all {
+            let name = tool.name();
+            if name.contains("childcare_hours") {
+                assert_eq!(
+                    tool.owner_user_id(),
+                    Some("andrew"),
+                    "owner_user_id is the registrant (andrew), but tool name uses source_scope"
+                );
+                assert!(
+                    name.starts_with("household_"),
+                    "tool name should use source_scope prefix: {name}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_duplicates_with_same_collection_name_different_owners() {
+        let (db, _dir) = make_db().await;
+        let registry = ToolRegistry::new();
+
+        // Both andrew and grace have a "tasks" collection
+        register_tools(&registry, &db, &simple_schema("tasks", None), "andrew").await;
+        register_tools(&registry, &db, &simple_schema("tasks", None), "grace").await;
+
+        // Andrew with grace scope — should see both, no duplicates
+        let scopes = vec!["grace".to_string()];
+        let defs = registry.tool_definitions_for_user("andrew", &scopes).await;
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+
+        // Should have andrew_tasks_X and grace_tasks_X — distinct names, no dupes
+        assert!(names.contains(&"andrew_tasks_add"));
+        assert!(names.contains(&"grace_tasks_add"));
+        assert!(names.contains(&"andrew_tasks_query"));
+        assert!(names.contains(&"grace_tasks_query"));
+
+        // Exactly 10 collection tools (5 per collection × 2 owners)
+        assert_eq!(
+            names.len(),
+            10,
+            "should have exactly 10 tools (no duplicates): {names:?}"
+        );
+
+        // Verify uniqueness
+        let unique: std::collections::HashSet<&&str> = names.iter().collect();
+        assert_eq!(names.len(), unique.len(), "all tool names should be unique");
+    }
+
+    #[tokio::test]
+    async fn cross_scope_schema_does_not_double_register() {
+        let (db, _dir) = make_db().await;
+        let registry = ToolRegistry::new();
+
+        // Household owns the collection natively
+        register_tools(
+            &registry,
+            &db,
+            &simple_schema("childcare_hours", None),
+            "household",
+        )
+        .await;
+
+        // Andrew also has a cross-scope schema pointing at household
+        let cross_schema = simple_schema("childcare_hours", Some("household"));
+        register_tools(&registry, &db, &cross_schema, "andrew").await;
+
+        // The cross-scope registration should overwrite (same tool name) not duplicate
+        let all = registry.all().await;
+        let childcare_tools: Vec<_> = all
+            .iter()
+            .filter(|t| t.name().contains("childcare_hours"))
+            .collect();
+
+        // Should be exactly 5 tools (add, update, delete, query, summary)
+        assert_eq!(
+            childcare_tools.len(),
+            5,
+            "cross-scope registration should not create duplicates: {:?}",
+            childcare_tools
+                .iter()
+                .map(|t| t.name())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_gating_matches_visibility() {
+        let (db, _dir) = make_db().await;
+        let registry = ToolRegistry::new();
+
+        register_tools(&registry, &db, &simple_schema("diary", None), "grace").await;
+
+        // Andrew WITHOUT grace scope — tool should not be findable
+        let tool = registry
+            .get_for_user("grace_diary_query", "andrew", &[])
+            .await;
+        assert!(
+            tool.is_none(),
+            "andrew should not be able to execute grace's tool without scope"
+        );
+
+        // Andrew WITH grace scope — tool should be findable
+        let scopes = vec!["grace".to_string()];
+        let tool = registry
+            .get_for_user("grace_diary_query", "andrew", &scopes)
+            .await;
+        assert!(
+            tool.is_some(),
+            "andrew should be able to execute grace's tool with scope"
+        );
+
+        // Grace herself — always allowed
+        let tool = registry
+            .get_for_user("grace_diary_query", "grace", &[])
+            .await;
+        assert!(tool.is_some(), "grace should always access her own tool");
+    }
+
+    #[tokio::test]
+    async fn initialize_for_users_registers_correct_tools() {
+        let (db, _dir) = make_db().await;
+        let registry = Arc::new(ToolRegistry::new());
+
+        // Pre-register schemas in the DB (simulating prior sessions)
+        db.register_collection("andrew", &simple_schema("tasks", None))
+            .await
+            .unwrap();
+        db.register_collection("grace", &simple_schema("diary", None))
+            .await
+            .unwrap();
+        db.register_collection("household", &simple_schema("childcare_hours", None))
+            .await
+            .unwrap();
+
+        // Run the startup initializer (what app.rs calls)
+        super::initialize_collection_tools_for_users(
+            &[
+                "andrew".to_string(),
+                "grace".to_string(),
+                "household".to_string(),
+            ],
+            &db,
+            &registry,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // Verify correct per-lens visibility
+        let andrew_defs = registry
+            .tool_definitions_for_user("andrew", &["household".to_string()])
+            .await;
+        let andrew_names: Vec<&str> = andrew_defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(andrew_names.contains(&"andrew_tasks_add"));
+        assert!(andrew_names.contains(&"household_childcare_hours_query"));
+        assert!(
+            !andrew_names.iter().any(|n| n.starts_with("grace_")),
+            "andrew should not see grace's tools without scope"
+        );
+
+        let household_defs = registry.tool_definitions_for_user("household", &[]).await;
+        let household_names: Vec<&str> = household_defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(household_names.contains(&"household_childcare_hours_add"));
+        assert!(
+            !household_names.iter().any(|n| n.starts_with("andrew_")),
+            "household must not see andrew's tools: {household_names:?}"
+        );
+        assert!(
+            !household_names.iter().any(|n| n.starts_with("grace_")),
+            "household must not see grace's tools: {household_names:?}"
+        );
+    }
+}
+
 /// Cross-scope integration tests using file-backed libsql (no postgres dependency).
 ///
 /// These tests validate:

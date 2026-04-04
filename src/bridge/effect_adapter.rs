@@ -596,9 +596,10 @@ impl EffectBridgeAdapter {
 
         match result {
             Ok(output) => {
-                let sanitized = self.safety.sanitize_tool_output(lookup_name, &output);
+                let output_str = output.result_string().unwrap_or_default();
+                let sanitized = self.safety.sanitize_tool_output(lookup_name, &output_str);
                 let wrapped = self.safety.wrap_for_llm(lookup_name, &sanitized.content);
-                let output_value = serde_json::from_str::<serde_json::Value>(&output)
+                let output_value = serde_json::from_str::<serde_json::Value>(&output_str)
                     .unwrap_or(serde_json::Value::String(wrapped));
 
                 if (lookup_name == "tool_activate" || lookup_name == "tool_auth")

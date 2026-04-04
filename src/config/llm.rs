@@ -1877,7 +1877,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn builtin_override_model_wins_over_env_var() {
         let _guard = lock_env();
         // SAFETY: Under ENV_MUTEX.
@@ -2261,7 +2260,9 @@ mod tests {
         unsafe {
             std::env::remove_var("GROQ_BASE_URL");
         }
-=======
+    }
+
+    #[test]
     fn test_escalation_tiers_not_set_returns_empty() {
         let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
         clear_escalation_tier_env();
@@ -2328,6 +2329,5 @@ mod tests {
         assert!(result.is_err());
 
         clear_escalation_tier_env();
->>>>>>> e682cce7 (feat: tier config parsing and TierMap wiring for provider swap on escalation)
     }
 }

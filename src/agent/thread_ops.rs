@@ -502,7 +502,7 @@ impl Agent {
 
         // Run the agentic tool execution loop
         let result = self
-            .run_agentic_loop(message, tenant, session.clone(), thread_id, turn_messages)
+            .run_agentic_loop(message, tenant.clone(), session.clone(), thread_id, turn_messages)
             .await;
 
         // Re-acquire lock and check if interrupted
@@ -748,7 +748,7 @@ impl Agent {
                 // Re-run the agentic loop with the escalated provider.
                 // The dispatcher will pick up the new provider via active_llm().
                 let replay_result = self
-                    .run_agentic_loop(message, session.clone(), thread_id, turn_messages)
+                    .run_agentic_loop(message, tenant.clone(), session.clone(), thread_id, turn_messages)
                     .await;
 
                 // Re-acquire lock and handle the replayed result
@@ -774,6 +774,7 @@ impl Agent {
                             &message.user_id,
                             turn_number,
                             &tool_calls,
+                            None,
                         )
                         .await;
                         self.persist_assistant_response(

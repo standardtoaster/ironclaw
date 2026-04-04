@@ -730,7 +730,7 @@ pub async fn create_escalation_tier_map(
         // Build a minimal LlmConfig for this tier using the registry.
         let provider_def = registry.find(&tier.backend)
             .or_else(|| registry.find("openai_compatible"));
-        let provider_config = provider_def.map(|def| config::RegistryProviderConfig {
+        let _provider_config = provider_def.map(|def| config::RegistryProviderConfig {
             protocol: def.protocol,
             provider_id: def.id.clone(),
             api_key: tier.api_key.clone(),
