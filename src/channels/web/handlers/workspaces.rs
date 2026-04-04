@@ -42,7 +42,7 @@ pub async fn workspaces_list_handler(
     ))?;
 
     let workspaces = db
-        .list_agent_workspaces(&state.user_id, params.status.as_deref())
+        .list_agent_workspaces(&state.owner_id, params.status.as_deref())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod collections;
 pub mod engine;
+pub mod events;
 pub mod ingest;
 pub mod jobs;
 pub mod llm;

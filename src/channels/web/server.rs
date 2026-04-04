@@ -45,10 +45,6 @@ use crate::channels::web::handlers::engine::{
     engine_project_detail_handler, engine_projects_handler, engine_thread_detail_handler,
     engine_thread_events_handler, engine_thread_steps_handler, engine_threads_handler,
 };
-use crate::channels::web::handlers::collections::{
-    collections_delete_handler, collections_insert_handler, collections_list_handler,
-    collections_query_handler, collections_register_handler, collections_update_handler,
-};
 use crate::channels::web::handlers::events::events_ingest_handler;
 use crate::channels::web::handlers::ingest::ingest_conversation_handler;
 use crate::channels::web::handlers::jobs::{
