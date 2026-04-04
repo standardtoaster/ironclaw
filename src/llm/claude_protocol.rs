@@ -135,6 +135,7 @@ pub fn extract_tool_calls(content: &serde_json::Value) -> Vec<ToolCall> {
                     id: block.get("id")?.as_str()?.to_string(),
                     name: block.get("name")?.as_str()?.to_string(),
                     arguments: block.get("input")?.clone(),
+                    reasoning: None,
                 })
             } else {
                 None

@@ -167,6 +167,85 @@ impl GatewayChannel {
         }
     }
 
+    /// Create a gateway channel with pre-built multi-user auth.
+    ///
+    /// Used when the caller has already constructed a `MultiAuthState` from
+    /// `GATEWAY_USER_TOKENS` or equivalent config. The first user's ID is used
+    /// as the durable `owner_id`.
+    pub fn new_multi_auth(config: GatewayConfig, env_auth: MultiAuthState) -> Self {
+        let owner_id = config
+            .user_tokens
+            .as_ref()
+            .and_then(|ut| ut.values().next())
+            .map(|cfg| cfg.user_id.clone())
+            .unwrap_or_else(|| "default".to_string());
+
+        let user_tokens = config.user_tokens.clone();
+
+        let auth = CombinedAuthState {
+            env_auth,
+            db_auth: None,
+            oidc: None,
+            oidc_allowed_domains: Vec::new(),
+        };
+
+        let state = Arc::new(GatewayState {
+            msg_tx: tokio::sync::RwLock::new(None),
+            sse: Arc::new(SseManager::new()),
+            workspace: None,
+            workspace_pool: None,
+            session_manager: None,
+            log_broadcaster: None,
+            log_level_handle: None,
+            extension_manager: None,
+            tool_registry: None,
+            store: None,
+            job_manager: None,
+            prompt_queue: None,
+            scheduler: None,
+            owner_id,
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: Some(Arc::new(ws::WsConnectionTracker::new())),
+            llm_provider: None,
+            user_llm_providers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            user_tokens,
+            skill_registry: None,
+            skill_catalog: None,
+            chat_rate_limiter: server::PerUserRateLimiter::new(30, 60),
+            oauth_rate_limiter: server::PerUserRateLimiter::new(20, 60),
+            webhook_rate_limiter: server::RateLimiter::new(10, 60),
+            registry_entries: Vec::new(),
+            cost_guard: None,
+            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
+            startup_time: std::time::Instant::now(),
+            active_config: server::ActiveConfigSnapshot::default(),
+            secrets_store: None,
+            db_auth: None,
+            oauth_providers: None,
+            oauth_state_store: None,
+            oauth_base_url: None,
+            oauth_allowed_domains: Vec::new(),
+            near_nonce_store: None,
+            near_rpc_url: None,
+            near_network: None,
+            oauth_sweep_shutdown: None,
+            collection_write_tx: None,
+            skills_dir: None,
+            pending_claude_replies: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            pending_claude_approvals: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+        });
+
+        Self {
+            config,
+            state,
+            auth,
+        }
+    }
+
     /// Helper to rebuild state, copying existing fields and applying a mutation.
     fn rebuild_state(&mut self, mutate: impl FnOnce(&mut GatewayState)) {
         let mut new_state = GatewayState {

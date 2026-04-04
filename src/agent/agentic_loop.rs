@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use std::borrow::Cow;
 
-use crate::agent::session::PendingApproval;
+use crate::agent::session::{PendingApproval, PendingUserInput};
 use crate::error::Error;
 use crate::llm::{
     ChatMessage, FinishReason, Reasoning, ReasoningContext, RespondResult, ResponseMetadata,
@@ -44,6 +44,17 @@ pub enum LoopOutcome {
     Failure(String),
     /// A tool requires user approval before continuing (chat delegate only).
     NeedApproval(Box<PendingApproval>),
+    /// Escalation requested — switch to a higher-tier model.
+    Escalate {
+        reason: String,
+        tier: Option<String>,
+    },
+    /// De-escalation requested — switch back to a lower-tier model.
+    DeEscalate { reason: String },
+    /// The agent needs user input to proceed.
+    NeedUserInput {
+        pending: Box<PendingUserInput>,
+    },
 }
 
 /// Configuration for the agentic loop.

@@ -1057,12 +1057,12 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                             .insert(tc.id.clone(), output.clone());
                     }
 
-                    let is_tool_error = str_result.is_err();
+                    let is_tool_error = tool_result.is_err();
                     let (result_content, tool_message) = crate::tools::execute::process_tool_result(
                         self.agent.safety(),
                         &tc.name,
                         &tc.id,
-                        &str_result,
+                        &tool_result,
                     );
 
                     // Record sanitized result in thread (identity-based matching).

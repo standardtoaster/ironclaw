@@ -84,7 +84,7 @@ pub async fn mcp_post_handler(
     }
 
     // Build a JobContext scoped to the default user (no per-request auth on this base).
-    let ctx = JobContext::with_user(&state.default_user_id, "mcp", "MCP tool call");
+    let ctx = JobContext::with_user(&state.owner_id, "mcp", "MCP tool call");
 
     let registry = state.tool_registry.as_deref();
     let sessions = &*MCP_SESSIONS;

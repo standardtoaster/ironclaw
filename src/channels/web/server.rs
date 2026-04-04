@@ -990,10 +990,11 @@ pub async fn start_server(
             loop {
                 match rx.recv().await {
                     Ok(event) => {
-                        let sse_event = crate::channels::web::types::SseEvent::CollectionWrite {
-                            collection: event.collection.clone(),
-                            record_id: event.record_id.to_string(),
-                            operation: "insert".to_string(),
+                        let sse_event = crate::channels::web::types::AppEvent::Status {
+                            message: format!(
+                                "collection_write: collection={}, record_id={}, operation=insert",
+                                event.collection, event.record_id
+                            ),
                             thread_id: None,
                         };
                         sse.broadcast_for_user(&event.user_id, sse_event);
@@ -1507,7 +1508,7 @@ async fn claude_events_handler(
                 "Claude sandbox tool completed"
             );
             // Broadcast as SSE event for TUI visibility
-            state.sse.broadcast(crate::channels::web::types::SseEvent::ToolCompleted {
+            state.sse.broadcast(crate::channels::web::types::AppEvent::ToolCompleted {
                 name: tool_name.to_string(),
                 success: true,
                 error: None,
@@ -1529,7 +1530,7 @@ async fn claude_events_handler(
                 error = %error,
                 "Claude sandbox tool failed"
             );
-            state.sse.broadcast(crate::channels::web::types::SseEvent::ToolCompleted {
+            state.sse.broadcast(crate::channels::web::types::AppEvent::ToolCompleted {
                 name: tool_name.to_string(),
                 success: false,
                 error: Some(error.to_string()),
@@ -1591,7 +1592,7 @@ async fn claude_approval_handler(
 
                             // Emit SSE event so the TUI shows the approval prompt
                             state.sse.broadcast(
-                                crate::channels::web::types::SseEvent::ApprovalNeeded {
+                                crate::channels::web::types::AppEvent::ApprovalNeeded {
                                     request_id: request_id.clone(),
                                     tool_name: tool_name.to_string(),
                                     description: format!("Sandbox Claude wants to call {}", tool_name),
@@ -5637,7 +5638,7 @@ mod tests {
             .user_id("alice")
             .build();
 
-        assert_eq!(state.default_user_id, "alice");
+        assert_eq!(state.owner_id, "alice");
         assert!(state.workspace.is_none());
         assert!(state.session_manager.is_none());
         assert!(state.store.is_none());
