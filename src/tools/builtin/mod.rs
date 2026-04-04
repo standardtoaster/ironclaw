@@ -2,6 +2,7 @@
 
 pub mod ask_user;
 mod conversation;
+pub(crate) mod collections;
 pub mod generic_collections;
 mod echo;
 pub mod escalate;
