@@ -1041,4 +1041,218 @@ mod tests {
             "expected Err for unknown conversation, got Ok"
         );
     }
+
+    // ── Session continuity tests ───────────────────────────
+    //
+    // These tests validate that completed foreground threads stay tracked
+    // and are resumable, which is the core session continuity fix.
+    // Old behavior: Completed threads were untracked, forcing a new thread
+    // per user message (no conversation continuity).
+
+    #[tokio::test]
+    async fn completed_foreground_stays_tracked() {
+        // After recording ThreadOutcome::Completed, the thread must remain
+        // in active_threads. Old behavior: it was removed via untrack_thread.
+        let (_, cm) = make_conv_manager();
+        let conv_id = cm.get_or_create_conversation("web", "user1").await.unwrap();
+        let tid = ThreadId::new();
+
+        cm.track_thread_in_conversation(conv_id, tid).await;
+
+        cm.record_thread_outcome(
+            conv_id,
+            tid,
+            &ThreadOutcome::Completed {
+                response: Some("response".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let conv = cm.get_conversation(conv_id).await.unwrap();
+        assert!(
+            conv.active_threads.contains(&tid),
+            "completed foreground thread should stay tracked, but was removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_foreground_is_resumable() {
+        // A tracked thread in Completed state should be found as Resumable
+        // by find_active_foreground, not ignored. Old behavior: only Suspended
+        // matched, so Completed threads were invisible and a new thread was spawned.
+        let store = Arc::new(MockStore::new());
+        let tm = Arc::new(ThreadManager::new(
+            Arc::new(MockLlm(Mutex::new(vec![LlmOutput {
+                response: LlmResponse::Text("resumed".into()),
+                usage: TokenUsage::default(),
+            }]))),
+            Arc::new(MockEffects),
+            store.clone(),
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+        let cm = ConversationManager::new(Arc::clone(&tm), store.clone());
+
+        let conv_id = cm.get_or_create_conversation("web", "user1").await.unwrap();
+        let project = ProjectId::new();
+
+        // Create a foreground thread in Completed state (simulating a thread
+        // that finished its first turn and is waiting for the next message).
+        let mut thread = crate::types::thread::Thread::new(
+            "session",
+            ThreadType::Foreground,
+            project,
+            "user1",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread.add_message(ThreadMessage::user("first turn"));
+        thread.add_message(ThreadMessage::assistant("response to first turn"));
+        thread
+            .transition_to(ThreadState::Completed, Some("turn finished".into()))
+            .unwrap();
+        store.save_thread(&thread).await.unwrap();
+
+        cm.track_thread_in_conversation(conv_id, thread.id).await;
+
+        // Send a follow-up message. This should resume the completed thread,
+        // not spawn a new one.
+        let resumed_tid = cm
+            .handle_user_message(
+                conv_id,
+                "follow-up message",
+                project,
+                "user1",
+                ThreadConfig::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resumed_tid, thread.id,
+            "follow-up message should resume the completed thread, not spawn a new one"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_turn_resumes_same_thread() {
+        // Simulates the full multi-turn session continuity flow:
+        // Turn 1: thread spawns, runs, completes
+        // Turn 2: follow-up message resumes the SAME thread (not a new one)
+        //
+        // The background task in ThreadManager auto-transitions Completed→Done,
+        // so we set up the "between turns" state manually: thread is Completed
+        // in the store, tracked in the conversation. This is the state the
+        // conversation sees when record_thread_outcome(Completed) keeps the
+        // thread tracked and the user sends a follow-up.
+        let store = Arc::new(MockStore::new());
+        let tm = Arc::new(ThreadManager::new(
+            Arc::new(MockLlm(Mutex::new(vec![LlmOutput {
+                response: LlmResponse::Text("turn 2 response".into()),
+                usage: TokenUsage::default(),
+            }]))),
+            Arc::new(MockEffects),
+            store.clone(),
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+        let cm = ConversationManager::new(Arc::clone(&tm), store.clone());
+
+        let conv_id = cm.get_or_create_conversation("web", "user1").await.unwrap();
+        let project = ProjectId::new();
+
+        // Simulate turn 1 result: a foreground thread that has completed its
+        // first turn and is tracked in the conversation.
+        let mut thread = crate::types::thread::Thread::new(
+            "hello",
+            ThreadType::Foreground,
+            project,
+            "user1",
+            ThreadConfig::default(),
+        );
+        let tid1 = thread.id;
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread.add_message(ThreadMessage::user("hello"));
+        thread.add_message(ThreadMessage::assistant("turn 1 response"));
+        thread
+            .transition_to(ThreadState::Completed, Some("turn finished".into()))
+            .unwrap();
+        store.save_thread(&thread).await.unwrap();
+
+        // Track thread and record the completion outcome (this is what
+        // record_thread_outcome does for Completed — keeps it tracked).
+        cm.track_thread_in_conversation(conv_id, tid1).await;
+
+        // Verify pre-condition: thread is tracked.
+        let conv = cm.get_conversation(conv_id).await.unwrap();
+        assert!(conv.active_threads.contains(&tid1));
+
+        // Turn 2: follow-up message should resume the SAME thread.
+        let tid2 = cm
+            .handle_user_message(
+                conv_id,
+                "follow up",
+                project,
+                "user1",
+                ThreadConfig::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tid1, tid2,
+            "second message should resume the same thread (tid1={tid1:?}), but got a new one (tid2={tid2:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_thread_is_untracked() {
+        // ThreadOutcome::Stopped must untrack the thread (regression check:
+        // only Completed keeps tracking, not Stopped).
+        let (_, cm) = make_conv_manager();
+        let conv_id = cm.get_or_create_conversation("web", "user1").await.unwrap();
+        let tid = ThreadId::new();
+
+        cm.track_thread_in_conversation(conv_id, tid).await;
+
+        cm.record_thread_outcome(conv_id, tid, &ThreadOutcome::Stopped)
+            .await
+            .unwrap();
+
+        let conv = cm.get_conversation(conv_id).await.unwrap();
+        assert!(
+            !conv.active_threads.contains(&tid),
+            "stopped thread should be untracked"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_thread_is_untracked() {
+        // ThreadOutcome::Failed must untrack the thread (regression check:
+        // only Completed keeps tracking, not Failed).
+        let (_, cm) = make_conv_manager();
+        let conv_id = cm.get_or_create_conversation("web", "user1").await.unwrap();
+        let tid = ThreadId::new();
+
+        cm.track_thread_in_conversation(conv_id, tid).await;
+
+        cm.record_thread_outcome(
+            conv_id,
+            tid,
+            &ThreadOutcome::Failed {
+                error: "something broke".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let conv = cm.get_conversation(conv_id).await.unwrap();
+        assert!(
+            !conv.active_threads.contains(&tid),
+            "failed thread should be untracked"
+        );
+    }
 }

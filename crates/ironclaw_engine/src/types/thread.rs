@@ -531,4 +531,42 @@ mod tests {
 
         assert_eq!(thread.active_skills(), skills);
     }
+
+    // ── Session continuity: Completed → Running transition ─
+
+    #[test]
+    fn completed_thread_can_resume_to_running() {
+        // Full lifecycle: Created → Running → Completed → Running (resume).
+        // This is the state transition path that session continuity enables.
+        // Without the (Completed, Running) transition in can_transition_to(),
+        // the resume_thread call would fail with InvalidTransition.
+        let mut t = make_thread();
+        t.transition_to(ThreadState::Running, None).unwrap();
+        t.transition_to(ThreadState::Completed, Some("turn finished".into()))
+            .unwrap();
+
+        // This is the critical transition: Completed → Running for resume.
+        assert!(
+            ThreadState::Completed.can_transition_to(ThreadState::Running),
+            "Completed must be able to transition to Running for session continuity"
+        );
+        t.transition_to(ThreadState::Running, Some("user sent follow-up".into()))
+            .unwrap();
+        assert_eq!(t.state, ThreadState::Running);
+
+        // And the thread can complete again after resuming.
+        t.transition_to(ThreadState::Completed, Some("second turn finished".into()))
+            .unwrap();
+        assert_eq!(t.state, ThreadState::Completed);
+        assert_eq!(t.events.len(), 4); // Running, Completed, Running, Completed
+    }
+
+    #[test]
+    fn completed_cannot_transition_to_invalid_states() {
+        // Completed can go to Done or Running, but nothing else.
+        assert!(!ThreadState::Completed.can_transition_to(ThreadState::Waiting));
+        assert!(!ThreadState::Completed.can_transition_to(ThreadState::Suspended));
+        assert!(!ThreadState::Completed.can_transition_to(ThreadState::Failed));
+        assert!(!ThreadState::Completed.can_transition_to(ThreadState::Created));
+    }
 }
