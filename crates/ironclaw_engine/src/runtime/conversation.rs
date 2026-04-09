@@ -334,6 +334,26 @@ impl ConversationManager {
                 }
                 // Keep thread tracked so follow-up messages resume it
                 // rather than spawning a new thread each time.
+
+                // Sweep stale completed foreground threads — only the most recent
+                // completed thread should remain resumable. Older completed threads
+                // are superseded by this newer completion, and leaving them tracked
+                // would cause unbounded active_threads growth.
+                let mut stale = Vec::new();
+                for &tid in &conv.active_threads {
+                    if tid != thread_id {
+                        if let Ok(Some(t)) = self.store.load_thread(tid).await {
+                            if t.thread_type == ThreadType::Foreground
+                                && t.state == ThreadState::Completed
+                            {
+                                stale.push(tid);
+                            }
+                        }
+                    }
+                }
+                for tid in stale {
+                    conv.untrack_thread(tid);
+                }
             }
             ThreadOutcome::Stopped => {
                 conv.add_entry(ConversationEntry::system_for_thread(
@@ -1253,6 +1273,125 @@ mod tests {
         assert!(
             !conv.active_threads.contains(&tid),
             "failed thread should be untracked"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_completed_threads_swept_on_new_completion() {
+        // When a second foreground thread completes, the first completed
+        // foreground thread should be swept from active_threads. Only the
+        // most recent completed foreground thread stays tracked.
+        let store = Arc::new(MockStore::new());
+        let tm = Arc::new(ThreadManager::new(
+            Arc::new(MockLlm(Mutex::new(vec![]))),
+            Arc::new(MockEffects),
+            store.clone(),
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+        let cm = ConversationManager::new(Arc::clone(&tm), store.clone());
+
+        let conv_id = cm.get_or_create_conversation("web", "user1").await.unwrap();
+        let project = ProjectId::new();
+
+        // Create two foreground threads in Completed state in the store.
+        let mut thread1 = crate::types::thread::Thread::new(
+            "turn 1",
+            ThreadType::Foreground,
+            project,
+            "user1",
+            ThreadConfig::default(),
+        );
+        thread1.transition_to(ThreadState::Running, None).unwrap();
+        thread1
+            .transition_to(ThreadState::Completed, Some("done".into()))
+            .unwrap();
+        store.save_thread(&thread1).await.unwrap();
+
+        let mut thread2 = crate::types::thread::Thread::new(
+            "turn 2",
+            ThreadType::Foreground,
+            project,
+            "user1",
+            ThreadConfig::default(),
+        );
+        thread2.transition_to(ThreadState::Running, None).unwrap();
+        thread2
+            .transition_to(ThreadState::Completed, Some("done".into()))
+            .unwrap();
+        store.save_thread(&thread2).await.unwrap();
+
+        // Track both threads.
+        cm.track_thread_in_conversation(conv_id, thread1.id).await;
+        cm.track_thread_in_conversation(conv_id, thread2.id).await;
+
+        // Record completion for thread 1.
+        cm.record_thread_outcome(
+            conv_id,
+            thread1.id,
+            &ThreadOutcome::Completed {
+                response: Some("response 1".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // After thread 1 completes: thread 2 is already Completed+Foreground
+        // in the store, so it should be swept. Only thread 1 remains.
+        let conv = cm.get_conversation(conv_id).await.unwrap();
+        assert!(
+            conv.active_threads.contains(&thread1.id),
+            "current completed thread should stay tracked"
+        );
+        assert!(
+            !conv.active_threads.contains(&thread2.id),
+            "stale completed foreground thread should be swept"
+        );
+        assert_eq!(
+            conv.active_threads.len(),
+            1,
+            "only the most recent completed foreground thread should remain"
+        );
+
+        // Now record completion for a third thread — thread 1 should be swept.
+        let mut thread3 = crate::types::thread::Thread::new(
+            "turn 3",
+            ThreadType::Foreground,
+            project,
+            "user1",
+            ThreadConfig::default(),
+        );
+        thread3.transition_to(ThreadState::Running, None).unwrap();
+        thread3
+            .transition_to(ThreadState::Completed, Some("done".into()))
+            .unwrap();
+        store.save_thread(&thread3).await.unwrap();
+        cm.track_thread_in_conversation(conv_id, thread3.id).await;
+
+        cm.record_thread_outcome(
+            conv_id,
+            thread3.id,
+            &ThreadOutcome::Completed {
+                response: Some("response 3".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let conv = cm.get_conversation(conv_id).await.unwrap();
+        assert!(
+            !conv.active_threads.contains(&thread1.id),
+            "thread 1 should be swept after thread 3 completes"
+        );
+        assert!(
+            conv.active_threads.contains(&thread3.id),
+            "thread 3 should be the only tracked completed thread"
+        );
+        assert_eq!(
+            conv.active_threads.len(),
+            1,
+            "only the most recent completed foreground thread should remain"
         );
     }
 }
