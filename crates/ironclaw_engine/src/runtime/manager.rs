@@ -196,6 +196,7 @@ impl ThreadManager {
             thread.state,
             crate::types::thread::ThreadState::Waiting
                 | crate::types::thread::ThreadState::Suspended
+                | crate::types::thread::ThreadState::Completed
         ) {
             return Err(EngineError::Store {
                 reason: format!(

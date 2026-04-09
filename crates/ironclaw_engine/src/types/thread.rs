@@ -83,6 +83,7 @@ impl ThreadState {
             | (Self::Suspended, Self::Failed)
             // From Completed
             | (Self::Completed, Self::Done)
+            | (Self::Completed, Self::Running)
         )
     }
 
@@ -417,6 +418,11 @@ mod tests {
     #[test]
     fn completed_can_transition_to_done() {
         assert!(ThreadState::Completed.can_transition_to(ThreadState::Done));
+    }
+
+    #[test]
+    fn completed_can_resume_to_running() {
+        assert!(ThreadState::Completed.can_transition_to(ThreadState::Running));
     }
 
     #[test]

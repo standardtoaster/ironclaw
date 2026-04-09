@@ -332,7 +332,8 @@ impl ConversationManager {
                 if let Some(text) = response {
                     conv.add_entry(ConversationEntry::agent(thread_id, text));
                 }
-                conv.untrack_thread(thread_id);
+                // Keep thread tracked so follow-up messages resume it
+                // rather than spawning a new thread each time.
             }
             ThreadOutcome::Stopped => {
                 conv.add_entry(ConversationEntry::system_for_thread(
@@ -452,7 +453,10 @@ impl ConversationManager {
             }
             if let Ok(Some(thread)) = self.store.load_thread(tid).await
                 && thread.thread_type == ThreadType::Foreground
-                && thread.state == ThreadState::Suspended
+                && matches!(
+                    thread.state,
+                    ThreadState::Suspended | ThreadState::Completed
+                )
             {
                 return Some(ActiveForeground::Resumable(tid));
             }
@@ -868,7 +872,9 @@ mod tests {
         .unwrap();
 
         let conv = cm.get_conversation(conv_id).await.unwrap();
-        assert!(conv.active_threads.is_empty());
+        // Completed threads stay tracked for follow-up message resume.
+        assert_eq!(conv.active_threads.len(), 1);
+        assert_eq!(conv.active_threads[0], tid);
         assert_eq!(conv.entries.len(), 1);
         assert_eq!(conv.entries[0].content, "Done!");
 
