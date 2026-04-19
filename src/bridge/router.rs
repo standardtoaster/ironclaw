@@ -3060,7 +3060,15 @@ async fn await_thread_outcome(
             event = event_rx.recv() => {
                 match event {
                     Ok(ref evt) if evt.thread_id == thread_id => {
-                        forward_event_to_channel(evt, channels, channel_name, metadata).await;
+                        // forward_event_to_channel drives status display on
+                        // REPL/TUI/Telegram. The web gateway channel's own
+                        // send_status also broadcasts to SSE, so calling it
+                        // here while we also emit via thread_event_to_app_events
+                        // below would duplicate every tool_started /
+                        // tool_completed event in the browser.
+                        if channel_name != "gateway" {
+                            forward_event_to_channel(evt, channels, channel_name, metadata).await;
+                        }
                         if let Some(sse) = sse {
                             for app_event in thread_event_to_app_events(evt, &tid_str) {
                                 sse.broadcast_for_user(&message.user_id, app_event);
@@ -3500,7 +3508,6 @@ async fn forward_event_to_channel(
         EventKind::ActionExecuted {
             action_name,
             call_id,
-            duration_ms,
             params_summary,
             ..
         } => {
@@ -3523,7 +3530,7 @@ async fn forward_event_to_channel(
                         name: display_name,
                         success: true,
                         error: None,
-                        parameters: Some(format!("{duration_ms}ms")),
+                        parameters: None,
                         call_id: Some(call_id.clone()),
                     },
                     metadata,
@@ -3642,7 +3649,6 @@ fn thread_event_to_app_events(
         EventKind::ActionExecuted {
             action_name,
             call_id,
-            duration_ms,
             params_summary,
             ..
         } => {
@@ -3658,7 +3664,7 @@ fn thread_event_to_app_events(
                     name: display_name,
                     success: true,
                     error: None,
-                    parameters: Some(format!("{duration_ms}ms")),
+                    parameters: None,
                     call_id: Some(call_id.clone()),
                     thread_id: Some(thread_id.into()),
                 },
@@ -7089,5 +7095,46 @@ mod tests {
 
         let prior = super::persist_always_allow(&agent, &state, &pending).await;
         assert!(prior.is_none(), "Should return None when no settings_store");
+    }
+
+    /// Regression: a successful ActionExecuted must not stuff duration into
+    /// the `parameters` field of the emitted ToolCompleted AppEvent. The
+    /// ToolCompleted doc-comment says parameters are only populated on
+    /// failure, and frontends render the string verbatim — so writing
+    /// "503ms" there made tool cards show the duration in the UI's
+    /// PARAMETERS slot.
+    #[test]
+    fn action_executed_leaves_parameters_empty_on_success() {
+        let tid = ironclaw_engine::ThreadId::new();
+        let evt = ironclaw_engine::ThreadEvent::new(
+            tid,
+            ironclaw_engine::EventKind::ActionExecuted {
+                step_id: ironclaw_engine::StepId::new(),
+                action_name: "web_search".into(),
+                call_id: "c1".into(),
+                duration_ms: 503,
+                params_summary: Some("query=rust".into()),
+            },
+        );
+
+        let events = super::thread_event_to_app_events(&evt, &tid.0.to_string());
+        let completed = events
+            .iter()
+            .find(|e| matches!(e, AppEvent::ToolCompleted { .. }))
+            .expect("should emit ToolCompleted");
+        match completed {
+            AppEvent::ToolCompleted {
+                parameters,
+                success,
+                ..
+            } => {
+                assert!(*success, "action success expected");
+                assert!(
+                    parameters.is_none(),
+                    "parameters field must be empty on success; got {parameters:?}"
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 }
